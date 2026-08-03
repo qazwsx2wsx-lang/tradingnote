@@ -311,7 +311,15 @@ def get_tpex_valuation(ticker):
     return data.get(ticker)
 
 
-def get_market_snapshot(cache_path, force_refresh=False):
+def get_market_snapshot(cache_path, force_refresh=False, on_progress=None):
+    """on_progress(done, total, label) 在 force_refresh 真的重打 API 時，於每個階段
+    開始前被呼叫一次（TWSE、TPEX、寫入快取共 3 個階段），讓呼叫端能畫出進度條；
+    走快取路徑（未過期或 API 失敗回退）時不會呼叫，跟 backfill_twse_history 的
+    on_progress 只在真的有動作時才觸發是一樣的原則。"""
+    def _progress(done, total, label):
+        if on_progress:
+            on_progress(done, total, label)
+
     p = Path(cache_path)
     if not force_refresh and p.exists():
         with p.open("r", encoding="utf-8") as f:
@@ -322,9 +330,13 @@ def get_market_snapshot(cache_path, force_refresh=False):
                 code: PriceInfo(**info) for code, info in cached["prices"].items()
             }
 
+    total_steps = 3
     try:
+        _progress(0, total_steps, "正在取得上市（TWSE）報價...")
         twse = fetch_twse_all()
+        _progress(1, total_steps, "正在取得上櫃（TPEX）報價...")
         tpex = fetch_tpex_all()
+        _progress(2, total_steps, "正在寫入快取...")
     except PriceFetchError:
         if p.exists():
             with p.open("r", encoding="utf-8") as f:
@@ -344,6 +356,7 @@ def get_market_snapshot(cache_path, force_refresh=False):
             ensure_ascii=False,
             indent=2,
         )
+    _progress(3, total_steps, "快取寫入完成")
     return snapshot
 
 

@@ -42,6 +42,7 @@ from tradingnote_finmind import (
     fetch_valuation,
     get_call_count,
 )
+from tradingnote_taifex import DEFAULT_FUTURES_PRODUCTS, get_futures_snapshot
 from tradingnote_ai_agent import GEMINI_RPM_HINT, run_agent_turn
 from tradingnote_ai_agent import get_call_count as get_gemini_call_count
 
@@ -55,6 +56,7 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 # 快取（tradingnote_core.CACHE_TTL_SECONDS），所以就算這裡設得比 30 分鐘短，實際
 # 打 TWSE／TPEX 的頻率仍受快取保護，不會因為輪詢變密就增加對外部 API 的負擔。
 NEW_DATA_CHECK_INTERVAL_MS = 5 * 60 * 1000
+
 
 COLUMNS = [
     ("id", "ID", 90),
@@ -325,36 +327,44 @@ def run_task_in_thread(parent, work_fn, on_done, on_error):
 
 def run_refresh_in_thread(parent, progress_cb, done_cb, error_cb):
     """在背景執行緒重新整理即時報價＋寫入歷史資料庫，機制跟 run_backfill_in_thread／
-    run_task_in_thread 相同（背景執行緒＋queue＋QTimer 輪詢送回 Qt 主執行緒），差別是
-    progress_cb 傳的是階段文字（連線中／寫入中）而非數字進度，給「重新整理」彈窗用，
-    避免 TWSE/TPEX 網路延遲時整個視窗看起來像當掉。"""
+    run_task_in_thread 相同（背景執行緒＋queue＋QTimer 輪詢送回 Qt 主執行緒）。
+    progress_cb(done, total, label) 傳數字進度＋階段文字，給「重新整理」彈窗畫進度條用：
+    共 4 個階段（TWSE、TPEX、寫入快取——這 3 個轉發自 get_market_snapshot 的
+    on_progress——再加上寫入歷史資料庫），避免 TWSE/TPEX 網路延遲時整個視窗看起來像當掉。"""
     q = queue.Queue()
+    total_steps = 4
 
     def worker():
         try:
-            q.put(("progress", "正在連線 TWSE／TPEX 取得即時報價..."))
-            snapshot = get_market_snapshot(CACHE_PATH, force_refresh=True)
-            q.put(("progress", "正在寫入歷史資料庫..."))
+            snapshot = get_market_snapshot(
+                CACHE_PATH,
+                force_refresh=True,
+                on_progress=lambda done, _total, label: q.put(
+                    ("progress", done, total_steps, label)
+                ),
+            )
+            q.put(("progress", 3, total_steps, "正在寫入歷史資料庫..."))
             record_snapshot(HISTORY_DB_PATH, snapshot)
-            q.put(("done", snapshot))
+            q.put(("progress", 4, total_steps, "完成"))
+            q.put(("done", snapshot, None, None))
         except PriceFetchError as e:  # noqa: BLE001 - surface any failure to the caller
-            q.put(("error", str(e)))
+            q.put(("error", str(e), None, None))
 
     timer = QtCore.QTimer(parent)
 
     def poll():
         try:
             while True:
-                kind, payload = q.get_nowait()
+                kind, a, b, c = q.get_nowait()
                 if kind == "progress":
-                    progress_cb(payload)
+                    progress_cb(a, b, c)
                 elif kind == "done":
                     timer.stop()
-                    done_cb(payload)
+                    done_cb(a)
                     return
                 elif kind == "error":
                     timer.stop()
-                    error_cb(payload)
+                    error_cb(a)
                     return
         except queue.Empty:
             pass
@@ -656,6 +666,9 @@ class RefreshDialog(QtWidgets.QDialog):
 
         self.status_label = QtWidgets.QLabel("準備連線取得最新報價...")
         self.status_label.setWordWrap(True)
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
         self.close_button = QtWidgets.QPushButton("關閉")
         self.close_button.setEnabled(False)
         self.close_button.clicked.connect(self.accept)
@@ -663,17 +676,24 @@ class RefreshDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 16)
         layout.addWidget(self.status_label)
+        layout.addSpacing(6)
+        layout.addWidget(self.progress_bar)
         layout.addSpacing(10)
         layout.addWidget(self.close_button, alignment=QtCore.Qt.AlignHCenter)
 
         self._timer = run_refresh_in_thread(
             self,
-            progress_cb=self.status_label.setText,
+            progress_cb=self._on_progress,
             done_cb=self._on_done,
             error_cb=self._on_error,
         )
 
+    def _on_progress(self, done, total, label):
+        self.progress_bar.setValue(int(done / total * 100))
+        self.status_label.setText(label)
+
     def _on_done(self, snapshot):
+        self.progress_bar.setValue(100)
         self.status_label.setText("重新整理完成。")
         self.close_button.setEnabled(True)
         self.on_complete(snapshot, None)
@@ -809,18 +829,21 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.flow_tab = QtWidgets.QWidget()
         self.positions_tab = QtWidgets.QWidget()
         self.stocks_tab = QtWidgets.QWidget()
+        self.futures_tab = QtWidgets.QWidget()
         self.ai_agent_tab = QtWidgets.QWidget()
         self.settings_tab = QtWidgets.QWidget()
-        # 資金流向分析先加入，成為預設頁；部位紀錄、個股、AI 助理、設定依序是第二～五個分頁。
+        # 資金流向分析先加入，成為預設頁；部位紀錄、個股、期貨、AI 助理、設定依序是第二～六個分頁。
         self.tabs.addTab(self.flow_tab, "資金流向分析")
         self.tabs.addTab(self.positions_tab, "部位紀錄")
         self.tabs.addTab(self.stocks_tab, "個股")
+        self.tabs.addTab(self.futures_tab, "期貨")
         self.tabs.addTab(self.ai_agent_tab, "AI 助理")
         self.tabs.addTab(self.settings_tab, "設定")
 
         self._build_flow_tab()
         self._build_positions_tab()
         self._build_stocks_tab()
+        self._build_futures_tab()
         self._build_ai_agent_tab()
         self._build_settings_tab()
 
@@ -830,6 +853,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.refresh_table()
         self.refresh_flow_tab()
         self.refresh_stocks_tab()
+        self.refresh_futures_tab()
 
         # 每次啟動是否自動確保 TWSE 歷史資料連續（跟上到昨天）由「設定」分頁的
         # 「每次啟動自動檢測」開關控制，預設開啟。資料已經連續時在背景執行緒
@@ -1269,6 +1293,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.refresh_table()
         self.refresh_flow_tab()
         self.refresh_stocks_tab()
+        self.refresh_futures_tab()
 
     # ---------- 個股頁 ----------
 
@@ -1425,6 +1450,112 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         market = item.data(0, QtCore.Qt.UserRole + 1)
         token = self.settings.get("finmind_token", "")
         StockDetailDialog(self, ticker, name, token, market=market).exec()
+
+    # ---------- 期貨頁（TAIFEX 官方盤後行情） ----------
+    # 原本串接 Fugle 的 data-futopt 即時行情，但查證 developer.fugle.tw 定價文件
+    # 後發現期貨/選擇權完全不在免費方案內（連歷史/盤後資料都沒有，只有 intraday
+    # 且需要付費 Developer 方案）。改用 TAIFEX 官方公開、免金鑰的「期貨每日交易
+    # 行情」，只反映盤後（EOD）資訊，不是即時報價——跟 TWSE/TPEX 股票走 EOD 的既有
+    # 原則一致，見 tradingnote_taifex.py。一天只更新一次，不需要背景輪詢計時器，
+    # 隨「重新整理」（見 _apply_refresh_result）跟股票資料一起刷新即可。
+
+    FUTURES_COLUMNS = [
+        "商品", "契約月份", "時段", "最後成交", "漲跌", "漲跌%",
+        "結算價", "成交量", "未沖銷契約數",
+    ]
+    FUTURES_SESSION_ORDER = ["一般", "盤後"]
+
+    def _build_futures_tab(self):
+        layout = QtWidgets.QVBoxLayout(self.futures_tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        toolbar = QtWidgets.QHBoxLayout()
+        toolbar.addWidget(accent_button("重新整理", self.refresh_futures_tab))
+        toolbar.addStretch(1)
+        layout.addLayout(toolbar)
+
+        hint = QtWidgets.QLabel(
+            "近月指數期貨（TX 臺股期貨／MTX 小型臺指期貨）盤後資訊，資料來自 TAIFEX 官方"
+            "「期貨每日交易行情」，免金鑰、每個交易日更新一次，非即時報價——"
+            "「一般」為日盤收盤後的彙總、「盤後」為夜盤收盤後的彙總。"
+        )
+        hint.setProperty("muted", True)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.futures_status_label = QtWidgets.QLabel("")
+        self.futures_status_label.setProperty("muted", True)
+        layout.addWidget(self.futures_status_label)
+
+        self.futures_table = QtWidgets.QTableWidget()
+        self.futures_table.setColumnCount(len(self.FUTURES_COLUMNS))
+        self.futures_table.setHorizontalHeaderLabels(self.FUTURES_COLUMNS)
+        self.futures_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.futures_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        for col, width in enumerate([70, 90, 60, 90, 80, 70, 90, 90, 110]):
+            self.futures_table.setColumnWidth(col, width)
+        layout.addWidget(self.futures_table)
+
+        self._futures_snapshot = {}
+        self._rebuild_futures_table()
+
+    def _rebuild_futures_table(self):
+        rows = [
+            (product, session)
+            for product in DEFAULT_FUTURES_PRODUCTS
+            for session in self.FUTURES_SESSION_ORDER
+            if session in self._futures_snapshot.get(product, {})
+        ]
+        self._futures_rows = rows
+        self.futures_table.setRowCount(len(rows))
+        for index in range(len(rows)):
+            self._paint_futures_row(index)
+
+    def _paint_futures_row(self, index):
+        product, session = self._futures_rows[index]
+        data = self._futures_snapshot[product][session]
+
+        contract_month = data.get("contract_month") or "-"
+        last = data.get("last")
+        last_text = f"{last:,.0f}" if last is not None else "-"
+        change = data.get("change")
+        change_text = f"{change:+,.0f}" if change is not None else "-"
+        settlement = data.get("settlement_price")
+        settlement_text = f"{settlement:,.0f}" if settlement is not None else "-"
+        volume = data.get("volume")
+        volume_text = f"{volume:,}" if volume is not None else "-"
+        open_interest = data.get("open_interest")
+        oi_text = f"{open_interest:,}" if open_interest is not None else "-"
+        change_pct = data.get("change_pct")
+        change_pct_text = f"{change_pct:+.2f}%" if change_pct is not None else "-"
+
+        color = COLOR_GAIN if (change is not None and change >= 0) else (
+            COLOR_LOSS if change is not None else None
+        )
+
+        values = [
+            product, contract_month, session,
+            last_text, change_text, change_pct_text,
+            settlement_text, volume_text, oi_text,
+        ]
+        for col, text in enumerate(values):
+            item = QtWidgets.QTableWidgetItem(text)
+            if col in (3, 4) and color:
+                item.setForeground(QtGui.QColor(color))
+            self.futures_table.setItem(index, col, item)
+
+    def refresh_futures_tab(self):
+        def on_done(snapshot):
+            self._futures_snapshot = snapshot
+            self.futures_status_label.setText("")
+            self._rebuild_futures_table()
+
+        def on_error(message):
+            self.futures_status_label.setText(f"期貨盤後資訊取得失敗：{message}")
+
+        self._futures_task_timer = run_task_in_thread(
+            self, lambda: get_futures_snapshot(DEFAULT_FUTURES_PRODUCTS), on_done, on_error
+        )
 
     # ---------- AI 助理頁 ----------
 
