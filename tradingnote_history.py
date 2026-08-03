@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+"""tradingnote 歷史模組 - 120日歷史價格、產業分類、產業資金流向分析（不依賴任何介面）"""
+
+import re
+import sqlite3
+import threading
+import time
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+from tradingnote_core import PriceFetchError, _http_get_json, _to_float, _to_int
+
+TWSE_MI_INDEX_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
+TWSE_INDUSTRY_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
+TPEX_INDUSTRY_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
+
+INDUSTRY_MAP_MAX_AGE_DAYS = 7
+DEFAULT_BACKFILL_TARGET_DAYS = 120
+DEFAULT_BACKFILL_LOOKBACK_CAP_DAYS = 200
+DEFAULT_BACKFILL_DELAY_SECONDS = 0.3
+
+# 同一個行程（process）內最多只讓一個 backfill_twse_history 在跑：GUI 啟動時的自動
+# 資料連續性同步，跟使用者手動點「回補歷史資料」有可能前後腳同時觸發，兩個都寫同一個
+# SQLite 檔會造成鎖爭用、拖慢甚至互相卡住。用這個 lock 讓第二個呼叫排隊等第一個做完，
+# 而不是真的同時打 API／寫入。
+_backfill_lock = threading.Lock()
+
+_SIGN_RE = re.compile(r">([+-])<")
+
+# 公開資訊觀測站產業別代碼（TWSE／TPEX 共用），驗證方式見 ARCHITECTURE.md。
+# 少數罕見代碼（如 37、38）未能確認對應名稱，industry_name() 會 fallback 顯示原始代碼。
+INDUSTRY_CODE_NAMES = {
+    "01": "水泥工業", "02": "食品工業", "03": "塑膠工業", "04": "紡織纖維",
+    "05": "電機機械", "06": "電器電纜", "08": "玻璃陶瓷", "09": "造紙工業",
+    "10": "鋼鐵工業", "11": "橡膠工業", "12": "汽車工業", "14": "建材營造",
+    "15": "航運業", "16": "觀光事業", "17": "金融保險", "18": "貿易百貨",
+    "19": "綜合", "20": "其他", "21": "化學工業", "22": "生技醫療業",
+    "23": "油電燃氣業", "24": "半導體業", "25": "電腦及週邊設備業", "26": "光電業",
+    "27": "通信網路業", "28": "電子零組件業", "29": "電子通路業", "30": "資訊服務業",
+    "31": "其他電子業", "32": "文化創意業", "33": "農業科技業", "34": "電子商務業",
+    "35": "綠能環保", "36": "數位雲端", "80": "全額交割股", "91": "臺灣存託憑證",
+    "97": "社會企業", "98": "農林漁牧業",
+}
+
+
+@dataclass
+class IndustryFlow:
+    industry: str
+    avg_change_pct: float | None
+    volume_ratio: float | None
+    total_trading_value: float
+    stock_count: int
+
+
+def industry_name(code):
+    code = (code or "").strip()
+    return INDUSTRY_CODE_NAMES.get(code, code or "未分類")
+
+
+def _change_pct(price):
+    if price.close is None or price.change is None:
+        return None
+    prev_close = price.close - price.change
+    if not prev_close:
+        return None
+    return price.change / prev_close * 100
+
+
+# ---------- DB ----------
+
+def _connect(db_path):
+    p = Path(db_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    # timeout=30：遇到鎖定時最多等 30 秒才放棄（sqlite3 預設只有 5 秒），搭配下面的
+    # WAL 模式，讓 CLI／GUI 同時開啟，或 GUI 內背景執行緒（啟動自動同步）跟使用者手動
+    # 點「回補歷史資料」湊巧同時寫入時，不會直接丟出 database is locked。
+    conn = sqlite3.connect(p, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS daily_prices (
+            date TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            market TEXT,
+            name TEXT,
+            close REAL,
+            change_pct REAL,
+            volume INTEGER,
+            trading_value REAL,
+            PRIMARY KEY (date, ticker)
+        )"""
+    )
+    # PK 索引是 (date, ticker)，對「依日期範圍查詢」（compute_industry_flow）有效，但
+    # 對 LIFO 的主要存取模式「WHERE ticker = ? ORDER BY date DESC」（get_latest_ticker_record／
+    # get_ticker_history）完全用不上，會退化成全表掃描。這裡另建一個 (ticker, date DESC)
+    # 索引，讓個股層級的 LIFO 查詢也能吃到索引。
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_daily_prices_ticker_date "
+        "ON daily_prices (ticker, date DESC)"
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS industry_map (
+            ticker TEXT PRIMARY KEY,
+            name TEXT,
+            industry TEXT,
+            market TEXT,
+            updated_at TEXT
+        )"""
+    )
+    conn.commit()
+    return conn
+
+
+# ---------- 每日快照累積（TPEX 逐日累積的唯一來源） ----------
+
+def record_snapshot(db_path, snapshot, as_of_date=None):
+    as_of_date = as_of_date or date.today().isoformat()
+    conn = _connect(db_path)
+    try:
+        conn.executemany(
+            """INSERT OR REPLACE INTO daily_prices
+               (date, ticker, market, name, close, change_pct, volume, trading_value)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    as_of_date,
+                    price.ticker,
+                    price.market,
+                    price.name,
+                    price.close,
+                    _change_pct(price),
+                    price.volume,
+                    price.trading_value,
+                )
+                for price in snapshot.values()
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_history_status(db_path):
+    """回傳「設定」分頁「資料庫狀態」用的彙總統計：整體與 TWSE／TPEX 各自的交易日數、
+    日期範圍、股票數、筆數，外加資料庫檔案大小。只做 GROUP BY 聚合查詢，不把 200 天
+    ×全市場的原始列（數十萬筆）拉進 Python／UI，維持跟「個股」分頁同一套「輕量摘要，
+    非逐列瀏覽」原則。"""
+    conn = _connect(db_path)
+    try:
+        overall_row = conn.execute(
+            "SELECT COUNT(DISTINCT date), MIN(date), MAX(date), "
+            "COUNT(DISTINCT ticker), COUNT(*) FROM daily_prices"
+        ).fetchone()
+        by_market = conn.execute(
+            "SELECT market, COUNT(DISTINCT date), MIN(date), MAX(date), "
+            "COUNT(DISTINCT ticker), COUNT(*) FROM daily_prices GROUP BY market"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    def _to_dict(row):
+        days, min_date, max_date, tickers, rows = row
+        return {
+            "days": days,
+            "min_date": min_date,
+            "max_date": max_date,
+            "tickers": tickers,
+            "rows": rows,
+        }
+
+    db_file = Path(db_path)
+    file_size_bytes = db_file.stat().st_size if db_file.exists() else 0
+
+    return {
+        "overall": _to_dict(overall_row),
+        "by_market": {
+            market: _to_dict((days, min_date, max_date, tickers, rows))
+            for market, days, min_date, max_date, tickers, rows in by_market
+        },
+        "file_size_bytes": file_size_bytes,
+    }
+
+
+def prune_history(db_path, keep_trading_days=DEFAULT_BACKFILL_TARGET_DAYS):
+    conn = _connect(db_path)
+    try:
+        dates = [
+            row[0]
+            for row in conn.execute("SELECT DISTINCT date FROM daily_prices ORDER BY date DESC")
+        ]
+        stale = dates[keep_trading_days:]
+        if stale:
+            conn.executemany("DELETE FROM daily_prices WHERE date = ?", [(d,) for d in stale])
+            conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------- TWSE 歷史回補 ----------
+# TPEX 沒有可用的免費歷史回補端點（已測試 stk_quote_result.php 的 d 參數會被忽略，
+# 永遠只回傳今天的資料），所以只有 TWSE 能一次回補，TPEX 靠 record_snapshot 逐日累積。
+
+def fetch_twse_historical_day(date_str):
+    """date_str 格式 YYYYMMDD。回傳當天全部上市股票紀錄；非交易日回傳 None。"""
+    url = f"{TWSE_MI_INDEX_URL}?date={date_str}&type=ALLBUT0999&response=json"
+    try:
+        data = _http_get_json(url)
+    except PriceFetchError:
+        return None
+    if data.get("stat") != "OK":
+        return None
+
+    tables = data.get("tables") or []
+    quotes_table = next(
+        (t for t in tables if (t.get("fields") or [None])[0] == "證券代號"), None
+    )
+    if quotes_table is None:
+        return None
+
+    records = []
+    for row in quotes_table.get("data", []):
+        try:
+            code, name = row[0].strip(), row[1].strip()
+            volume = _to_int(row[2])
+            trading_value = _to_float(row[4])
+            close = _to_float(row[8])
+            sign_match = _SIGN_RE.search(row[9] or "")
+            sign = -1.0 if sign_match and sign_match.group(1) == "-" else 1.0
+            magnitude = _to_float(row[10]) or 0.0
+        except (IndexError, AttributeError):
+            continue
+        if not code or close is None:
+            continue
+        change = sign * magnitude
+        prev_close = close - change
+        change_pct = (change / prev_close * 100) if prev_close else None
+        records.append(
+            {
+                "ticker": code,
+                "name": name,
+                "market": "TWSE",
+                "close": close,
+                "change_pct": change_pct,
+                "volume": volume,
+                "trading_value": trading_value,
+            }
+        )
+    return records
+
+
+def backfill_twse_history(
+    db_path,
+    target_days=DEFAULT_BACKFILL_TARGET_DAYS,
+    lookback_cap_days=None,
+    delay_seconds=DEFAULT_BACKFILL_DELAY_SECONDS,
+    on_progress=None,
+):
+    """從昨天往回走，補到有 target_days 個 TWSE 交易日為止。已存在的日期會跳過重打，
+    可安全中斷後重跑。`on_progress` 只在真的打了 API 補到新的一天時才會被呼叫——已經
+    存在的日期會靜默跳過，讓「每次啟動都呼叫一次」在資料已經連續的情況下幾乎沒有感知
+    （不會印出/顯示任何進度），只有真的補缺口時才會動。同一行程內若已經有一個 backfill
+    在跑，這個呼叫會先排隊等它做完（見 `_backfill_lock`），而不是同時打 API／寫入。
+
+    `lookback_cap_days` 省略時會依 target_days 自動放大（台股一年約 247 個交易日，
+    日曆天數約是交易日的 1.6 倍，含假日緩衝），讓使用者調高 target_days（例如設定頁
+    的「回補天數」）時，掃描上限不會沒跟著放大而提早停在還沒補滿 target_days 的地方；
+    下限固定沿用原本 DEFAULT_BACKFILL_LOOKBACK_CAP_DAYS，維持預設值（120 天）行為不變。"""
+    if lookback_cap_days is None:
+        lookback_cap_days = max(
+            DEFAULT_BACKFILL_LOOKBACK_CAP_DAYS, int(target_days * 1.6)
+        )
+    with _backfill_lock:
+        return _backfill_twse_history_locked(
+            db_path, target_days, lookback_cap_days, delay_seconds, on_progress
+        )
+
+
+def _backfill_twse_history_locked(
+    db_path, target_days, lookback_cap_days, delay_seconds, on_progress
+):
+    conn = _connect(db_path)
+    try:
+        existing_dates = {
+            row[0]
+            for row in conn.execute("SELECT DISTINCT date FROM daily_prices WHERE market = 'TWSE'")
+        }
+
+        done = 0
+        cursor_date = date.today() - timedelta(days=1)
+        scanned = 0
+        while done < target_days and scanned < lookback_cap_days:
+            iso_date = cursor_date.isoformat()
+            date_str = cursor_date.strftime("%Y%m%d")
+            scanned += 1
+
+            if iso_date in existing_dates:
+                done += 1
+                cursor_date -= timedelta(days=1)
+                continue
+
+            records = fetch_twse_historical_day(date_str)
+            time.sleep(delay_seconds)
+            if records:
+                conn.executemany(
+                    """INSERT OR REPLACE INTO daily_prices
+                       (date, ticker, market, name, close, change_pct, volume, trading_value)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [
+                        (
+                            iso_date,
+                            r["ticker"],
+                            r["market"],
+                            r["name"],
+                            r["close"],
+                            r["change_pct"],
+                            r["volume"],
+                            r["trading_value"],
+                        )
+                        for r in records
+                    ],
+                )
+                conn.commit()
+                existing_dates.add(iso_date)
+                done += 1
+                if on_progress:
+                    on_progress(done, target_days)
+
+            cursor_date -= timedelta(days=1)
+
+        return done
+    finally:
+        conn.close()
+
+
+# ---------- 個股資料查詢（LIFO：一律以 date DESC 為主要存取順序） ----------
+# 本專案存取單一股票歷史資料的標準方式是 LIFO（最新日期優先）：即時快照若缺漏某檔股票
+# （例如 API 當下沒回傳、或使用者查詢時剛好卡在重新整理中間），一律先往歷史資料庫要
+# 「最新一筆」而不是任意一筆，確保資料連續性延伸到單檔股票查詢的層面。
+
+def get_latest_ticker_record(db_path, ticker):
+    """LIFO 查詢：回傳某檔股票在歷史資料庫中最新一筆紀錄，查無資料回傳 None。"""
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            """SELECT date, market, name, close, change_pct, volume, trading_value
+               FROM daily_prices WHERE ticker = ? ORDER BY date DESC LIMIT 1""",
+            (ticker,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    d, market, name, close, change_pct, volume, trading_value = row
+    return {
+        "date": d,
+        "market": market,
+        "name": name,
+        "close": close,
+        "change_pct": change_pct,
+        "volume": volume,
+        "trading_value": trading_value,
+    }
+
+
+def get_ticker_history(db_path, ticker, limit=None):
+    """LIFO 查詢：回傳某檔股票的歷史紀錄，固定以 date DESC（最新優先）排序。"""
+    conn = _connect(db_path)
+    try:
+        sql = (
+            "SELECT date, close, change_pct, volume, trading_value "
+            "FROM daily_prices WHERE ticker = ? ORDER BY date DESC"
+        )
+        params = [ticker]
+        if limit:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    return rows
+
+
+# ---------- 產業分類 ----------
+
+def fetch_industry_map():
+    twse_rows = _http_get_json(TWSE_INDUSTRY_URL)
+    tpex_rows = _http_get_json(TPEX_INDUSTRY_URL)
+
+    mapping = {}
+    for rec in twse_rows:
+        code = (rec.get("公司代號") or "").strip()
+        if not code:
+            continue
+        mapping[code] = {
+            "name": (rec.get("公司簡稱") or "").strip(),
+            "industry": industry_name(rec.get("產業別")),
+            "market": "TWSE",
+        }
+    for rec in tpex_rows:
+        code = (rec.get("SecuritiesCompanyCode") or "").strip()
+        if not code:
+            continue
+        mapping[code] = {
+            "name": (rec.get("CompanyAbbreviation") or "").strip(),
+            "industry": industry_name(rec.get("SecuritiesIndustryCode")),
+            "market": "TPEX",
+        }
+    return mapping
+
+
+def refresh_industry_map(db_path):
+    mapping = fetch_industry_map()
+    now = datetime.now().isoformat()
+    conn = _connect(db_path)
+    try:
+        conn.executemany(
+            """INSERT OR REPLACE INTO industry_map (ticker, name, industry, market, updated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            [
+                (ticker, info["name"], info["industry"], info["market"], now)
+                for ticker, info in mapping.items()
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return mapping
+
+
+def _load_industry_rows(db_path, max_age_days=INDUSTRY_MAP_MAX_AGE_DAYS):
+    """回傳 industry_map 全部欄位（ticker, name, industry, market, updated_at），
+    共用同一套 7 日 TTL 快取／過期重抓邏輯，讓 get_industry_map 與
+    get_industry_directory 不用各自重寫一次。"""
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT ticker, name, industry, market, updated_at FROM industry_map"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if rows:
+        oldest = min(row[4] for row in rows)
+        if (datetime.now() - datetime.fromisoformat(oldest)).days < max_age_days:
+            return rows
+
+    try:
+        mapping = refresh_industry_map(db_path)
+    except PriceFetchError:
+        if rows:
+            return rows
+        raise
+    now = datetime.now().isoformat()
+    return [
+        (ticker, info["name"], info["industry"], info["market"], now)
+        for ticker, info in mapping.items()
+    ]
+
+
+def get_industry_map(db_path, max_age_days=INDUSTRY_MAP_MAX_AGE_DAYS):
+    rows = _load_industry_rows(db_path, max_age_days)
+    return {ticker: industry for ticker, _name, industry, _market, _updated in rows}
+
+
+def get_industry_directory(db_path, max_age_days=INDUSTRY_MAP_MAX_AGE_DAYS):
+    """回傳 {ticker: {"name":, "industry":, "market":}}，供「個股」模組依族群列出
+    全市場股票用（比 get_industry_map 多帶 name／market，不只有 industry）。"""
+    rows = _load_industry_rows(db_path, max_age_days)
+    return {
+        ticker: {"name": name, "industry": industry, "market": market}
+        for ticker, name, industry, market, _updated in rows
+    }
+
+
+# ---------- 產業資金流向分析 ----------
+
+def compute_industry_flow(db_path, snapshot, avg_days=5):
+    """avg_days 同時決定兩件事，讓 X／Y 兩軸的「N 日流向」定義一致：
+    ① avg_change_pct：該產業近 avg_days 個交易日的累積漲跌%（以今日收盤對比 avg_days
+       個交易日前收盤，用今日成交金額加權平均），取代單日漲跌%；
+    ② volume_ratio：今日成交量對近 avg_days 日均量的比值（沿用原本邏輯）。
+    兩者用同一組「有足夠歷史資料」的成分股計算，資料不足的產業兩者皆回傳 None（由呼叫端
+    過濾不畫出），不會出現 X 有值但 Y 沒有值的不一致情況。"""
+    industry_map = get_industry_map(db_path)
+
+    groups = {}
+    for price in snapshot.values():
+        if price.close is None or price.trading_value is None:
+            continue
+        industry = industry_map.get(price.ticker)
+        if not industry:
+            continue
+        g = groups.setdefault(
+            industry,
+            {"trading_value": 0.0, "ticker_prices": {}, "ticker_volumes": {}, "ticker_values": {}},
+        )
+        g["trading_value"] += price.trading_value
+        g["ticker_prices"][price.ticker] = price.close
+        g["ticker_volumes"][price.ticker] = price.volume or 0
+        g["ticker_values"][price.ticker] = price.trading_value
+
+    min_history_days = max(2, avg_days // 2)
+    cutoff = (date.today() - timedelta(days=avg_days * 3)).isoformat()
+    conn = _connect(db_path)
+    try:
+        # LIFO：以 date DESC 為主要存取順序，讓每檔股票的區間內紀錄天然由新到舊排列，
+        # 下面直接取前 avg_days 筆即為「近 avg_days 日」，不需要再用 Python 額外排序；
+        # 該切片的最後一筆（最舊）即為「avg_days 個交易日前」的收盤價基準。
+        history_rows = conn.execute(
+            """SELECT ticker, date, close, volume FROM daily_prices
+               WHERE date < ? AND date >= ? ORDER BY date DESC""",
+            (date.today().isoformat(), cutoff),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    ticker_history = {}
+    for ticker, day, close, volume in history_rows:
+        ticker_history.setdefault(ticker, []).append((day, close, volume or 0))
+
+    results = []
+    for industry, g in groups.items():
+        if g["trading_value"] <= 0:
+            continue
+
+        weighted_change, change_weight = 0.0, 0.0
+        today_volume, baseline_volume = 0.0, 0.0
+        for ticker, today_close in g["ticker_prices"].items():
+            days = ticker_history.get(ticker, [])[:avg_days]
+            if len(days) < min_history_days:
+                continue
+            baseline_close = days[-1][1]
+            if not baseline_close:
+                continue
+            n_day_change_pct = (today_close - baseline_close) / baseline_close * 100
+            trading_value = g["ticker_values"][ticker]
+            weighted_change += n_day_change_pct * trading_value
+            change_weight += trading_value
+
+            baseline_volume += sum(v for _, _, v in days) / len(days)
+            today_volume += g["ticker_volumes"][ticker]
+
+        avg_change_pct = (weighted_change / change_weight) if change_weight > 0 else None
+        volume_ratio = (today_volume / baseline_volume) if baseline_volume > 0 else None
+
+        results.append(
+            IndustryFlow(
+                industry=industry,
+                avg_change_pct=avg_change_pct,
+                volume_ratio=volume_ratio,
+                total_trading_value=g["trading_value"],
+                stock_count=len(g["ticker_prices"]),
+            )
+        )
+
+    results.sort(key=lambda r: r.total_trading_value, reverse=True)
+    return results
+
+
+# ---------- 產業成分股（依累積成交金額排序，作為市值代理指標） ----------
+# 本專案沒有股本／發行股數資料（PriceInfo、daily_prices 都只有收盤價、成交量、成交
+# 金額），無法計算真正市值，因此「前N大成分股」改以區間累積成交金額排序，資料來源是
+# 即時 snapshot（今日）＋ daily_prices（歷史），不額外打 API，跟「個股」分頁列清單的
+# 原則一致。
+
+def get_industry_top_stocks_range(db_path, snapshot, industry, days, top_n=10):
+    """回傳某產業前 top_n 大成分股，排序依據是近 days 個交易日（含今日）的
+    「累積成交金額」，讓成分股排名跟「資金流向分析」頁（泡泡圖／資金動向清單）的
+    資料區間口徑一致。今日成交金額／收盤來自即時 snapshot，
+    days-1 天以前的歷史資料來自 daily_prices，抓法跟 compute_industry_flow 相同
+    （today 不在 daily_prices 裡，用 date < today 排除，避免重複計入）。change_pct
+    是區間累積漲跌%（區間起點收盤到今日收盤），跟清單「加權漲跌%」欄位定義一致。
+    歷史筆數不足 days 天的 ticker 仍會列入、用實際可拿到的筆數計算，不像
+    compute_industry_flow 會整檔排除——這裡只是排序用途，不要求嚴謹的樣本數。"""
+    industry_map = get_industry_map(db_path)
+
+    today_by_ticker = {}
+    for price in snapshot.values():
+        if price.close is None or price.trading_value is None:
+            continue
+        if industry_map.get(price.ticker) != industry:
+            continue
+        today_by_ticker[price.ticker] = price
+
+    if not today_by_ticker:
+        return []
+
+    tickers = list(today_by_ticker)
+    cutoff = (date.today() - timedelta(days=max(days, 1) * 3)).isoformat()
+    conn = _connect(db_path)
+    try:
+        placeholders = ",".join("?" * len(tickers))
+        rows = conn.execute(
+            f"""SELECT ticker, date, close, trading_value FROM daily_prices
+               WHERE ticker IN ({placeholders}) AND date < ? AND date >= ?
+               ORDER BY date DESC""",
+            (*tickers, date.today().isoformat(), cutoff),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    ticker_history = {}
+    for ticker, day, close, trading_value in rows:
+        ticker_history.setdefault(ticker, []).append((day, close, trading_value or 0.0))
+
+    results = []
+    for ticker, price in today_by_ticker.items():
+        history = ticker_history.get(ticker, [])[: max(days - 1, 0)]
+        total_trading_value = price.trading_value + sum(v for _, _, v in history)
+        baseline_close = history[-1][1] if history else price.close
+        change_pct = (
+            (price.close - baseline_close) / baseline_close * 100
+            if baseline_close
+            else None
+        )
+        results.append(
+            {
+                "ticker": ticker,
+                "name": price.name,
+                "close": price.close,
+                "change_pct": change_pct,
+                "trading_value": total_trading_value,
+            }
+        )
+
+    results.sort(key=lambda r: r["trading_value"], reverse=True)
+    return results[:top_n]
