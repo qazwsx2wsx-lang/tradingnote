@@ -225,6 +225,22 @@ def _snapshot_date(snapshot):
     return Counter(dates).most_common(1)[0][0]
 
 
+def _futures_snapshot_date(futures_snapshot):
+    """回傳期貨盤後快照（get_futures_snapshot 的回傳值）裡最新的資料日期，格式轉成
+    跟 _snapshot_date／history.db 一致的 "YYYY-MM-DD"（TAIFEX 原始欄位是 "YYYYMMDD"）；
+    快照是空的就回傳 None。"""
+    dates = [
+        data["date"]
+        for sessions in futures_snapshot.values()
+        for data in sessions.values()
+        if data.get("date")
+    ]
+    if not dates:
+        return None
+    raw = max(dates)
+    return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}"
+
+
 _MARKET_LABELS = {"TWSE": "上市 TWSE", "TPEX": "上櫃 TPEX"}
 
 
@@ -945,8 +961,6 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.flow_avg_days = 5
 
         toolbar = QtWidgets.QHBoxLayout()
-        toolbar.addWidget(accent_button("重新整理", self.force_refresh))
-        toolbar.addSpacing(12)
         toolbar.addWidget(QtWidgets.QLabel("流向天數："))
         self.flow_days_spin = QtWidgets.QSpinBox()
         self.flow_days_spin.setRange(1, 500)
@@ -1103,7 +1117,12 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
     def open_backfill_dialog(self):
         target_days = self.settings.get("backfill_target_days", DEFAULT_BACKFILL_TARGET_DAYS)
-        dialog = BackfillDialog(self, target_days=target_days, on_complete=self.refresh_flow_tab)
+
+        def on_complete():
+            self.refresh_flow_tab()
+            self._refresh_history_status()
+
+        dialog = BackfillDialog(self, target_days=target_days, on_complete=on_complete)
         dialog.exec()
 
     def _sync_history_continuity(self):
@@ -1117,6 +1136,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self._update_status_bar()
             if had_progress:
                 self.refresh_flow_tab()
+                self._refresh_history_status()
 
         def on_error(_message):
             self.continuity_note = ""
@@ -1138,7 +1158,6 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         toolbar.addWidget(QtWidgets.QPushButton("編輯部位", clicked=self.open_edit_dialog))
         toolbar.addWidget(QtWidgets.QPushButton("刪除部位", clicked=self.delete_selected))
         toolbar.addWidget(QtWidgets.QPushButton("查價", clicked=self.open_price_dialog))
-        toolbar.addWidget(QtWidgets.QPushButton("重新整理", clicked=self.force_refresh))
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
 
@@ -1248,7 +1267,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             return
         pos = find_position(self.positions, position_id)
         if pos is None:
-            QtWidgets.QMessageBox.warning(self, "錯誤", "找不到這個部位，畫面可能已過期，請重新整理。")
+            QtWidgets.QMessageBox.warning(
+                self, "錯誤", "找不到這個部位，畫面可能已過期，請至「設定」分頁按「重新整理所有資料」。"
+            )
             return
 
         def on_submit(_ticker, shares, entry_price, entry_date, note):
@@ -1294,6 +1315,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.refresh_flow_tab()
         self.refresh_stocks_tab()
         self.refresh_futures_tab()
+        self._refresh_data_freshness_label()
+        self._refresh_history_status()
 
     # ---------- 個股頁 ----------
 
@@ -1469,15 +1492,11 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(self.futures_tab)
         layout.setContentsMargins(10, 10, 10, 10)
 
-        toolbar = QtWidgets.QHBoxLayout()
-        toolbar.addWidget(accent_button("重新整理", self.refresh_futures_tab))
-        toolbar.addStretch(1)
-        layout.addLayout(toolbar)
-
         hint = QtWidgets.QLabel(
             "近月指數期貨（TX 臺股期貨／MTX 小型臺指期貨）盤後資訊，資料來自 TAIFEX 官方"
             "「期貨每日交易行情」，免金鑰、每個交易日更新一次，非即時報價——"
-            "「一般」為日盤收盤後的彙總、「盤後」為夜盤收盤後的彙總。"
+            "「一般」為日盤收盤後的彙總、「盤後」為夜盤收盤後的彙總。跟其他資料一起在"
+            "「設定」分頁按「重新整理所有資料」更新。"
         )
         hint.setProperty("muted", True)
         hint.setWordWrap(True)
@@ -1549,6 +1568,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self._futures_snapshot = snapshot
             self.futures_status_label.setText("")
             self._rebuild_futures_table()
+            self._refresh_data_freshness_label()
 
         def on_error(message):
             self.futures_status_label.setText(f"期貨盤後資訊取得失敗：{message}")
@@ -1681,6 +1701,24 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addWidget(header)
         layout.addSpacing(4)
 
+        # 全部的「重新整理」統一到這裡：原本資金流向分析／部位紀錄／期貨三個分頁
+        # 各有一顆重複的按鈕，其實都是呼叫同一個 force_refresh（期貨在
+        # _apply_refresh_result 裡跟著一起刷新），拆開放在各分頁反而讓人以為
+        # 是三個獨立的資料來源；集中在這裡＋下方即時顯示各類資料實際的最新日期，
+        # 使用者才看得出「重新整理」到底有沒有真的抓到新資料。
+        layout.addWidget(
+            accent_button("重新整理所有資料", self.force_refresh),
+            alignment=QtCore.Qt.AlignLeft,
+        )
+        layout.addSpacing(4)
+
+        self.data_freshness_label = QtWidgets.QLabel("")
+        self.data_freshness_label.setProperty("muted", True)
+        self.data_freshness_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        layout.addWidget(self.data_freshness_label)
+        self._refresh_data_freshness_label()
+        layout.addSpacing(20)
+
         self.auto_check_box = QtWidgets.QCheckBox(
             "每次啟動自動檢測（TWSE 歷史資料有缺口時自動補齊）"
         )
@@ -1722,15 +1760,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         )
 
         layout.addSpacing(20)
-        status_row = QtWidgets.QHBoxLayout()
         status_header = QtWidgets.QLabel("資料庫狀態")
         status_header.setProperty("header", True)
-        status_row.addWidget(status_header)
-        status_row.addStretch(1)
-        status_row.addWidget(
-            QtWidgets.QPushButton("重新整理", clicked=self._refresh_history_status)
-        )
-        layout.addLayout(status_row)
+        layout.addWidget(status_header)
         layout.addSpacing(4)
 
         self.history_status_label = QtWidgets.QLabel("")
@@ -1780,6 +1812,18 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
     def _on_backfill_days_changed(self, value):
         self.settings["backfill_target_days"] = value
         save_settings(SETTINGS_PATH, self.settings)
+
+    def _refresh_data_freshness_label(self):
+        """顯示各類資料「實際擷取到的最新一筆資料日期」，不是「上次按重新整理的
+        時間」——重新整理有可能因為連線失敗、或當天 TWSE/TPEX/TAIFEX 還沒發布新
+        資料而拿到跟之前一樣的日期，這裡一律以資料本身的日期欄位為準（_snapshot_date
+        取 PriceInfo.date 眾數、_futures_snapshot_date 取 TAIFEX 回傳的 Date 欄位）。"""
+        stock_date = _snapshot_date(self.snapshot) or "尚無資料"
+        futures_date = _futures_snapshot_date(getattr(self, "_futures_snapshot", {})) or "尚無資料"
+        self.data_freshness_label.setText(
+            f"台股即時報價（TWSE／TPEX）最新日期：{stock_date}\n"
+            f"期貨盤後（TAIFEX TX／MTX）最新日期：{futures_date}"
+        )
 
     def _refresh_history_status(self):
         """本地 SQLite 聚合查詢（COUNT／MIN／MAX，非逐列讀取），即使累積到 ~200 天、
