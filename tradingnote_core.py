@@ -5,7 +5,7 @@ import json
 import re
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -333,7 +333,7 @@ def get_market_snapshot(cache_path, force_refresh=False, on_progress=None):
     total_steps = 3
     try:
         _progress(0, total_steps, "正在取得上市（TWSE）報價...")
-        twse = fetch_twse_all()
+        twse = _twse_all_with_staleness_fallback(fetch_twse_all())
         _progress(1, total_steps, "正在取得上櫃（TPEX）報價...")
         tpex = fetch_tpex_all()
         _progress(2, total_steps, "正在寫入快取...")
@@ -358,6 +358,100 @@ def get_market_snapshot(cache_path, force_refresh=False, on_progress=None):
         )
     _progress(3, total_steps, "快取寫入完成")
     return snapshot
+
+
+def _previous_business_day(d):
+    d -= timedelta(days=1)
+    while d.weekday() >= 5:  # 5=Sat, 6=Sun
+        d -= timedelta(days=1)
+    return d
+
+
+def snapshot_staleness_warnings(snapshot, today=None, max_lag_business_days=1):
+    """檢查 snapshot 裡每個市場（TWSE／TPEX 分開看，避免其中一邊卡住被另一邊
+    的正常資料稀釋掉）目前最新的資料日期，跟「今天」比起來落後幾個營業日。
+    容許落後 max_lag_business_days 個營業日（預設 1）——涵蓋官方資料在當天
+    交易時間內、收盤前尚未發布的正常情況；超過這個門檻才視為異常（例如
+    TWSE STOCK_DAY_ALL 卡住連續好幾天不更新，就是這次 8/3 資料寫錯的起因）。
+    只用「跳過六日」判斷營業日，不含國定假日行事曆，遇到連假可能誤報，
+    可接受。回傳警告文字清單，沒有異常則回傳空 list。"""
+    today = today or date.today()
+    limit = today
+    for _ in range(max_lag_business_days):
+        limit = _previous_business_day(limit)
+
+    by_market = {}
+    for p in snapshot.values():
+        if p.date:
+            by_market.setdefault(p.market, set()).add(p.date)
+
+    warnings = []
+    for market, dates in sorted(by_market.items()):
+        latest = max(dates)
+        try:
+            latest_d = date.fromisoformat(latest)
+        except ValueError:
+            continue
+        if latest_d < limit:
+            warnings.append(
+                f"{market} 資料可能落後：最新僅到 {latest}（今天 {today.isoformat()}）"
+            )
+    return warnings
+
+
+def _twse_all_with_staleness_fallback(
+    twse, max_lag_business_days=1, today=None, lookback_days=10
+):
+    """twse 是 fetch_twse_all()（STOCK_DAY_ALL）的回傳值。若最新資料日期落後超過
+    max_lag_business_days 個營業日（跟 snapshot_staleness_warnings 用同一套門檻），
+    改用 MI_INDEX（tradingnote_history.fetch_twse_historical_day，backfill 歷史
+    回補用的同一個端點，已實測比 STOCK_DAY_ALL 更新得快）往回找最近一個有資料的
+    交易日取代，避免「現價」長期卡在舊資料（就是 2026-08-03 那次事故的成因：
+    STOCK_DAY_ALL 卡住不更新，但 MI_INDEX 當時已經有正確的當天資料）。這裡用
+    函式內的延後 import，避免跟會 import 這個模組的 tradingnote_history 在載入
+    階段形成循環 import；只有真的判定落後太久時才會用到。找不到更新資料就原樣
+    回傳 twse（不會比原本更差）。"""
+    if not twse:
+        return twse
+    today = today or date.today()
+    limit = today
+    for _ in range(max_lag_business_days):
+        limit = _previous_business_day(limit)
+
+    dates = {p.date for p in twse.values() if p.date}
+    if not dates:
+        return twse
+    try:
+        latest_d = date.fromisoformat(max(dates))
+    except ValueError:
+        return twse
+    if latest_d >= limit:
+        return twse
+
+    from tradingnote_history import fetch_twse_historical_day
+
+    cursor = today
+    for _ in range(lookback_days):
+        records = fetch_twse_historical_day(cursor.strftime("%Y%m%d"))
+        if records:
+            return {
+                r["ticker"]: PriceInfo(
+                    ticker=r["ticker"],
+                    name=r["name"],
+                    open=r.get("open"),
+                    high=r.get("high"),
+                    low=r.get("low"),
+                    close=r["close"],
+                    change=r.get("change"),
+                    volume=r["volume"],
+                    date=cursor.isoformat(),
+                    market="TWSE",
+                    trading_value=r["trading_value"],
+                )
+                for r in records
+            }
+        cursor -= timedelta(days=1)
+    return twse
 
 
 def lookup_price(ticker, snapshot):

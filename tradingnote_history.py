@@ -114,7 +114,14 @@ def _connect(db_path):
 # ---------- 每日快照累積（TPEX 逐日累積的唯一來源） ----------
 
 def record_snapshot(db_path, snapshot, as_of_date=None):
-    as_of_date = as_of_date or date.today().isoformat()
+    """`as_of_date` 給定時強制套用到每一筆（呼叫端明確指定的情況）；未給定時改採
+    每檔股票自己的 `price.date`（即 API 回傳的實際交易日期，例如 TWSE 的
+    STOCK_DAY_ALL 尚未更新到今天時，回傳的仍是上一個交易日的資料，此時
+    `price.date` 會忠實反映那個「上一個交易日」而不是打 API 當下的日曆日期）。
+    只有 `price.date` 缺漏（理論上不會發生，防禦性 fallback）才退回今天的日期。
+    這樣同一次 snapshot 裡 TWSE／TPEX 更新進度不同步時，各自會存到正確的日期，
+    不會把某個市場還沒更新的舊資料誤標成今天。"""
+    today_iso = date.today().isoformat()
     conn = _connect(db_path)
     try:
         conn.executemany(
@@ -123,7 +130,7 @@ def record_snapshot(db_path, snapshot, as_of_date=None):
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (
-                    as_of_date,
+                    as_of_date or price.date or today_iso,
                     price.ticker,
                     price.market,
                     price.name,
@@ -223,6 +230,9 @@ def fetch_twse_historical_day(date_str):
             code, name = row[0].strip(), row[1].strip()
             volume = _to_int(row[2])
             trading_value = _to_float(row[4])
+            open_ = _to_float(row[5])
+            high = _to_float(row[6])
+            low = _to_float(row[7])
             close = _to_float(row[8])
             sign_match = _SIGN_RE.search(row[9] or "")
             sign = -1.0 if sign_match and sign_match.group(1) == "-" else 1.0
@@ -239,7 +249,11 @@ def fetch_twse_historical_day(date_str):
                 "ticker": code,
                 "name": name,
                 "market": "TWSE",
+                "open": open_,
+                "high": high,
+                "low": low,
                 "close": close,
+                "change": change,
                 "change_pct": change_pct,
                 "volume": volume,
                 "trading_value": trading_value,

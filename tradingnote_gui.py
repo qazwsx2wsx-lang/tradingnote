@@ -23,6 +23,7 @@ from tradingnote_core import (
     remove_position,
     save_positions,
     save_settings,
+    snapshot_staleness_warnings,
     update_position,
 )
 from tradingnote_history import (
@@ -816,9 +817,11 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self.snapshot = get_market_snapshot(CACHE_PATH)
             record_snapshot(HISTORY_DB_PATH, self.snapshot)
             self.last_error = None
+            self.staleness_warning = "；".join(snapshot_staleness_warnings(self.snapshot))
         except PriceFetchError as e:
             self.snapshot = {}
             self.last_error = str(e)
+            self.staleness_warning = ""
 
         self.continuity_note = ""
         self._total_pnl = None
@@ -1241,8 +1244,11 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             f"總損益：{self._total_pnl:+.0f}" if self._total_pnl is not None else "總損益：N/A"
         )
         error_note = f"　⚠ {self.last_error}" if self.last_error else ""
+        staleness_note = f"　⚠ {self.staleness_warning}" if self.staleness_warning else ""
         continuity_note = f"　{self.continuity_note}" if self.continuity_note else ""
-        self.status_bar.showMessage(f"{cache_note}　{total_note}{error_note}{continuity_note}")
+        self.status_bar.showMessage(
+            f"{cache_note}　{total_note}{error_note}{staleness_note}{continuity_note}"
+        )
 
     def open_add_dialog(self):
         def on_submit(ticker, shares, entry_price, entry_date, note):
@@ -1306,6 +1312,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         if snapshot is not None:
             self.snapshot = snapshot
             self.last_error = None
+            self.staleness_warning = "；".join(snapshot_staleness_warnings(snapshot))
             self._known_data_date = _snapshot_date(snapshot) or self._known_data_date
             self._dismissed_data_date = None
             self.new_data_banner.setVisible(False)

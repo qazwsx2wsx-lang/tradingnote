@@ -15,6 +15,7 @@ from tradingnote_core import (
     lookup_price,
     remove_position,
     save_positions,
+    snapshot_staleness_warnings,
     update_position,
 )
 from tradingnote_history import (
@@ -220,6 +221,8 @@ def parse_command(cmd, positions, snapshot_ref, cache_path, settings):
             snapshot_ref = get_market_snapshot(cache_path, force_refresh=True)
             record_snapshot(HISTORY_DB_PATH, snapshot_ref)
             print("已重新抓取台股價格。")
+            for warning in snapshot_staleness_warnings(snapshot_ref):
+                print(f"⚠ {warning}")
         except PriceFetchError as e:
             print(f"重新抓取失敗：{e}")
         return snapshot_ref
@@ -313,6 +316,8 @@ def main():
     try:
         snapshot = get_market_snapshot(CACHE_PATH)
         record_snapshot(HISTORY_DB_PATH, snapshot)
+        for warning in snapshot_staleness_warnings(snapshot):
+            print(f"⚠ {warning}")
     except PriceFetchError as e:
         print(f"價格資料抓取失敗（{e}），將以無價格模式啟動。")
         snapshot = {}
