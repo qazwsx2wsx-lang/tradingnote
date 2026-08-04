@@ -80,20 +80,23 @@ COLUMNS = [
     ("updated_at", "更新日期", 90),
 ]
 
-# ---------- 視覺主題（暖米色背景 + 赤陶色重點色，呼應 Claude 介面風格） ----------
-COLOR_BG = "#F5F4ED"
+# ---------- 視覺主題（黑白灰極簡風格；漲跌與產業分類色刻意不受此影響，見下方） ----------
+COLOR_BG = "#FFFFFF"
 COLOR_SURFACE = "#FFFFFF"
-COLOR_TEXT = "#3D3929"
-COLOR_MUTED = "#8A8677"
-COLOR_ACCENT = "#CC785C"
-COLOR_ACCENT_ACTIVE = "#B8654A"
+COLOR_TEXT = "#1A1A1A"
+COLOR_MUTED = "#767676"
+COLOR_ACCENT = "#1A1A1A"
+COLOR_ACCENT_ACTIVE = "#000000"
 COLOR_ACCENT_TEXT = "#FFFFFF"
-COLOR_BORDER = "#E5E2D6"
-COLOR_ROW_ALT = "#FAF9F4"
+COLOR_BORDER = "#DCDCDC"
+COLOR_ROW_ALT = "#F7F7F7"
+COLOR_HOVER = "#EDEDED"
+# 漲跌（損益）刻意保留紅綠上色——功能性色彩，用來一眼辨識盈虧方向，不算裝飾用色。
 COLOR_GAIN = "#1E7A3E"
 COLOR_LOSS = "#C0392B"
 
-# matplotlib 的 tab20 定性配色表（手動內嵌，避免 pyqtgraph 為了取這組色再偷偷依賴 matplotlib）
+# matplotlib 的 tab20 定性配色表（手動內嵌，避免 pyqtgraph 為了取這組色再偷偷依賴 matplotlib）。
+# 黑白主題刻意不套用到這裡——這是資金流向頁唯一需要區分約35個產業類別的地方，改灰階會讓類別難以辨識。
 TAB20_COLORS = [
     "#1f77b4", "#aec7e8", "#ff7f0e", "#ffbb78", "#2ca02c", "#98df8a",
     "#d62728", "#ff9896", "#9467bd", "#c5b0d5", "#8c564b", "#c49c94",
@@ -130,7 +133,7 @@ QTabBar::tab:selected {{
     font-weight: 600;
 }}
 QTabBar::tab:hover:!selected {{
-    background: #DCD9CC;
+    background: {COLOR_HOVER};
 }}
 QPushButton {{
     background: {COLOR_SURFACE};
