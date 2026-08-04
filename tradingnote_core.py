@@ -367,18 +367,37 @@ def _previous_business_day(d):
     return d
 
 
-def snapshot_staleness_warnings(snapshot, today=None, max_lag_business_days=1):
-    """檢查 snapshot 裡每個市場（TWSE／TPEX 分開看，避免其中一邊卡住被另一邊
-    的正常資料稀釋掉）目前最新的資料日期，跟「今天」比起來落後幾個營業日。
-    容許落後 max_lag_business_days 個營業日（預設 1）——涵蓋官方資料在當天
-    交易時間內、收盤前尚未發布的正常情況；超過這個門檻才視為異常（例如
-    TWSE STOCK_DAY_ALL 卡住連續好幾天不更新，就是這次 8/3 資料寫錯的起因）。
-    只用「跳過六日」判斷營業日，不含國定假日行事曆，遇到連假可能誤報，
-    可接受。回傳警告文字清單，沒有異常則回傳空 list。"""
-    today = today or date.today()
+# TWSE STOCK_DAY_ALL 正常會在收盤（13:30）後數小時內公佈當天資料；官方沒有
+# SLA，這裡抓一個保守值。此時刻之前，今天的資料本來就可能還沒公佈，「最新僅到
+# 昨天」是正常狀態；此時刻之後仍然只到昨天，才視為真的卡住。
+TWSE_PUBLISH_CUTOFF_HOUR = 15
+
+
+def _staleness_limit(today, max_lag_business_days, now=None):
+    """回傳「可接受的最舊資料日期」。現在時刻若已過 TWSE_PUBLISH_CUTOFF_HOUR，
+    今天的資料理論上早該公佈，不再給予 max_lag_business_days 的寬限（否則
+    這個寬限會在收盤後的每一刻都掩蓋掉整整一個營業日的落後，等於永遠不會觸發
+    ——這正是 8/4 晚上 STOCK_DAY_ALL 卡在前一天資料、卻沒被偵測到的成因）；
+    未過此時刻則沿用原本「容忍 max_lag_business_days 個營業日」的寬限，涵蓋
+    今天資料本來就還沒公佈的正常情況。"""
+    now = now or datetime.now()
+    if now.hour >= TWSE_PUBLISH_CUTOFF_HOUR:
+        return today
     limit = today
     for _ in range(max_lag_business_days):
         limit = _previous_business_day(limit)
+    return limit
+
+
+def snapshot_staleness_warnings(snapshot, today=None, max_lag_business_days=1, now=None):
+    """檢查 snapshot 裡每個市場（TWSE／TPEX 分開看，避免其中一邊卡住被另一邊
+    的正常資料稀釋掉）目前最新的資料日期，是否落後超過可接受範圍（見
+    `_staleness_limit`：白天容忍 max_lag_business_days 個營業日，過了官方通常
+    公佈時間後不再容忍，例如 TWSE STOCK_DAY_ALL 卡住連續好幾天不更新，就是這次
+    8/3 資料寫錯的起因）。只用「跳過六日」判斷營業日，不含國定假日行事曆，遇到
+    連假可能誤報，可接受。回傳警告文字清單，沒有異常則回傳空 list。"""
+    today = today or date.today()
+    limit = _staleness_limit(today, max_lag_business_days, now=now)
 
     by_market = {}
     for p in snapshot.values():
@@ -400,23 +419,23 @@ def snapshot_staleness_warnings(snapshot, today=None, max_lag_business_days=1):
 
 
 def _twse_all_with_staleness_fallback(
-    twse, max_lag_business_days=1, today=None, lookback_days=10
+    twse, max_lag_business_days=1, today=None, lookback_days=10, now=None
 ):
     """twse 是 fetch_twse_all()（STOCK_DAY_ALL）的回傳值。若最新資料日期落後超過
-    max_lag_business_days 個營業日（跟 snapshot_staleness_warnings 用同一套門檻），
+    可接受範圍（跟 snapshot_staleness_warnings 用同一套 `_staleness_limit` 門檻：
+    白天容忍 max_lag_business_days 個營業日，過了官方通常公佈時間後不再容忍），
     改用 MI_INDEX（tradingnote_history.fetch_twse_historical_day，backfill 歷史
     回補用的同一個端點，已實測比 STOCK_DAY_ALL 更新得快）往回找最近一個有資料的
     交易日取代，避免「現價」長期卡在舊資料（就是 2026-08-03 那次事故的成因：
-    STOCK_DAY_ALL 卡住不更新，但 MI_INDEX 當時已經有正確的當天資料）。這裡用
-    函式內的延後 import，避免跟會 import 這個模組的 tradingnote_history 在載入
-    階段形成循環 import；只有真的判定落後太久時才會用到。找不到更新資料就原樣
-    回傳 twse（不會比原本更差）。"""
+    STOCK_DAY_ALL 卡住不更新，但 MI_INDEX 當時已經有正確的當天資料；8/4 晚上又
+    卡了一次，才發現原本的門檻在收盤後永遠不會觸發，見 `_staleness_limit`）。
+    這裡用函式內的延後 import，避免跟會 import 這個模組的 tradingnote_history
+    在載入階段形成循環 import；只有真的判定落後太久時才會用到。找不到更新資料
+    就原樣回傳 twse（不會比原本更差）。"""
     if not twse:
         return twse
     today = today or date.today()
-    limit = today
-    for _ in range(max_lag_business_days):
-        limit = _previous_business_day(limit)
+    limit = _staleness_limit(today, max_lag_business_days, now=now)
 
     dates = {p.date for p in twse.values() if p.date}
     if not dates:
