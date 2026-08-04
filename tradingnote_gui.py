@@ -767,6 +767,8 @@ def populate_flow_chart(chart, db_path, snapshot, avg_days=5, on_industry_click=
     plotted = [f for f in flow if f.volume_ratio is not None and f.avg_change_pct is not None]
     skipped = len(flow) - len(plotted)
 
+    vb = chart.getPlotItem().getViewBox()
+
     if not plotted:
         text = pg.TextItem(
             "尚無足夠歷史資料可繪製（請先執行「回補歷史資料」，\n或等待逐日累積達到最小天數）",
@@ -776,6 +778,7 @@ def populate_flow_chart(chart, db_path, snapshot, avg_days=5, on_industry_click=
         chart.addItem(text)
         text.setPos(0, 0)
         chart.setTitle("產業資金流向", color=COLOR_TEXT, size="13pt")
+        vb.setLimits(xMin=None, xMax=None, yMin=None, yMax=None)
         return
 
     max_value = max(f.total_trading_value for f in plotted)
@@ -810,6 +813,23 @@ def populate_flow_chart(chart, db_path, snapshot, avg_days=5, on_industry_click=
     if skipped:
         title += f"　（另有 {skipped} 個產業因歷史資料不足未顯示）"
     chart.setTitle(title, color=COLOR_TEXT, size="13pt")
+
+    # 限制縮小（滾輪／觸控板捏合）的下限，最多縮到剛好看見全部泡泡為止，避免
+    # 縮出一大片空白；邊界抓資料範圍的 15% 當緩衝，讓泡泡本身（半徑）與旁邊的
+    # 產業名稱標籤不會被邊緣裁到。上限（放大）不受影響，仍可無限拉近。
+    xs = [f.avg_change_pct for f in plotted]
+    ys = [f.volume_ratio for f in plotted]
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+    x_pad = max((x_max - x_min) * 0.15, 1.0)
+    y_pad = max((y_max - y_min) * 0.15, 0.2)
+    vb.setLimits(
+        xMin=x_min - x_pad,
+        xMax=x_max + x_pad,
+        yMin=y_min - y_pad,
+        yMax=y_max + y_pad,
+    )
+
     chart.enableAutoRange()
 
 
