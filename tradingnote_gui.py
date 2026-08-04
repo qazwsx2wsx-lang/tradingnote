@@ -43,13 +43,19 @@ from tradingnote_finmind import (
     fetch_valuation,
     get_call_count,
 )
-from tradingnote_taifex import DEFAULT_FUTURES_PRODUCTS, get_futures_snapshot
+from tradingnote_taifex import (
+    DEFAULT_FUTURES_PRODUCTS,
+    get_cached_daily_futures_report,
+    get_futures_snapshot,
+    list_all_products,
+)
 from tradingnote_ai_agent import GEMINI_RPM_HINT, run_agent_turn
 from tradingnote_ai_agent import get_call_count as get_gemini_call_count
 
 DATA_DIR = Path(__file__).parent / "data"
 POSITIONS_PATH = DATA_DIR / "positions.json"
 CACHE_PATH = DATA_DIR / "price_cache.json"
+FUTURES_CACHE_PATH = DATA_DIR / "futures_cache.json"
 HISTORY_DB_PATH = DATA_DIR / "history.db"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 
@@ -1321,7 +1327,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.refresh_table()
         self.refresh_flow_tab()
         self.refresh_stocks_tab()
-        self.refresh_futures_tab()
+        self.refresh_futures_tab(force_refresh=True)
         self._refresh_data_freshness_label()
         self._refresh_history_status()
 
@@ -1499,15 +1505,25 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(self.futures_tab)
         layout.setContentsMargins(10, 10, 10, 10)
 
+        toolbar = QtWidgets.QHBoxLayout()
+        toolbar.addWidget(QtWidgets.QLabel("搜尋"))
+        self.futures_search_edit = QtWidgets.QLineEdit()
+        self.futures_search_edit.setPlaceholderText("輸入期貨代號，如 TX／MTX／TE")
+        self.futures_search_edit.setMaximumWidth(200)
+        self.futures_search_edit.textChanged.connect(self._filter_futures_table)
+        toolbar.addWidget(self.futures_search_edit)
+
         hint = QtWidgets.QLabel(
-            "近月指數期貨（TX 臺股期貨／MTX 小型臺指期貨）盤後資訊，資料來自 TAIFEX 官方"
-            "「期貨每日交易行情」，免金鑰、每個交易日更新一次，非即時報價——"
-            "「一般」為日盤收盤後的彙總、「盤後」為夜盤收盤後的彙總。跟其他資料一起在"
-            "「設定」分頁按「重新整理所有資料」更新。"
+            "預設顯示近月指數期貨（TX 臺股期貨／MTX 小型臺指期貨）盤後資訊，輸入代號可"
+            "搜尋 TAIFEX 全部期貨商品。資料來自 TAIFEX 官方「期貨每日交易行情」，免金鑰、"
+            "每個交易日更新一次，非即時報價——「一般」為日盤收盤後的彙總、「盤後」為夜盤"
+            "收盤後的彙總。跟其他資料一起在「設定」分頁按「重新整理所有資料」更新。"
         )
         hint.setProperty("muted", True)
         hint.setWordWrap(True)
-        layout.addWidget(hint)
+        toolbar.addWidget(hint)
+        toolbar.addStretch(1)
+        layout.addLayout(toolbar)
 
         self.futures_status_label = QtWidgets.QLabel("")
         self.futures_status_label.setProperty("muted", True)
@@ -1523,12 +1539,13 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.futures_table)
 
         self._futures_snapshot = {}
+        self._futures_all_products = list(DEFAULT_FUTURES_PRODUCTS)
         self._rebuild_futures_table()
 
     def _rebuild_futures_table(self):
         rows = [
             (product, session)
-            for product in DEFAULT_FUTURES_PRODUCTS
+            for product in self._futures_all_products
             for session in self.FUTURES_SESSION_ORDER
             if session in self._futures_snapshot.get(product, {})
         ]
@@ -1536,6 +1553,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.futures_table.setRowCount(len(rows))
         for index in range(len(rows)):
             self._paint_futures_row(index)
+        self._filter_futures_table(self.futures_search_edit.text())
 
     def _paint_futures_row(self, index):
         product, session = self._futures_rows[index]
@@ -1570,8 +1588,15 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
                 item.setForeground(QtGui.QColor(color))
             self.futures_table.setItem(index, col, item)
 
-    def refresh_futures_tab(self):
-        def on_done(snapshot):
+    def refresh_futures_tab(self, force_refresh=False):
+        def fetch():
+            rows = get_cached_daily_futures_report(FUTURES_CACHE_PATH, force_refresh=force_refresh)
+            all_products = list_all_products(rows)
+            return all_products, get_futures_snapshot(all_products, rows=rows)
+
+        def on_done(result):
+            all_products, snapshot = result
+            self._futures_all_products = all_products
             self._futures_snapshot = snapshot
             self.futures_status_label.setText("")
             self._rebuild_futures_table()
@@ -1580,9 +1605,19 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         def on_error(message):
             self.futures_status_label.setText(f"期貨盤後資訊取得失敗：{message}")
 
-        self._futures_task_timer = run_task_in_thread(
-            self, lambda: get_futures_snapshot(DEFAULT_FUTURES_PRODUCTS), on_done, on_error
-        )
+        self._futures_task_timer = run_task_in_thread(self, fetch, on_done, on_error)
+
+    def _filter_futures_table(self, text):
+        """依商品代碼關鍵字（不分大小寫、子字串比對）篩選期貨表格：關鍵字為空
+        時只顯示預設商品（DEFAULT_FUTURES_PRODUCTS，即 TX／MTX），輸入關鍵字
+        後改成在全部商品中比對，符合的列顯示、其餘隱藏。"""
+        keyword = text.strip().lower()
+        for index, (product, _session) in enumerate(self._futures_rows):
+            if keyword:
+                matched = keyword in product.lower()
+            else:
+                matched = product in DEFAULT_FUTURES_PRODUCTS
+            self.futures_table.setRowHidden(index, not matched)
 
     # ---------- AI 助理頁 ----------
 
@@ -1829,7 +1864,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         futures_date = _futures_snapshot_date(getattr(self, "_futures_snapshot", {})) or "尚無資料"
         self.data_freshness_label.setText(
             f"台股即時報價（TWSE／TPEX）最新日期：{stock_date}\n"
-            f"期貨盤後（TAIFEX TX／MTX）最新日期：{futures_date}"
+            f"期貨盤後（TAIFEX 全商品）最新日期：{futures_date}"
         )
 
     def _refresh_history_status(self):

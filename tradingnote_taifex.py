@@ -13,6 +13,8 @@
 """
 
 import json
+from datetime import datetime
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
@@ -23,6 +25,11 @@ TAIFEX_DAILY_FUTURES_URL = "https://openapi.taifex.com.tw/v1/DailyMarketReportFu
 # 預設顯示商品：TX（臺股期貨，大台）／MTX（小型臺指期貨，小台），對應 TAIFEX
 # 官方契約代號（不是 Fugle 舊版用的 TXF／MXF 命名）。
 DEFAULT_FUTURES_PRODUCTS = ["TX", "MTX"]
+
+# 比照 tradingnote_core.CACHE_TTL_SECONDS（個股快取）：這支端點本來就是一天只
+# 更新一次（見 fetch_daily_futures_report），30 分鐘純粹是擋短時間內（例如搜尋
+# 商品時）重複打 API。
+FUTURES_CACHE_TTL_SECONDS = 30 * 60
 
 
 def _http_get_json(url):
@@ -103,10 +110,49 @@ def get_front_month_sessions(product, rows):
     }
 
 
-def get_futures_snapshot(products=None):
-    """一次呼叫 fetch_daily_futures_report()，回傳
-    {product: {"一般": {...}, "盤後": {...}}, ...}，避免每個商品都各打一次
+def get_cached_daily_futures_report(cache_path, force_refresh=False):
+    """比照 tradingnote_core.get_market_snapshot 的檔案快取模式：命中
+    FUTURES_CACHE_TTL_SECONDS 內的快取就不重打 API，過期或 force_refresh 才
+    真的呼叫 fetch_daily_futures_report()；API 失敗時退回舊快取（若有）而不是
+    直接噴錯，跟個股快取失敗時的 fallback 邏輯一致。"""
+    p = Path(cache_path)
+    if not force_refresh and p.exists():
+        with p.open("r", encoding="utf-8") as f:
+            cached = json.load(f)
+        fetched_at = datetime.fromisoformat(cached["fetched_at"])
+        if (datetime.now() - fetched_at).total_seconds() < FUTURES_CACHE_TTL_SECONDS:
+            return cached["rows"]
+
+    try:
+        rows = fetch_daily_futures_report()
+    except PriceFetchError:
+        if p.exists():
+            with p.open("r", encoding="utf-8") as f:
+                return json.load(f)["rows"]
+        raise
+
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8") as f:
+        json.dump(
+            {"fetched_at": datetime.now().isoformat(), "rows": rows},
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    return rows
+
+
+def get_futures_snapshot(products=None, rows=None):
+    """回傳 {product: {"一般": {...}, "盤後": {...}}, ...}。rows 若已由呼叫端
+    先呼叫過 fetch_daily_futures_report() 取得，可傳入重用，避免重複打
     API——這支端點本來就是一次回傳全市場，一次抓取即可涵蓋所有商品。"""
     products = products or DEFAULT_FUTURES_PRODUCTS
-    rows = fetch_daily_futures_report()
+    if rows is None:
+        rows = fetch_daily_futures_report()
     return {product: get_front_month_sessions(product, rows) for product in products}
+
+
+def list_all_products(rows):
+    """從 fetch_daily_futures_report() 的原始清單裡取出所有不重複的商品代碼
+    （Contract）並排序回傳，作為期貨搜尋功能的商品全集來源。"""
+    return sorted({r["Contract"] for r in rows if r.get("Contract")})
