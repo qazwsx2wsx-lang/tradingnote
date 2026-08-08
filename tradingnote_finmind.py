@@ -16,7 +16,8 @@ import time
 from datetime import date, timedelta
 from urllib.parse import urlencode
 
-from tradingnote_core import PriceFetchError, _http_get_json, get_tpex_valuation
+from tradingnote_core import get_tpex_valuation
+from tradingnote_http import PriceFetchError, http_get_json
 
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 
@@ -83,7 +84,7 @@ def _fetch_dataset(dataset, ticker, token, lookback_days=10):
         params["token"] = token
     url = f"{FINMIND_URL}?{urlencode(params)}"
     _call_timestamps.append(time.time())
-    payload = _http_get_json(url)
+    payload = http_get_json(url)
     if payload.get("msg") != "success":
         raise PriceFetchError(f"FinMind 回應異常：{payload.get('msg')}")
     rows = payload.get("data") or []

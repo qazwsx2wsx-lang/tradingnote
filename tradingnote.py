@@ -6,7 +6,6 @@ import unicodedata
 from pathlib import Path
 
 from tradingnote_core import (
-    PriceFetchError,
     add_position,
     compute_pnl,
     get_market_snapshot,
@@ -25,6 +24,7 @@ from tradingnote_history import (
     get_latest_ticker_record,
     record_snapshot,
 )
+from tradingnote_http import PriceFetchError
 
 DATA_DIR = Path(__file__).parent / "data"
 POSITIONS_PATH = DATA_DIR / "positions.json"

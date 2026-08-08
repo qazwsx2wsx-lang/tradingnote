@@ -4,11 +4,12 @@
 import json
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from urllib.error import URLError
-from urllib.request import urlopen
+
+from tradingnote_http import PriceFetchError, http_get_json, to_float, to_int
 
 TWSE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TPEX_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
@@ -36,10 +37,6 @@ DEFAULT_SETTINGS = {
     # 自動函式呼叫，呼叫 FinMind／歷史資料庫查詢函式）；留空則該分頁無法使用。
     "gemini_api_key": "",
 }
-
-
-class PriceFetchError(Exception):
-    pass
 
 
 @dataclass
@@ -188,17 +185,6 @@ def remove_position(positions, position_id):
 
 # ---------- 查價：台股 TWSE／TPEX 價格擷取 ----------
 
-def _http_get_json(url):
-    try:
-        with urlopen(url, timeout=10) as resp:
-            data = json.load(resp)
-    except URLError as e:
-        raise PriceFetchError(f"連線失敗：{e}") from e
-    except json.JSONDecodeError as e:
-        raise PriceFetchError(f"回傳資料格式錯誤：{e}") from e
-    return data
-
-
 def _roc_to_iso(roc_date):
     roc_date = str(roc_date).strip()
     if len(roc_date) < 6:
@@ -209,22 +195,8 @@ def _roc_to_iso(roc_date):
     return f"{year:04d}-{month}-{day}"
 
 
-def _to_float(value):
-    if value is None:
-        return None
-    try:
-        return float(str(value).strip().replace(",", ""))
-    except ValueError:
-        return None
-
-
-def _to_int(value):
-    f = _to_float(value)
-    return int(f) if f is not None else None
-
-
 def fetch_twse_all():
-    rows = _http_get_json(TWSE_URL)
+    rows = http_get_json(TWSE_URL)
     result = {}
     for rec in rows:
         code = rec.get("Code", "").strip()
@@ -233,21 +205,21 @@ def fetch_twse_all():
         result[code] = PriceInfo(
             ticker=code,
             name=rec.get("Name", "").strip(),
-            open=_to_float(rec.get("OpeningPrice")),
-            high=_to_float(rec.get("HighestPrice")),
-            low=_to_float(rec.get("LowestPrice")),
-            close=_to_float(rec.get("ClosingPrice")),
-            change=_to_float(rec.get("Change")),
-            volume=_to_int(rec.get("TradeVolume")),
+            open=to_float(rec.get("OpeningPrice")),
+            high=to_float(rec.get("HighestPrice")),
+            low=to_float(rec.get("LowestPrice")),
+            close=to_float(rec.get("ClosingPrice")),
+            change=to_float(rec.get("Change")),
+            volume=to_int(rec.get("TradeVolume")),
             date=_roc_to_iso(rec.get("Date", "")),
             market="TWSE",
-            trading_value=_to_float(rec.get("TradeValue")),
+            trading_value=to_float(rec.get("TradeValue")),
         )
     return result
 
 
 def fetch_tpex_all():
-    rows = _http_get_json(TPEX_URL)
+    rows = http_get_json(TPEX_URL)
     result = {}
     for rec in rows:
         code = rec.get("SecuritiesCompanyCode", "").strip()
@@ -256,15 +228,15 @@ def fetch_tpex_all():
         result[code] = PriceInfo(
             ticker=code,
             name=rec.get("CompanyName", "").strip(),
-            open=_to_float(rec.get("Open")),
-            high=_to_float(rec.get("High")),
-            low=_to_float(rec.get("Low")),
-            close=_to_float(rec.get("Close")),
-            change=_to_float(rec.get("Change")),
-            volume=_to_int(rec.get("TradingShares")),
+            open=to_float(rec.get("Open")),
+            high=to_float(rec.get("High")),
+            low=to_float(rec.get("Low")),
+            close=to_float(rec.get("Close")),
+            change=to_float(rec.get("Change")),
+            volume=to_int(rec.get("TradingShares")),
             date=_roc_to_iso(rec.get("Date", "")),
             market="TPEX",
-            trading_value=_to_float(rec.get("TransactionAmount")),
+            trading_value=to_float(rec.get("TransactionAmount")),
         )
     return result
 
@@ -281,7 +253,7 @@ def fetch_tpex_valuation_all():
     """打一次 tpex_mainboard_peratio_analysis，回傳 {ticker: {"date":, "per":,
     "pbr":, "dividend_yield":}}。查無獲利無法計算本益比的公司不會出現在回傳的
     資料裡（該公司的資料集本來就沒有這一列）。"""
-    rows = _http_get_json(TPEX_PERATIO_URL)
+    rows = http_get_json(TPEX_PERATIO_URL)
     result = {}
     for rec in rows:
         code = (rec.get("SecuritiesCompanyCode") or "").strip()
@@ -289,9 +261,9 @@ def fetch_tpex_valuation_all():
             continue
         result[code] = {
             "date": _roc_to_iso(rec.get("Date", "")),
-            "per": _to_float(rec.get("PriceEarningRatio")),
-            "pbr": _to_float(rec.get("PriceBookRatio")),
-            "dividend_yield": _to_float(rec.get("YieldRatio")),
+            "per": to_float(rec.get("PriceEarningRatio")),
+            "pbr": to_float(rec.get("PriceBookRatio")),
+            "dividend_yield": to_float(rec.get("YieldRatio")),
         }
     return result
 
@@ -313,9 +285,9 @@ def get_tpex_valuation(ticker):
 
 def get_market_snapshot(cache_path, force_refresh=False, on_progress=None):
     """on_progress(done, total, label) 在 force_refresh 真的重打 API 時，於每個階段
-    開始前被呼叫一次（TWSE、TPEX、寫入快取共 3 個階段），讓呼叫端能畫出進度條；
-    走快取路徑（未過期或 API 失敗回退）時不會呼叫，跟 backfill_twse_history 的
-    on_progress 只在真的有動作時才觸發是一樣的原則。"""
+    開始前被呼叫一次（TWSE／TPEX 並行抓取、寫入快取共 2 個階段），讓呼叫端能畫出
+    進度條；走快取路徑（未過期或 API 失敗回退）時不會呼叫，跟 backfill_twse_history
+    的 on_progress 只在真的有動作時才觸發是一樣的原則。"""
     def _progress(done, total, label):
         if on_progress:
             on_progress(done, total, label)
@@ -330,13 +302,19 @@ def get_market_snapshot(cache_path, force_refresh=False, on_progress=None):
                 code: PriceInfo(**info) for code, info in cached["prices"].items()
             }
 
-    total_steps = 3
+    total_steps = 2
     try:
-        _progress(0, total_steps, "正在取得上市（TWSE）報價...")
-        twse = _twse_all_with_staleness_fallback(fetch_twse_all())
-        _progress(1, total_steps, "正在取得上櫃（TPEX）報價...")
-        tpex = fetch_tpex_all()
-        _progress(2, total_steps, "正在寫入快取...")
+        _progress(0, total_steps, "正在取得台股報價（TWSE／TPEX）...")
+        # TWSE／TPEX 是兩個獨立、互不相依的報價端點，並行送出可省下一次網路
+        # 往返的等待時間（原本是先等 TWSE 回來才打 TPEX）。任一邊拋出的
+        # PriceFetchError 會在 .result() 被重新拋出，走到下面既有的快取回退邏輯。
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            twse_future = executor.submit(fetch_twse_all)
+            tpex_future = executor.submit(fetch_tpex_all)
+            twse_raw = twse_future.result()
+            tpex = tpex_future.result()
+        twse = _twse_all_with_staleness_fallback(twse_raw)
+        _progress(1, total_steps, "正在寫入快取...")
     except PriceFetchError:
         if p.exists():
             with p.open("r", encoding="utf-8") as f:
@@ -356,7 +334,7 @@ def get_market_snapshot(cache_path, force_refresh=False, on_progress=None):
             ensure_ascii=False,
             indent=2,
         )
-    _progress(3, total_steps, "快取寫入完成")
+    _progress(2, total_steps, "快取寫入完成")
     return snapshot
 
 

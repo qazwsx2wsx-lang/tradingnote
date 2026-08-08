@@ -15,10 +15,8 @@
 import json
 from datetime import datetime
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
 
-from tradingnote_core import PriceFetchError
+from tradingnote_http import PriceFetchError, http_get_json, to_float, to_int
 
 TAIFEX_DAILY_FUTURES_URL = "https://openapi.taifex.com.tw/v1/DailyMarketReportFut"
 
@@ -32,38 +30,12 @@ DEFAULT_FUTURES_PRODUCTS = ["TX", "MTX"]
 FUTURES_CACHE_TTL_SECONDS = 30 * 60
 
 
-def _http_get_json(url):
-    try:
-        with urlopen(url, timeout=10) as resp:
-            return json.load(resp)
-    except HTTPError as e:
-        raise PriceFetchError(f"TAIFEX API 錯誤（HTTP {e.code}）") from e
-    except URLError as e:
-        raise PriceFetchError(f"連線失敗：{e}") from e
-    except ValueError as e:  # json 解析錯誤
-        raise PriceFetchError(f"回傳資料格式錯誤：{e}") from e
-
-
 def fetch_daily_futures_report():
     """打一次 DailyMarketReportFut，回傳最近一個交易日全部期貨契約的原始清單，
     每筆含 Contract／ContractMonth(Week)／TradingSession（"一般"＝日盤、
     "盤後"＝夜盤）等欄位，欄位名稱、型別（字串）均照 TAIFEX 原樣，正規化留給
     get_front_month_sessions 處理。"""
-    return _http_get_json(TAIFEX_DAILY_FUTURES_URL)
-
-
-def _to_float(value):
-    if value in (None, "", "-", "NULL"):
-        return None
-    try:
-        return float(str(value).replace(",", ""))
-    except ValueError:
-        return None
-
-
-def _to_int(value):
-    f = _to_float(value)
-    return int(f) if f is not None else None
+    return http_get_json(TAIFEX_DAILY_FUTURES_URL)
 
 
 def _normalize_row(row):
@@ -72,15 +44,15 @@ def _normalize_row(row):
         "contract": row.get("Contract"),
         "contract_month": row.get("ContractMonth(Week)"),
         "session": row.get("TradingSession"),
-        "open": _to_float(row.get("Open")),
-        "high": _to_float(row.get("High")),
-        "low": _to_float(row.get("Low")),
-        "last": _to_float(row.get("Last")),
-        "change": _to_float(row.get("Change")),
-        "change_pct": _to_float(str(row.get("%") or "").rstrip("%")),
-        "settlement_price": _to_float(row.get("SettlementPrice")),
-        "volume": _to_int(row.get("Volume")),
-        "open_interest": _to_int(row.get("OpenInterest")),
+        "open": to_float(row.get("Open")),
+        "high": to_float(row.get("High")),
+        "low": to_float(row.get("Low")),
+        "last": to_float(row.get("Last")),
+        "change": to_float(row.get("Change")),
+        "change_pct": to_float(str(row.get("%") or "").rstrip("%")),
+        "settlement_price": to_float(row.get("SettlementPrice")),
+        "volume": to_int(row.get("Volume")),
+        "open_interest": to_int(row.get("OpenInterest")),
     }
 
 

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from tradingnote_core import PriceFetchError, _http_get_json, _to_float, _to_int
+from tradingnote_http import PriceFetchError, http_get_json, to_float, to_int
 
 TWSE_MI_INDEX_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
 TWSE_INDUSTRY_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
@@ -211,7 +211,7 @@ def fetch_twse_historical_day(date_str):
     """date_str 格式 YYYYMMDD。回傳當天全部上市股票紀錄；非交易日回傳 None。"""
     url = f"{TWSE_MI_INDEX_URL}?date={date_str}&type=ALLBUT0999&response=json"
     try:
-        data = _http_get_json(url)
+        data = http_get_json(url)
     except PriceFetchError:
         return None
     if data.get("stat") != "OK":
@@ -228,15 +228,15 @@ def fetch_twse_historical_day(date_str):
     for row in quotes_table.get("data", []):
         try:
             code, name = row[0].strip(), row[1].strip()
-            volume = _to_int(row[2])
-            trading_value = _to_float(row[4])
-            open_ = _to_float(row[5])
-            high = _to_float(row[6])
-            low = _to_float(row[7])
-            close = _to_float(row[8])
+            volume = to_int(row[2])
+            trading_value = to_float(row[4])
+            open_ = to_float(row[5])
+            high = to_float(row[6])
+            low = to_float(row[7])
+            close = to_float(row[8])
             sign_match = _SIGN_RE.search(row[9] or "")
             sign = -1.0 if sign_match and sign_match.group(1) == "-" else 1.0
-            magnitude = _to_float(row[10]) or 0.0
+            magnitude = to_float(row[10]) or 0.0
         except (IndexError, AttributeError):
             continue
         if not code or close is None:
@@ -397,8 +397,8 @@ def get_ticker_history(db_path, ticker, limit=None):
 # ---------- 產業分類 ----------
 
 def fetch_industry_map():
-    twse_rows = _http_get_json(TWSE_INDUSTRY_URL)
-    tpex_rows = _http_get_json(TPEX_INDUSTRY_URL)
+    twse_rows = http_get_json(TWSE_INDUSTRY_URL)
+    tpex_rows = http_get_json(TPEX_INDUSTRY_URL)
 
     mapping = {}
     for rec in twse_rows:

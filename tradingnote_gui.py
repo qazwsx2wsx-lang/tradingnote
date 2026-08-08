@@ -12,7 +12,6 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from tradingnote_core import (
-    PriceFetchError,
     add_position,
     compute_pnl,
     find_position,
@@ -51,6 +50,7 @@ from tradingnote_taifex import (
 )
 from tradingnote_ai_agent import GEMINI_RPM_HINT, run_agent_turn
 from tradingnote_ai_agent import get_call_count as get_gemini_call_count
+from tradingnote_http import PriceFetchError
 
 DATA_DIR = Path(__file__).parent / "data"
 POSITIONS_PATH = DATA_DIR / "positions.json"
