@@ -32,19 +32,28 @@ from tradingnote_history import (
     backfill_twse_history,
     compute_industry_flow,
     compute_volume_ratio_outliers,
+    default_start_date_for_days,
+    get_available_dates,
     get_history_status,
     get_industry_directory,
     get_industry_map,
     get_industry_top_stocks_range,
     get_latest_ticker_record,
     record_snapshot,
+    trading_days_between,
 )
 from tradingnote_finmind import (
     FINMIND_HOURLY_LIMIT,
+    fetch_foreign_shareholding,
     fetch_institutional_investors,
+    fetch_institutional_investors_history,
+    fetch_margin_short_sale_history,
+    fetch_margin_short_sale_suspension,
+    fetch_securities_lending_summary,
     fetch_valuation,
     get_call_count,
 )
+from tradingnote_concepts import build_ticker_concept_map, load_concepts
 from tradingnote_taifex import (
     DEFAULT_FUTURES_PRODUCTS,
     get_cached_daily_futures_report,
@@ -72,6 +81,8 @@ COLUMNS = [
     ("id", "ID", 90),
     ("ticker", "代號", 60),
     ("name", "名稱", 100),
+    ("industry", "族群", 90),
+    ("concepts", "概念股", 160),
     ("shares", "股數", 70),
     ("entry_price", "成本價", 80),
     ("current_price", "現價", 80),
@@ -923,6 +934,84 @@ def populate_flow_chart(chart, db_path, snapshot, avg_days=5, on_industry_click=
     chart.enableAutoRange()
 
 
+class TradingCalendarWidget(QtWidgets.QCalendarWidget):
+    """只允許選取「有歷史資料」的日期（valid_dates_iso，來自
+    tradingnote_history.get_available_dates）：沒資料的日期文字反白（灰階），
+    點下去也不會真的被選取——QCalendarWidget 本身沒有「單一日期停用」的原生
+    API（setMinimumDate／setMaximumDate 只能框住整段區間頭尾），所以改成監聽
+    clicked(QDate) 訊號，點到不在 valid_dates_iso 裡的日期時，把選取狀態復原回
+    上一個有效日期，點到有效日期才會真的送出 dateChosen 訊號。"""
+
+    dateChosen = QtCore.Signal(str)  # 選到有效日期時 emit ISO 字串（yyyy-MM-dd）
+
+    def __init__(self, valid_dates_iso, parent=None):
+        super().__init__(parent)
+        self.setGridVisible(True)
+        self.setVerticalHeaderFormat(QtWidgets.QCalendarWidget.NoVerticalHeader)
+
+        valid_qdates = sorted(
+            QtCore.QDate.fromString(d, "yyyy-MM-dd") for d in valid_dates_iso
+        )
+        self._valid_set = set(valid_qdates)
+        self._last_valid = valid_qdates[-1] if valid_qdates else QtCore.QDate.currentDate()
+
+        if valid_qdates:
+            self.setMinimumDate(valid_qdates[0])
+            self.setMaximumDate(valid_qdates[-1])
+            muted_format = QtGui.QTextCharFormat()
+            muted_format.setForeground(QtGui.QColor(COLOR_MUTED))
+            d = valid_qdates[0]
+            while d <= valid_qdates[-1]:
+                if d not in self._valid_set:
+                    self.setDateTextFormat(d, muted_format)
+                d = d.addDays(1)
+            self.setSelectedDate(self._last_valid)
+
+        self.clicked.connect(self._on_clicked)
+
+    def _on_clicked(self, qdate):
+        if qdate in self._valid_set:
+            self._last_valid = qdate
+            self.dateChosen.emit(qdate.toString("yyyy-MM-dd"))
+        else:
+            # 灰階（沒有資料）的日期：復原成上一個有效選取，等同「不能選」。
+            self.setSelectedDate(self._last_valid)
+
+
+class TradingDateDialog(QtWidgets.QDialog):
+    """資金流向頁「流向天數」／「資料區間」的日曆式起始日期選擇器，取代原本直接
+    輸入天數的 QSpinBox。結束日固定是今天／最新資料（跟 compute_industry_flow 的
+    avg_days 語意一致，永遠是「今天以前 N 個交易日」），使用者只選起始日；點到有
+    資料的日期立刻套用並關閉視窗，不需要另外按確定。"""
+
+    def __init__(self, parent, valid_dates_iso, title):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.selected_date = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 12)
+
+        if not valid_dates_iso:
+            layout.addWidget(QtWidgets.QLabel("尚無足夠歷史資料可選擇日期，請先回補歷史資料。"))
+        else:
+            calendar = TradingCalendarWidget(valid_dates_iso, self)
+            calendar.dateChosen.connect(self._on_date_chosen)
+            layout.addWidget(calendar)
+            hint = QtWidgets.QLabel("反白（灰階）日期沒有歷史資料，無法選取；區間結束日固定是今天／最新資料。")
+            hint.setProperty("muted", True)
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+
+        close_btn = QtWidgets.QPushButton("關閉")
+        close_btn.clicked.connect(self.reject)
+        layout.addWidget(close_btn, alignment=QtCore.Qt.AlignRight)
+
+    def _on_date_chosen(self, date_iso):
+        self.selected_date = date_iso
+        self.accept()
+
+
 class TradingNoteWindow(QtWidgets.QMainWindow):
     def __init__(self, snapshot, last_error):
         """snapshot／last_error 由 main() 的啟動前置作業（run_startup_preload_in_thread）
@@ -935,6 +1024,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
         self.settings = load_settings(SETTINGS_PATH)
         self.positions = load_positions(POSITIONS_PATH)
+        # 概念股清單只在啟動時讀一次（跟 concepts.json 一樣是人工維護的靜態檔案，
+        # 改完要重開程式才生效，見 tradingnote_concepts.py docstring）。
+        self._ticker_concept_map = build_ticker_concept_map(load_concepts())
         self.snapshot = snapshot
         self.last_error = last_error
         self.staleness_warning = (
@@ -1080,17 +1172,16 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(10, 10, 10, 10)
 
         self.flow_avg_days = 5
+        self.flow_start_date = default_start_date_for_days(HISTORY_DB_PATH, self.flow_avg_days)
 
         toolbar = QtWidgets.QHBoxLayout()
-        toolbar.addWidget(QtWidgets.QLabel("流向天數："))
-        self.flow_days_spin = QtWidgets.QSpinBox()
-        self.flow_days_spin.setRange(1, 500)
-        self.flow_days_spin.setValue(self.flow_avg_days)
-        self.flow_days_spin.setSuffix(" 天")
-        toolbar.addWidget(self.flow_days_spin)
-        toolbar.addWidget(accent_button("套用", self._on_flow_days_apply))
+        toolbar.addWidget(QtWidgets.QLabel("流向區間："))
+        self.flow_date_button = QtWidgets.QPushButton()
+        self.flow_date_button.clicked.connect(self._open_flow_date_picker)
+        toolbar.addWidget(self.flow_date_button)
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
+        self._update_flow_date_button()
 
         self.flow_chart = FlowChartWidget()
         self.flow_chart.setMinimumHeight(380)
@@ -1102,20 +1193,22 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addSpacing(20)
         self._build_volume_outliers_section(layout)
 
-    def _on_flow_days_apply(self):
-        requested_days = self.flow_days_spin.value()
-        status = get_history_status(HISTORY_DB_PATH)
-        available_days = status["overall"]["days"]
-        if available_days and requested_days > available_days:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "資料可能不足",
-                f"選擇的區間是 {requested_days} 天，但資料庫目前只有 {available_days} "
-                f"個交易日資料，部分（或全部）產業泡泡可能會顯示「資料不足」。\n\n"
-                "可至「設定」分頁調整回補天數，或按「回補歷史資料」補齊後再試。",
-            )
-        self.flow_avg_days = requested_days
-        self.refresh_flow_tab()
+    def _update_flow_date_button(self):
+        self.flow_date_button.setText(
+            f"{self.flow_start_date} 起（近 {self.flow_avg_days} 個交易日）　▾"
+        )
+
+    def _open_flow_date_picker(self):
+        # 可選的起始日只到「今天以前」——avg_days 的語意本來就是「今天以前 N 個交易日」
+        # （見 compute_industry_flow），選今天當起始日沒有意義（等同 0 天，永遠資料不足）。
+        today_iso = date.today().isoformat()
+        valid_dates = [d for d in get_available_dates(HISTORY_DB_PATH) if d < today_iso]
+        dialog = TradingDateDialog(self, valid_dates, "選擇流向區間起始日期")
+        if dialog.exec() == QtWidgets.QDialog.Accepted and dialog.selected_date:
+            self.flow_start_date = dialog.selected_date
+            self.flow_avg_days = max(1, trading_days_between(HISTORY_DB_PATH, self.flow_start_date))
+            self._update_flow_date_button()
+            self.refresh_flow_tab()
 
     def refresh_flow_tab(self):
         populate_flow_chart(
@@ -1155,27 +1248,24 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addWidget(header)
         layout.addSpacing(4)
 
+        self.list_avg_days = 20
+        self.list_start_date = default_start_date_for_days(HISTORY_DB_PATH, self.list_avg_days)
+
         controls = QtWidgets.QHBoxLayout()
         controls.addWidget(QtWidgets.QLabel("資料區間："))
-        self.list_days_spin = QtWidgets.QSpinBox()
-        self.list_days_spin.setRange(1, 500)
-        self.list_days_spin.setValue(20)
-        self.list_days_spin.setSuffix(" 天")
-        controls.addWidget(self.list_days_spin)
-        controls.addWidget(accent_button("套用", self._on_list_days_apply))
+        self.list_date_button = QtWidgets.QPushButton()
+        self.list_date_button.clicked.connect(self._open_list_date_picker)
+        controls.addWidget(self.list_date_button)
         controls.addStretch(1)
         layout.addLayout(controls)
+        self._update_list_date_button()
 
-        hint = QtWidgets.QLabel(
-            "天數以「今日」往回算，跟泡泡圖的「流向天數」各自獨立；"
-            "若超過資料庫實際涵蓋的交易日數，套用時會提醒。"
-        )
+        hint = QtWidgets.QLabel("起始日以「今日」往回算，跟泡泡圖的「流向區間」各自獨立。")
         hint.setProperty("muted", True)
         hint.setWordWrap(True)
         layout.addWidget(hint)
         layout.addSpacing(8)
 
-        self.list_avg_days = self.list_days_spin.value()
         self.flow_list = QtWidgets.QTreeWidget()
         self.flow_list.setColumnCount(5)
         self.flow_list.setHeaderLabels(["產業", "檔數", "成交金額(億)", "加權漲跌%", "量比"])
@@ -1190,20 +1280,20 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         )
         layout.addWidget(self.flow_list)
 
-    def _on_list_days_apply(self):
-        requested_days = self.list_days_spin.value()
-        status = get_history_status(HISTORY_DB_PATH)
-        available_days = status["overall"]["days"]
-        if available_days and requested_days > available_days:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "資料可能不足",
-                f"選擇的區間是 {requested_days} 天，但資料庫目前只有 {available_days} "
-                f"個交易日資料，部分（或全部）產業在清單中可能會顯示「資料不足」。\n\n"
-                "可至「設定」分頁調整回補天數，或按「回補歷史資料」補齊後再試。",
-            )
-        self.list_avg_days = requested_days
-        self.refresh_flow_list()
+    def _update_list_date_button(self):
+        self.list_date_button.setText(
+            f"{self.list_start_date} 起（近 {self.list_avg_days} 個交易日）　▾"
+        )
+
+    def _open_list_date_picker(self):
+        today_iso = date.today().isoformat()
+        valid_dates = [d for d in get_available_dates(HISTORY_DB_PATH) if d < today_iso]
+        dialog = TradingDateDialog(self, valid_dates, "選擇資料區間起始日期")
+        if dialog.exec() == QtWidgets.QDialog.Accepted and dialog.selected_date:
+            self.list_start_date = dialog.selected_date
+            self.list_avg_days = max(1, trading_days_between(HISTORY_DB_PATH, self.list_start_date))
+            self._update_list_date_button()
+            self.refresh_flow_list()
 
     def refresh_flow_list(self):
         flow = compute_industry_flow(HISTORY_DB_PATH, self.snapshot, avg_days=self.list_avg_days)
@@ -1423,12 +1513,76 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         for i, (key, _, width) in enumerate(COLUMNS):
             self.table.setColumnWidth(i, width)
         self._column_keys = keys
-        layout.addWidget(self.table)
+        self.table.itemSelectionChanged.connect(self._on_position_row_selected)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        splitter.addWidget(self.table)
+        splitter.addWidget(self._build_position_detail_section())
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter)
+
+    def _build_position_detail_section(self):
+        """選取上方某筆部位時顯示的詳細資訊區塊：族群／概念股（本地資料，
+        即時顯示，見 self._ticker_concept_map／get_industry_map）＋ FinMind
+        本益比／殖利率／三大法人買賣超／融資融券餘額／外資持股／借券／停資停券
+        （背景查詢，見 _load_position_detail）。跟「個股」頁的 StockDetailDialog
+        不同，這裡不彈窗，直接嵌在部位紀錄頁裡。文字摘要＋兩張趨勢圖疊起來可能
+        比下方分割區塊的可視高度還高，用 QScrollArea 包起來讓內容用捲軸瀏覽
+        （跟「資金流向分析」頁 _build_flow_tab 同一招），而不是把圖硬擠壓變形。"""
+        container = QtWidgets.QWidget()
+        outer_layout = QtWidgets.QVBoxLayout(container)
+        outer_layout.setContentsMargins(0, 10, 0, 0)
+
+        header = QtWidgets.QLabel(
+            "個股詳細資訊（選取上方部位查看，含 FinMind 三大法人120日資金流向、"
+            "融資融券餘額、外資持股、借券與停資停券）"
+        )
+        header.setProperty("header", True)
+        outer_layout.addWidget(header)
+        outer_layout.addSpacing(4)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        outer_layout.addWidget(scroll)
+
+        content = QtWidgets.QWidget()
+        scroll.setWidget(content)
+        layout = QtWidgets.QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.position_detail_label = QtWidgets.QLabel("尚未選取部位。")
+        self.position_detail_label.setWordWrap(True)
+        layout.addWidget(self.position_detail_label)
+
+        self.position_flow_chart = pg.PlotWidget()
+        self.position_flow_chart.setBackground(COLOR_BG)
+        self.position_flow_chart.showGrid(x=True, y=True, alpha=0.15)
+        self.position_flow_chart.setMinimumHeight(200)
+        self.position_flow_chart.addLegend()
+        layout.addWidget(self.position_flow_chart)
+
+        self.position_margin_chart = pg.PlotWidget()
+        self.position_margin_chart.setBackground(COLOR_BG)
+        self.position_margin_chart.showGrid(x=True, y=True, alpha=0.15)
+        self.position_margin_chart.setMinimumHeight(200)
+        self.position_margin_chart.addLegend()
+        layout.addWidget(self.position_margin_chart)
+
+        return container
 
     def refresh_table(self):
         total_pnl = 0.0
         has_pnl = False
         self.table.setRowCount(len(self.positions))
+        try:
+            industry_map = get_industry_map(HISTORY_DB_PATH)
+        except PriceFetchError:
+            # 族群只是輔助資訊，抓不到（例如離線、快取剛好過期又連不上網）不該
+            # 讓整個部位表格連損益都顯示不出來，各列的「族群」直接落回「-」。
+            industry_map = {}
 
         for row_index, pos in enumerate(self.positions):
             price = lookup_price(pos.ticker, self.snapshot)
@@ -1453,10 +1607,14 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
                 total_pnl += pnl.unrealized_pnl
                 has_pnl = True
 
+            concepts = self._ticker_concept_map.get(pos.ticker) or []
+
             values = {
                 "id": pos.id,
                 "ticker": pos.ticker,
                 "name": pos.name or "-",
+                "industry": industry_map.get(pos.ticker) or "-",
+                "concepts": "、".join(concepts) if concepts else "-",
                 "shares": str(pos.shares),
                 "entry_price": f"{pos.entry_price:.2f}",
                 "current_price": current_price,
@@ -1478,6 +1636,201 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         save_positions(POSITIONS_PATH, self.positions)
         self._total_pnl = total_pnl if has_pnl else None
         self._update_status_bar()
+
+    # ---------- 部位詳細資訊區塊：族群／概念股（本地）＋ FinMind 基本面／
+    # 三大法人120日趨勢（背景查詢，見 tradingnote_finmind.py） ----------
+
+    def _on_position_row_selected(self):
+        position_id = self._selected_position_id()
+        if position_id is None:
+            self.position_detail_label.setText("尚未選取部位。")
+            self.position_flow_chart.clear()
+            self.position_margin_chart.clear()
+            return
+        pos = find_position(self.positions, position_id)
+        if pos is None:
+            return
+        self._load_position_detail(pos)
+
+    def _load_position_detail(self, pos):
+        try:
+            industry = get_industry_map(HISTORY_DB_PATH).get(pos.ticker) or "未分類"
+        except PriceFetchError:
+            industry = "未分類"
+        concepts = self._ticker_concept_map.get(pos.ticker) or []
+        concept_text = "、".join(concepts) if concepts else "（尚無分類，可編輯 concepts.json 新增）"
+        header = f"{pos.ticker} {pos.name or ''}　族群：{industry}　概念股：{concept_text}"
+        self.position_detail_label.setText(f"{header}\n\nFinMind 查詢中...")
+        self.position_flow_chart.clear()
+        self.position_margin_chart.clear()
+
+        token = self.settings.get("finmind_token", "")
+        market = pos.market
+
+        def fetch():
+            return (
+                fetch_valuation(pos.ticker, token, market=market),
+                fetch_institutional_investors_history(pos.ticker, token, lookback_days=120),
+                fetch_margin_short_sale_history(pos.ticker, token, lookback_days=120),
+                fetch_foreign_shareholding(pos.ticker, token),
+                fetch_securities_lending_summary(pos.ticker, token),
+                fetch_margin_short_sale_suspension(pos.ticker, token),
+            )
+
+        self._position_detail_timer = run_task_in_thread(
+            self,
+            fetch,
+            lambda result: self._on_position_detail_done(pos, header, result),
+            lambda message: self._on_position_detail_error(pos, header, message),
+        )
+
+    def _is_current_detail_target(self, pos):
+        return self._selected_position_id() == pos.id
+
+    def _on_position_detail_done(self, pos, header, result):
+        if not self._is_current_detail_target(pos):
+            return  # 使用者查詢途中已切換到別筆部位，這份結果過期了，不套用
+        (
+            valuation,
+            history,
+            margin_history,
+            foreign_shareholding,
+            lending,
+            suspension,
+        ) = result
+        lines = [header, ""]
+
+        if valuation is None:
+            lines.append("FinMind 基本面：查無資料")
+        else:
+            per = valuation["per"]
+            pbr = valuation["pbr"]
+            yield_pct = valuation["dividend_yield"]
+            lines.append(
+                f"FinMind 基本面（{valuation['date']}）　本益比：{per if per is not None else 'N/A'}　"
+                f"股價淨值比：{pbr if pbr is not None else 'N/A'}　"
+                f"殖利率：{yield_pct if yield_pct is not None else 'N/A'}%"
+            )
+
+        if history is None or not history["dates"]:
+            lines.append("三大法人買賣超：查無資料")
+        else:
+            latest_date = history["dates"][-1]
+            lines.append(f"三大法人買賣超（最新 {latest_date}，單位：股）")
+            for label, series in history["series"].items():
+                lines.append(f"　{label}：淨買超 {series[-1]:+,}")
+
+        if margin_history is None:
+            lines.append("融資融券：查無資料")
+        else:
+            latest = margin_history["latest"]
+            lines.append(
+                f"融資融券（最新 {latest['date']}，單位：張）　"
+                f"融資餘額：{latest['margin_balance']:,}（{latest['margin_change']:+,}）　"
+                f"融券餘額：{latest['short_balance']:,}（{latest['short_change']:+,}）"
+            )
+
+        if foreign_shareholding is None or foreign_shareholding["ratio"] is None:
+            lines.append("外資持股比例：查無資料")
+        else:
+            change = foreign_shareholding["change"]
+            change_text = f"（{change:+.2f}pp）" if change is not None else ""
+            lines.append(
+                f"外資持股比例（{foreign_shareholding['date']}）："
+                f"{foreign_shareholding['ratio']:.2f}%{change_text}"
+            )
+
+        if lending is None or not lending["volume"]:
+            lines.append("借券成交：查無資料")
+        else:
+            fee_text = (
+                f"，均費率 {lending['avg_fee_rate']:.2f}%"
+                if lending["avg_fee_rate"] is not None
+                else ""
+            )
+            lines.append(f"借券成交（{lending['date']}）：合計 {lending['volume']:,} 張{fee_text}")
+
+        if suspension:
+            for event in suspension:
+                lines.append(
+                    f"⚠ 停資停券公告　{event['date']} ～ {event['end_date'] or '未提供'}　"
+                    f"原因：{event['reason'] or '未提供'}"
+                )
+
+        self.position_detail_label.setText("\n".join(lines))
+        self._populate_position_flow_chart(history)
+        self._populate_position_margin_chart(margin_history)
+        self.update_finmind_count_label()
+
+    def _on_position_detail_error(self, pos, header, message):
+        if not self._is_current_detail_target(pos):
+            return
+        self.position_detail_label.setText(
+            f"{header}\n\nFinMind 查詢失敗：{message}\n\n"
+            "可能原因：FinMind token 未設定或已失效、已超過免費額度，或該股票暫無此資料。"
+        )
+        self.position_flow_chart.clear()
+        self.position_margin_chart.clear()
+        self.update_finmind_count_label()
+
+    def _populate_position_flow_chart(self, history):
+        chart = self.position_flow_chart
+        chart.clear()
+        if history is None or not history["dates"]:
+            return
+
+        dates = history["dates"]
+        x = list(range(len(dates)))
+        step = max(1, len(dates) // 8)
+        chart.getPlotItem().getAxis("bottom").setTicks(
+            [[(i, dates[i]) for i in range(0, len(dates), step)]]
+        )
+
+        bucket_colors = {"外資": "#1f77b4", "投信": "#2ca02c", "自營商": "#d62728"}
+        for label, series in history["series"].items():
+            cumulative = []
+            running_total = 0
+            for net in series:
+                running_total += net
+                cumulative.append(running_total)
+            chart.plot(
+                x,
+                cumulative,
+                pen=pg.mkPen(bucket_colors.get(label, COLOR_TEXT), width=2),
+                name=label,
+            )
+
+        chart.addLine(y=0, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
+        chart.setLabel("left", "累計淨買賣超（股）", color=COLOR_TEXT)
+        chart.setTitle(f"三大法人累計買賣超｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
+
+    def _populate_position_margin_chart(self, margin_history):
+        """融資融券餘額趨勢圖：跟 _populate_position_flow_chart 不同，這裡的資料
+        本來就是「餘額」（TodayBalance），不是逐日買賣超流量，所以直接畫原始值，
+        不能再累加一次（累加會變成「餘額的餘額」，數字沒有意義）。"""
+        chart = self.position_margin_chart
+        chart.clear()
+        if margin_history is None or not margin_history["dates"]:
+            return
+
+        dates = margin_history["dates"]
+        x = list(range(len(dates)))
+        step = max(1, len(dates) // 8)
+        chart.getPlotItem().getAxis("bottom").setTicks(
+            [[(i, dates[i]) for i in range(0, len(dates), step)]]
+        )
+
+        series_colors = {"融資餘額": "#9467bd", "融券餘額": "#ff7f0e"}
+        for label, series in margin_history["series"].items():
+            chart.plot(
+                x,
+                series,
+                pen=pg.mkPen(series_colors.get(label, COLOR_TEXT), width=2),
+                name=label,
+            )
+
+        chart.setLabel("left", "餘額（張）", color=COLOR_TEXT)
+        chart.setTitle(f"融資融券餘額｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
 
     def _update_status_bar(self):
         cache_note = ""

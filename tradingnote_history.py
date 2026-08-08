@@ -395,6 +395,51 @@ def get_ticker_history(db_path, ticker, limit=None):
     return rows
 
 
+# ---------- 日期選擇（給資金流向頁的日曆式區間選擇器用，取代原本直接輸入天數；
+# 天數（avg_days）語意見 compute_industry_flow：今天以前 N 個交易日，不含今天） ----------
+
+def get_available_dates(db_path):
+    """回傳 daily_prices 裡所有出現過的交易日（ISO 字串，由舊到新排序），給 GUI
+    日期選擇器判斷「哪些日期有資料、該反白哪些日期」用；資料庫是空的回傳空清單。"""
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute("SELECT DISTINCT date FROM daily_prices ORDER BY date").fetchall()
+    finally:
+        conn.close()
+    return [row[0] for row in rows]
+
+
+def trading_days_between(db_path, start_date, end_date=None):
+    """回傳 start_date（含）到 end_date（不含，預設今天）之間有資料的交易日數，
+    給日期選擇器把使用者選的「起始日期」換算成 compute_industry_flow／
+    compute_volume_ratio_outliers 慣用的 avg_days（今天以前 N 個交易日）。"""
+    end_date = end_date or date.today().isoformat()
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT date) FROM daily_prices WHERE date >= ? AND date < ?",
+            (start_date, end_date),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else 0
+
+
+def default_start_date_for_days(db_path, avg_days):
+    """回傳「今天以前 avg_days 個交易日」對應的起始日期（ISO字串），給日期選擇器的
+    預設值用（例如舊有 QSpinBox 預設值 5／20 天，換算成日期選擇器的預設起始日）；
+    實際可用天數不足 avg_days 天時，回傳資料庫裡最早的日期（等同「全部資料都選」），
+    完全沒有資料時回傳今天。跟 trading_days_between 互為反函式：
+    trading_days_between(db_path, default_start_date_for_days(db_path, N)) == N
+    （資料足夠的情況下）。"""
+    today_iso = date.today().isoformat()
+    before_today = [d for d in get_available_dates(db_path) if d < today_iso]
+    if not before_today:
+        return today_iso
+    index = max(0, len(before_today) - avg_days)
+    return before_today[index]
+
+
 # ---------- 產業分類 ----------
 
 def fetch_industry_map():
