@@ -27,11 +27,14 @@ from tradingnote_core import (
 )
 from tradingnote_history import (
     DEFAULT_BACKFILL_TARGET_DAYS,
+    VOLUME_RATIO_TIERS,
     _change_pct,
     backfill_twse_history,
     compute_industry_flow,
+    compute_volume_ratio_outliers,
     get_history_status,
     get_industry_directory,
+    get_industry_map,
     get_industry_top_stocks_range,
     get_latest_ticker_record,
     record_snapshot,
@@ -593,14 +596,14 @@ class StockDetailDialog(QtWidgets.QDialog):
 
 class IndustryTopStocksDialog(QtWidgets.QDialog):
     """點擊「資金流向分析」頁的產業泡泡／資金動向清單時彈出的小視窗，顯示該產業
-    近 days 個交易日累積成交金額前十大成分股（市值資料的代理指標，見
-    get_industry_top_stocks_range）。純本地資料，不打任何 API，開啟即顯示。
-    泡泡圖跟清單各自有獨立的「資料區間」設定，這裡的 days 就是觸發點擊當下
-    那邊的區間天數，讓彈出視窗的口徑跟畫面上看到的一致。"""
+    近 days 個交易日累積成交金額前 N 大成分股（市值資料的代理指標，見
+    get_industry_top_stocks_range；N 不足時全部顯示）。純本地資料，不打任何
+    API，開啟即顯示。泡泡圖跟清單各自有獨立的「資料區間」設定，這裡的 days
+    就是觸發點擊當下那邊的區間天數，讓彈出視窗的口徑跟畫面上看到的一致。"""
 
     def __init__(self, parent, industry, top_stocks, days):
         super().__init__(parent)
-        self.setWindowTitle(f"{industry}　近 {days} 日成交金額前十大成分股")
+        self.setWindowTitle(f"{industry}　近 {days} 日成交金額前 {len(top_stocks)} 大成分股")
         self.setMinimumWidth(420)
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -631,7 +634,7 @@ class IndustryTopStocksDialog(QtWidgets.QDialog):
                     item.setForeground(QtGui.QColor(color))
                 table.setItem(row, col, item)
         table.resizeColumnsToContents()
-        table.setFixedHeight(min(320, 36 + table.rowCount() * 30))
+        table.setFixedHeight(min(760, 36 + table.rowCount() * 30))
         layout.addWidget(table)
 
         close_btn = QtWidgets.QPushButton("關閉")
@@ -781,10 +784,12 @@ def populate_flow_chart(chart, db_path, snapshot, avg_days=5, on_industry_click=
         vb.setLimits(xMin=None, xMax=None, yMin=None, yMax=None)
         return
 
-    max_value = max(f.total_trading_value for f in plotted)
+    # 泡泡大小用「資金比重(%)」（該產業成交金額 ÷ 全市場今日總成交金額）而非絕對金額，
+    # 讓數字換算成跟當日大盤規模脫鉤的相對占比，不再是每天隨大盤總量起伏的絕對值。
+    max_share = max(f.capital_share_pct for f in plotted)
 
     for i, f in enumerate(plotted):
-        size = max(14.0, (f.total_trading_value / max_value) ** 0.5 * 55.0)
+        size = max(14.0, (f.capital_share_pct / max_share) ** 0.5 * 55.0)
         color = QtGui.QColor(TAB20_COLORS[i % len(TAB20_COLORS)])
         scatter = pg.ScatterPlotItem(
             x=[f.avg_change_pct],
@@ -801,7 +806,9 @@ def populate_flow_chart(chart, db_path, snapshot, avg_days=5, on_industry_click=
                 lambda _plot, _pts, _ev, industry=f.industry: on_industry_click(industry)
             )
         chart.addItem(scatter)
-        label = pg.TextItem(f.industry, color=COLOR_TEXT, anchor=(0.5, 0.5))
+        label = pg.TextItem(
+            f"{f.industry}\n{f.capital_share_pct:.1f}%", color=COLOR_TEXT, anchor=(0.5, 0.5)
+        )
         label.setPos(f.avg_change_pct, f.volume_ratio)
         chart.addItem(label)
 
@@ -809,7 +816,7 @@ def populate_flow_chart(chart, db_path, snapshot, avg_days=5, on_industry_click=
     chart.addLine(y=1, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
     chart.setLabel("bottom", f"近{avg_days}日成交金額加權平均累積漲跌 %", color=COLOR_TEXT)
     chart.setLabel("left", f"今日成交量 / 近{avg_days}日均量", color=COLOR_TEXT)
-    title = f"產業資金流向｜{avg_days}日（泡泡大小＝成交金額，點擊可查看成分股）"
+    title = f"產業資金流向｜{avg_days}日（泡泡大小＝資金比重%，點擊可查看成分股）"
     if skipped:
         title += f"　（另有 {skipped} 個產業因歷史資料不足未顯示）"
     chart.setTitle(title, color=COLOR_TEXT, size="13pt")
@@ -1010,6 +1017,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addSpacing(20)
         self._build_flow_list_section(layout)
 
+        layout.addSpacing(20)
+        self._build_volume_outliers_section(layout)
+
     def _on_flow_days_apply(self):
         requested_days = self.flow_days_spin.value()
         status = get_history_status(HISTORY_DB_PATH)
@@ -1034,16 +1044,17 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             on_industry_click=self._on_industry_bubble_clicked,
         )
         self.refresh_flow_list()
+        self.refresh_volume_outliers_list()
 
     def _show_industry_top_stocks(self, industry, days):
         top_stocks = get_industry_top_stocks_range(
-            HISTORY_DB_PATH, self.snapshot, industry, days, top_n=10
+            HISTORY_DB_PATH, self.snapshot, industry, days, top_n=30
         )
         IndustryTopStocksDialog(self, industry, top_stocks, days=days).exec()
 
     def _on_industry_bubble_clicked(self, industry):
-        # 泡泡圖本身就是「近 flow_avg_days 日」流向的視覺化，點擊彈出的前十大
-        # 成分股也該用同一個區間的累積成交金額，跟泡泡代表的資料口徑一致。
+        # 泡泡圖本身就是「近 flow_avg_days 日」流向的視覺化，點擊彈出的成分股
+        # 清單也該用同一個區間的累積成交金額，跟泡泡代表的資料口徑一致。
         self._show_industry_top_stocks(industry, self.flow_avg_days)
 
     def _on_flow_list_item_clicked(self, industry):
@@ -1146,6 +1157,131 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.flow_list.sortByColumn(2, QtCore.Qt.DescendingOrder)
         for col in range(self.flow_list.columnCount()):
             self.flow_list.resizeColumnToContents(col)
+
+    # ---------- 個股量比異常清單（今日量 ÷ 近N日均量，逐檔股票各自比較自己的
+    # 歷史均量，抓「個股」層級的爆量，不像資金動向清單是整個產業加總後的量比，
+    # 單一檔股票爆量會被同產業其他股票稀釋掉） ----------
+
+    def _build_volume_outliers_section(self, layout):
+        header = QtWidgets.QLabel("個股量比異常清單")
+        header.setProperty("header", True)
+        layout.addWidget(header)
+        layout.addSpacing(4)
+
+        controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(QtWidgets.QLabel("均量天數："))
+        self.outlier_days_spin = QtWidgets.QSpinBox()
+        self.outlier_days_spin.setRange(2, 60)
+        self.outlier_days_spin.setValue(5)
+        self.outlier_days_spin.setSuffix(" 天")
+        controls.addWidget(self.outlier_days_spin)
+        controls.addWidget(accent_button("套用", self._on_outlier_days_apply))
+
+        controls.addSpacing(16)
+        controls.addWidget(QtWidgets.QLabel("級距："))
+        self.outlier_tier_combo = QtWidgets.QComboBox()
+        self.outlier_tier_combo.addItem("全部", None)
+        for tier in VOLUME_RATIO_TIERS:
+            self.outlier_tier_combo.addItem(tier, tier)
+        self.outlier_tier_combo.currentIndexChanged.connect(self._on_outlier_tier_filter_changed)
+        controls.addWidget(self.outlier_tier_combo)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        hint = QtWidgets.QLabel(
+            "今日成交量 ÷ 近N日均量 ≥ 1.5 倍的個股，依比值分成 1.5～2倍／2～3倍／3倍以上；"
+            "雙擊股票查詢本益比／殖利率／三大法人買賣超（同「個股」分頁，走 FinMind）。"
+        )
+        hint.setProperty("muted", True)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        layout.addSpacing(8)
+
+        self.outlier_avg_days = self.outlier_days_spin.value()
+        self.outlier_tier_filter = None
+        self.volume_outliers_list = QtWidgets.QTreeWidget()
+        self.volume_outliers_list.setColumnCount(7)
+        self.volume_outliers_list.setHeaderLabels(
+            ["級距", "代號", "名稱", "現價", "漲跌%", "量比", "今日量(張)"]
+        )
+        self.volume_outliers_list.setRootIsDecorated(False)
+        self.volume_outliers_list.setAlternatingRowColors(True)
+        self.volume_outliers_list.setSortingEnabled(True)
+        self.volume_outliers_list.setMinimumHeight(280)
+        self.volume_outliers_list.itemDoubleClicked.connect(
+            self._on_volume_outlier_double_clicked
+        )
+        layout.addWidget(self.volume_outliers_list)
+
+    def _on_outlier_days_apply(self):
+        requested_days = self.outlier_days_spin.value()
+        status = get_history_status(HISTORY_DB_PATH)
+        available_days = status["overall"]["days"]
+        if available_days and requested_days > available_days:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "資料可能不足",
+                f"選擇的均量天數是 {requested_days} 天，但資料庫目前只有 {available_days} "
+                f"個交易日資料，符合的個股可能會偏少。\n\n"
+                "可至「設定」分頁調整回補天數，或按「回補歷史資料」補齊後再試。",
+            )
+        self.outlier_avg_days = requested_days
+        self.refresh_volume_outliers_list()
+
+    def _on_outlier_tier_filter_changed(self, _index):
+        self.outlier_tier_filter = self.outlier_tier_combo.currentData()
+        self.refresh_volume_outliers_list()
+
+    def refresh_volume_outliers_list(self):
+        outliers = compute_volume_ratio_outliers(
+            HISTORY_DB_PATH, self.snapshot, avg_days=self.outlier_avg_days, min_ratio=1.5
+        )
+        if self.outlier_tier_filter:
+            outliers = [o for o in outliers if o.tier == self.outlier_tier_filter]
+
+        tier_colors = {
+            "3倍以上": COLOR_LOSS,
+            "2～3倍": COLOR_ACCENT,
+            "1.5～2倍": COLOR_MUTED,
+        }
+
+        self.volume_outliers_list.setSortingEnabled(False)
+        self.volume_outliers_list.clear()
+        for o in outliers:
+            change_text = f"{o.change_pct:+.2f}%" if o.change_pct is not None else "-"
+            item = QtWidgets.QTreeWidgetItem(
+                [
+                    o.tier,
+                    o.ticker,
+                    o.name,
+                    f"{o.close:.2f}" if o.close is not None else "-",
+                    change_text,
+                    f"{o.volume_ratio:.2f}",
+                    f"{o.today_volume / 1000:,.0f}",
+                ]
+            )
+            item.setData(0, QtCore.Qt.UserRole, o.ticker)
+            item.setData(0, QtCore.Qt.UserRole + 1, o.market)
+            for col in (1, 2, 3, 4, 5, 6):
+                item.setTextAlignment(col, QtCore.Qt.AlignCenter)
+            item.setForeground(0, QtGui.QColor(tier_colors[o.tier]))
+            if o.change_pct is not None:
+                color = COLOR_GAIN if o.change_pct >= 0 else COLOR_LOSS
+                item.setForeground(4, QtGui.QColor(color))
+            self.volume_outliers_list.addTopLevelItem(item)
+        self.volume_outliers_list.setSortingEnabled(True)
+        self.volume_outliers_list.sortByColumn(5, QtCore.Qt.DescendingOrder)
+        for col in range(self.volume_outliers_list.columnCount()):
+            self.volume_outliers_list.resizeColumnToContents(col)
+
+    def _on_volume_outlier_double_clicked(self, item, _column):
+        ticker = item.data(0, QtCore.Qt.UserRole)
+        if not ticker:
+            return
+        name = item.text(2)
+        market = item.data(0, QtCore.Qt.UserRole + 1)
+        token = self.settings.get("finmind_token", "")
+        StockDetailDialog(self, ticker, name, token, market=market).exec()
 
     def open_backfill_dialog(self):
         target_days = self.settings.get("backfill_target_days", DEFAULT_BACKFILL_TARGET_DAYS)

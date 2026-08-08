@@ -50,6 +50,7 @@ class IndustryFlow:
     avg_change_pct: float | None
     volume_ratio: float | None
     total_trading_value: float
+    capital_share_pct: float
     stock_count: int
 
 
@@ -532,6 +533,10 @@ def compute_industry_flow(db_path, snapshot, avg_days=5):
     for ticker, day, close, volume in history_rows:
         ticker_history.setdefault(ticker, []).append((day, close, volume or 0))
 
+    # 資金比重的分母用「全市場今日總成交金額」（含歷史資料不足、稍後會被過濾掉的產業），
+    # 才能反映真實佔比；若只用 plotted 產業算分母，佔比會隨著哪些產業被過濾而跳動。
+    total_market_value = sum(g["trading_value"] for g in groups.values())
+
     results = []
     for industry, g in groups.items():
         if g["trading_value"] <= 0:
@@ -557,12 +562,17 @@ def compute_industry_flow(db_path, snapshot, avg_days=5):
         avg_change_pct = (weighted_change / change_weight) if change_weight > 0 else None
         volume_ratio = (today_volume / baseline_volume) if baseline_volume > 0 else None
 
+        capital_share_pct = (
+            (g["trading_value"] / total_market_value * 100) if total_market_value > 0 else 0.0
+        )
+
         results.append(
             IndustryFlow(
                 industry=industry,
                 avg_change_pct=avg_change_pct,
                 volume_ratio=volume_ratio,
                 total_trading_value=g["trading_value"],
+                capital_share_pct=capital_share_pct,
                 stock_count=len(g["ticker_prices"]),
             )
         )
@@ -577,7 +587,7 @@ def compute_industry_flow(db_path, snapshot, avg_days=5):
 # 即時 snapshot（今日）＋ daily_prices（歷史），不額外打 API，跟「個股」分頁列清單的
 # 原則一致。
 
-def get_industry_top_stocks_range(db_path, snapshot, industry, days, top_n=10):
+def get_industry_top_stocks_range(db_path, snapshot, industry, days, top_n=30):
     """回傳某產業前 top_n 大成分股，排序依據是近 days 個交易日（含今日）的
     「累積成交金額」，讓成分股排名跟「資金流向分析」頁（泡泡圖／資金動向清單）的
     資料區間口徑一致。今日成交金額／收盤來自即時 snapshot，
@@ -639,3 +649,100 @@ def get_industry_top_stocks_range(db_path, snapshot, industry, days, top_n=10):
 
     results.sort(key=lambda r: r["trading_value"], reverse=True)
     return results[:top_n]
+
+
+# ---------- 個股量比異常清單 ----------
+
+VOLUME_RATIO_TIERS = ("1.5～2倍", "2～3倍", "3倍以上")
+
+
+@dataclass
+class VolumeRatioOutlier:
+    ticker: str
+    name: str
+    market: str
+    close: float | None
+    change_pct: float | None
+    today_volume: int
+    avg_volume: float
+    volume_ratio: float
+    tier: str
+
+
+def _volume_ratio_tier(ratio):
+    if ratio >= 3:
+        return "3倍以上"
+    if ratio >= 2:
+        return "2～3倍"
+    return "1.5～2倍"
+
+
+def compute_volume_ratio_outliers(db_path, snapshot, avg_days=5, min_ratio=1.5):
+    """掃描全市場個股，找出「今日成交量 ÷ 近 avg_days 日均量」達到 min_ratio 倍以上的
+    爆量股票，依比值分成三個級距（1.5～2倍／2～3倍／3倍以上）。
+
+    跟 compute_industry_flow 的 volume_ratio 不同：那裡是整個產業加總後的量比，
+    單一檔股票爆量會被同產業其他股票的量能稀釋掉；這裡逐檔股票各自比較自己的
+    歷史均量，才抓得到「個股」層級的異常。查詢手法（LIFO 取近 avg_days 筆歷史）
+    跟 compute_industry_flow／get_industry_top_stocks_range 一致。只納入
+    industry_map 裡有分類的股票，藉此排除權證、ETF 等非個股商品。"""
+    industry_map = get_industry_map(db_path)
+    min_history_days = max(2, avg_days // 2)
+    cutoff = (date.today() - timedelta(days=avg_days * 3)).isoformat()
+
+    tickers_today = {}
+    for price in snapshot.values():
+        if price.close is None or price.volume is None:
+            continue
+        if price.ticker not in industry_map:
+            continue
+        tickers_today[price.ticker] = price
+
+    if not tickers_today:
+        return []
+
+    tickers = list(tickers_today)
+    conn = _connect(db_path)
+    try:
+        placeholders = ",".join("?" * len(tickers))
+        rows = conn.execute(
+            f"""SELECT ticker, date, volume FROM daily_prices
+               WHERE ticker IN ({placeholders}) AND date < ? AND date >= ?
+               ORDER BY date DESC""",
+            (*tickers, date.today().isoformat(), cutoff),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    ticker_history = {}
+    for ticker, _day, volume in rows:
+        ticker_history.setdefault(ticker, []).append(volume or 0)
+
+    results = []
+    for ticker, price in tickers_today.items():
+        days = ticker_history.get(ticker, [])[:avg_days]
+        if len(days) < min_history_days:
+            continue
+        avg_volume = sum(days) / len(days)
+        if avg_volume <= 0:
+            continue
+        ratio = price.volume / avg_volume
+        if ratio < min_ratio:
+            continue
+
+        results.append(
+            VolumeRatioOutlier(
+                ticker=ticker,
+                name=price.name,
+                market=price.market,
+                close=price.close,
+                change_pct=_change_pct(price),
+                today_volume=price.volume,
+                avg_volume=avg_volume,
+                volume_ratio=ratio,
+                tier=_volume_ratio_tier(ratio),
+            )
+        )
+
+    results.sort(key=lambda r: r.volume_ratio, reverse=True)
+    return results
