@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from tradingnote_cache import TTLCache, load_fresh_file_cache, load_stale_file_cache, write_file_cache
 from tradingnote_http import PriceFetchError, http_get_json, to_float, to_int
 
 TWSE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
@@ -246,7 +247,7 @@ def fetch_tpex_all():
 # FinMind 得每檔股票各打一次、還要算進 600 次／小時額度，所以整份快取在行程記憶體
 # 裡（_tpex_valuation_cache），而不是像 FinMind 那樣以 (dataset, ticker) 為單位。
 
-_tpex_valuation_cache = None  # (fetched_at: datetime, {ticker: {"date":, "per":, "pbr":, "dividend_yield":}})
+_tpex_valuation_cache = TTLCache(TPEX_VALUATION_CACHE_TTL_SECONDS)
 
 
 def fetch_tpex_valuation_all():
@@ -272,14 +273,7 @@ def get_tpex_valuation(ticker):
     """LIFO 風格的單檔查詢，但底層是整份市場快取：命中 30 分鐘內的快取就不重打
     API，快取過期時一次重抓全市場、之後這一輪的其他上櫃股票查詢都直接吃快取。
     查無資料（該股票不在 tpex_mainboard_peratio_analysis 裡）回傳 None。"""
-    global _tpex_valuation_cache
-    if _tpex_valuation_cache is not None:
-        fetched_at, data = _tpex_valuation_cache
-        if (datetime.now() - fetched_at).total_seconds() < TPEX_VALUATION_CACHE_TTL_SECONDS:
-            return data.get(ticker)
-
-    data = fetch_tpex_valuation_all()
-    _tpex_valuation_cache = (datetime.now(), data)
+    data = _tpex_valuation_cache.get_or_fetch(None, fetch_tpex_valuation_all)
     return data.get(ticker)
 
 
@@ -292,12 +286,9 @@ def get_market_snapshot(cache_path, force_refresh=False, on_progress=None):
         if on_progress:
             on_progress(done, total, label)
 
-    p = Path(cache_path)
-    if not force_refresh and p.exists():
-        with p.open("r", encoding="utf-8") as f:
-            cached = json.load(f)
-        fetched_at = datetime.fromisoformat(cached["fetched_at"])
-        if (datetime.now() - fetched_at).total_seconds() < CACHE_TTL_SECONDS:
+    if not force_refresh:
+        cached = load_fresh_file_cache(cache_path, CACHE_TTL_SECONDS)
+        if cached is not None:
             return {
                 code: PriceInfo(**info) for code, info in cached["prices"].items()
             }
@@ -316,24 +307,15 @@ def get_market_snapshot(cache_path, force_refresh=False, on_progress=None):
         twse = _twse_all_with_staleness_fallback(twse_raw)
         _progress(1, total_steps, "正在寫入快取...")
     except PriceFetchError:
-        if p.exists():
-            with p.open("r", encoding="utf-8") as f:
-                cached = json.load(f)
-            return {code: PriceInfo(**info) for code, info in cached["prices"].items()}
+        stale = load_stale_file_cache(cache_path)
+        if stale is not None:
+            return {code: PriceInfo(**info) for code, info in stale["prices"].items()}
         raise
 
     snapshot = {**twse, **tpex}
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "fetched_at": datetime.now().isoformat(),
-                "prices": {code: asdict(info) for code, info in snapshot.items()},
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+    write_file_cache(
+        cache_path, {"prices": {code: asdict(info) for code, info in snapshot.items()}}
+    )
     _progress(2, total_steps, "快取寫入完成")
     return snapshot
 

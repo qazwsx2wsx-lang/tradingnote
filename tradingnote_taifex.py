@@ -12,10 +12,7 @@
 （含價差單），呼叫端自行從裡面篩出想要的商品代碼與近月合約。
 """
 
-import json
-from datetime import datetime
-from pathlib import Path
-
+from tradingnote_cache import load_fresh_file_cache, load_stale_file_cache, write_file_cache
 from tradingnote_http import PriceFetchError, http_get_json, to_float, to_int
 
 TAIFEX_DAILY_FUTURES_URL = "https://openapi.taifex.com.tw/v1/DailyMarketReportFut"
@@ -87,30 +84,20 @@ def get_cached_daily_futures_report(cache_path, force_refresh=False):
     FUTURES_CACHE_TTL_SECONDS 內的快取就不重打 API，過期或 force_refresh 才
     真的呼叫 fetch_daily_futures_report()；API 失敗時退回舊快取（若有）而不是
     直接噴錯，跟個股快取失敗時的 fallback 邏輯一致。"""
-    p = Path(cache_path)
-    if not force_refresh and p.exists():
-        with p.open("r", encoding="utf-8") as f:
-            cached = json.load(f)
-        fetched_at = datetime.fromisoformat(cached["fetched_at"])
-        if (datetime.now() - fetched_at).total_seconds() < FUTURES_CACHE_TTL_SECONDS:
+    if not force_refresh:
+        cached = load_fresh_file_cache(cache_path, FUTURES_CACHE_TTL_SECONDS)
+        if cached is not None:
             return cached["rows"]
 
     try:
         rows = fetch_daily_futures_report()
     except PriceFetchError:
-        if p.exists():
-            with p.open("r", encoding="utf-8") as f:
-                return json.load(f)["rows"]
+        stale = load_stale_file_cache(cache_path)
+        if stale is not None:
+            return stale["rows"]
         raise
 
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(
-            {"fetched_at": datetime.now().isoformat(), "rows": rows},
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+    write_file_cache(cache_path, {"rows": rows})
     return rows
 
 

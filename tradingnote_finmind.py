@@ -16,6 +16,7 @@ import time
 from datetime import date, timedelta
 from urllib.parse import urlencode
 
+from tradingnote_cache import TTLCache
 from tradingnote_core import get_tpex_valuation
 from tradingnote_http import PriceFetchError, http_get_json
 
@@ -44,11 +45,12 @@ INSTITUTIONAL_NAME_ORDER = list(INSTITUTIONAL_NAME_LABELS)
 # 只存在記憶體中，重啟程式會歸零，不代表 FinMind 帳號其他來源的真實用量。
 _call_timestamps = []
 
-# (dataset, ticker, lookback_days) -> (fetched_at, rows)。「個股」雙擊查詢跟
-# 「AI 助理」工具呼叫都走 _fetch_dataset，共用同一份，命中快取時不會被算進
-# _call_timestamps（用量統計只反映真的打出去的 API 次數）。只快取成功的結果
-# （包含查無資料的空陣列）；連線失敗會直接拋錯，不快取，下次呼叫照樣重試。
-_dataset_cache = {}
+# key 是 (dataset, ticker, lookback_days)。「個股」雙擊查詢跟「AI 助理」工具
+# 呼叫都走 _fetch_dataset，共用同一份，命中快取時不會被算進 _call_timestamps
+# （用量統計只反映真的打出去的 API 次數）。只快取成功的結果（包含查無資料的
+# 空陣列，因為 TTLCache.get_or_fetch 只在 fetch_fn 正常回傳時才存入）；連線
+# 失敗的例外會直接往上拋，不快取，下次呼叫照樣重試。
+_dataset_cache = TTLCache(DATASET_CACHE_TTL_SECONDS)
 
 
 def get_call_count(window_seconds=3600):
@@ -65,31 +67,26 @@ def _fetch_dataset(dataset, ticker, token, lookback_days=10):
     （預設 10 天）而不是單一天，是因為假日、盤後資料延遲時當天可能還沒有資料，
     用區間取最後一筆確保拿得到最新的一筆。命中 _dataset_cache（30 分鐘內查過
     同一個 dataset／ticker／lookback_days 組合）就直接回傳，不重打 API。"""
-    cache_key = (dataset, ticker, lookback_days)
-    cached = _dataset_cache.get(cache_key)
-    if cached is not None:
-        fetched_at, rows = cached
-        if time.time() - fetched_at < DATASET_CACHE_TTL_SECONDS:
-            return rows
 
-    end = date.today()
-    start = end - timedelta(days=lookback_days)
-    params = {
-        "dataset": dataset,
-        "data_id": ticker,
-        "start_date": start.isoformat(),
-        "end_date": end.isoformat(),
-    }
-    if token:
-        params["token"] = token
-    url = f"{FINMIND_URL}?{urlencode(params)}"
-    _call_timestamps.append(time.time())
-    payload = http_get_json(url)
-    if payload.get("msg") != "success":
-        raise PriceFetchError(f"FinMind 回應異常：{payload.get('msg')}")
-    rows = payload.get("data") or []
-    _dataset_cache[cache_key] = (time.time(), rows)
-    return rows
+    def _do_fetch():
+        end = date.today()
+        start = end - timedelta(days=lookback_days)
+        params = {
+            "dataset": dataset,
+            "data_id": ticker,
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+        }
+        if token:
+            params["token"] = token
+        url = f"{FINMIND_URL}?{urlencode(params)}"
+        _call_timestamps.append(time.time())
+        payload = http_get_json(url)
+        if payload.get("msg") != "success":
+            raise PriceFetchError(f"FinMind 回應異常：{payload.get('msg')}")
+        return payload.get("data") or []
+
+    return _dataset_cache.get_or_fetch((dataset, ticker, lookback_days), _do_fetch)
 
 
 def fetch_valuation(ticker, token, lookback_days=10, market=None):

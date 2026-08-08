@@ -1839,7 +1839,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             all_products, snapshot = result
             self._futures_all_products = all_products
             self._futures_snapshot = snapshot
-            self.futures_status_label.setText("")
+            data_date = _futures_snapshot_date(snapshot)
+            self.futures_status_label.setText(f"資料日期：{data_date}" if data_date else "")
             self._rebuild_futures_table()
             self._refresh_data_freshness_label()
 
