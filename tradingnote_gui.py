@@ -404,6 +404,89 @@ def run_refresh_in_thread(parent, progress_cb, done_cb, error_cb):
     return timer
 
 
+def run_startup_preload_in_thread(parent, progress_cb, done_cb, error_cb):
+    """App 啟動時、TradingNoteWindow 建立前，在背景執行緒抓取即時報價、寫入歷史
+    資料庫、更新產業分類（機制跟 run_refresh_in_thread 相同）。原本這三步是在
+    TradingNoteWindow.__init__ 裡同步做，視窗要等全部做完才 show()，網路慢時
+    畫面會完全沒反應；改成背景執行緒＋StartupProgressDialog 讓使用者看得到進度。
+    多做「更新產業分類」是因為 __init__ 後續的 refresh_flow_tab／refresh_stocks_tab
+    也需要它，先在這裡連網更新好，__init__ 裡才不用再連一次網。"""
+    q = queue.Queue()
+    total_steps = 4
+
+    def worker():
+        try:
+            snapshot = get_market_snapshot(
+                CACHE_PATH,
+                on_progress=lambda done, _total, label: q.put(
+                    ("progress", done, total_steps, label)
+                ),
+            )
+            q.put(("progress", 3, total_steps, "正在寫入歷史資料庫..."))
+            record_snapshot(HISTORY_DB_PATH, snapshot)
+            q.put(("progress", 3, total_steps, "正在更新產業分類..."))
+            get_industry_map(HISTORY_DB_PATH)
+            q.put(("progress", 4, total_steps, "完成"))
+            q.put(("done", snapshot, None, None))
+        except PriceFetchError as e:  # noqa: BLE001 - surface any failure to the caller
+            q.put(("error", str(e), None, None))
+
+    timer = QtCore.QTimer(parent)
+
+    def poll():
+        try:
+            while True:
+                kind, a, b, c = q.get_nowait()
+                if kind == "progress":
+                    progress_cb(a, b, c)
+                elif kind == "done":
+                    timer.stop()
+                    done_cb(a)
+                    return
+                elif kind == "error":
+                    timer.stop()
+                    error_cb(a)
+                    return
+        except queue.Empty:
+            pass
+
+    timer.timeout.connect(poll)
+    timer.start(150)
+    threading.Thread(target=worker, daemon=True).start()
+    return timer
+
+
+class StartupProgressDialog(QtWidgets.QDialog):
+    """App 啟動時顯示，讓使用者知道正在抓報價／更新產業分類，避免主視窗建立
+    完成前完全沒有任何畫面（原本 TradingNoteWindow() 建構子跑完才 show()，
+    網路慢時看起來像沒反應甚至像當掉）。由 main() 建立、驅動、關閉，本身不
+    知道背景工作的細節，只負責顯示 run_startup_preload_in_thread 回報的進度。"""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("tradingnote")
+        self.setFixedWidth(320)
+        # 啟動階段還沒有主視窗可以退回去，故意拿掉關閉鈕，避免使用者手動關掉
+        # 這個對話框後，背景執行緒做完卻沒有視窗可以顯示、app 卡住沒反應。
+        self.setWindowFlags(QtCore.Qt.Dialog | QtCore.Qt.CustomizeWindowHint | QtCore.Qt.WindowTitleHint)
+
+        self.status_label = QtWidgets.QLabel("正在啟動...")
+        self.status_label.setWordWrap(True)
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 20)
+        layout.addWidget(self.status_label)
+        layout.addSpacing(6)
+        layout.addWidget(self.progress_bar)
+
+    def set_progress(self, done, total, label):
+        self.progress_bar.setValue(int(done / total * 100))
+        self.status_label.setText(label)
+
+
 class PositionFormDialog(QtWidgets.QDialog):
     """新增／編輯部位共用同一個表單。position=None 是新增模式（欄位空白，日期
     預設今天）；傳入現有 Position 就是編輯模式（欄位預先帶入目前的值，代號欄位
@@ -841,7 +924,10 @@ def populate_flow_chart(chart, db_path, snapshot, avg_days=5, on_industry_click=
 
 
 class TradingNoteWindow(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self, snapshot, last_error):
+        """snapshot／last_error 由 main() 的啟動前置作業（run_startup_preload_in_thread）
+        算好傳入——報價抓取、寫入歷史資料庫、產業分類更新這三個會連網／連DB的步驟
+        都已經在背景執行緒做完，這裡不再重做一次，避免視窗建立過程又卡一次網路。"""
         super().__init__()
         self.setWindowTitle("tradingnote - 台股資金流向分析")
         self.resize(1040, 720)
@@ -849,15 +935,11 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
         self.settings = load_settings(SETTINGS_PATH)
         self.positions = load_positions(POSITIONS_PATH)
-        try:
-            self.snapshot = get_market_snapshot(CACHE_PATH)
-            record_snapshot(HISTORY_DB_PATH, self.snapshot)
-            self.last_error = None
-            self.staleness_warning = "；".join(snapshot_staleness_warnings(self.snapshot))
-        except PriceFetchError as e:
-            self.snapshot = {}
-            self.last_error = str(e)
-            self.staleness_warning = ""
+        self.snapshot = snapshot
+        self.last_error = last_error
+        self.staleness_warning = (
+            "；".join(snapshot_staleness_warnings(self.snapshot)) if self.snapshot else ""
+        )
 
         self.continuity_note = ""
         self._total_pnl = None
@@ -2042,8 +2124,28 @@ def main():
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     app.setStyleSheet(STYLESHEET)
     pg.setConfigOptions(antialias=True, background=COLOR_BG, foreground=COLOR_TEXT)
-    window = TradingNoteWindow()
-    window.show()
+
+    splash = StartupProgressDialog()
+    splash.show()
+
+    # 保住 TradingNoteWindow 的參照：window 是在 on_ready 這個巢狀函式的區域變數
+    # 建立的，on_ready 執行完就會結束，若不另外存進外層變數，Python 端的物件
+    # 會被回收（即使已經 show() 出來），導致視窗一閃就消失。
+    windows = []
+
+    def on_ready(snapshot, last_error):
+        splash.close()
+        window = TradingNoteWindow(snapshot, last_error)
+        windows.append(window)
+        window.show()
+
+    splash._timer = run_startup_preload_in_thread(
+        splash,
+        splash.set_progress,
+        done_cb=lambda snapshot: on_ready(snapshot, None),
+        error_cb=lambda message: on_ready({}, message),
+    )
+
     app.exec()
 
 
