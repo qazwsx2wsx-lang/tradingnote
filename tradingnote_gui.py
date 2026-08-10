@@ -5,7 +5,7 @@ import html
 import queue
 import threading
 from collections import Counter
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pyqtgraph as pg
@@ -44,14 +44,13 @@ from tradingnote_history import (
 )
 from tradingnote_finmind import (
     FINMIND_HOURLY_LIMIT,
-    fetch_foreign_shareholding,
+    backfill_tpex_history_via_finmind,
     fetch_institutional_investors,
-    fetch_institutional_investors_history,
-    fetch_margin_short_sale_history,
-    fetch_margin_short_sale_suspension,
-    fetch_securities_lending_summary,
+    fetch_position_detail,
     fetch_valuation,
     get_call_count,
+    load_position_detail_cache,
+    save_position_detail_cache,
 )
 from tradingnote_concepts import build_ticker_concept_map, load_concepts
 from tradingnote_taifex import (
@@ -68,6 +67,7 @@ DATA_DIR = Path(__file__).parent / "data"
 POSITIONS_PATH = DATA_DIR / "positions.json"
 CACHE_PATH = DATA_DIR / "price_cache.json"
 FUTURES_CACHE_PATH = DATA_DIR / "futures_cache.json"
+POSITION_DETAIL_CACHE_PATH = DATA_DIR / "position_detail_cache.json"
 HISTORY_DB_PATH = DATA_DIR / "history.db"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 
@@ -331,6 +331,61 @@ def run_backfill_in_thread(parent, target_days, progress_cb, done_cb, error_cb):
     timer.start(150)
     threading.Thread(target=worker, daemon=True).start()
     return timer
+
+
+def run_tpex_finmind_backfill_in_thread(parent, token, target_days, progress_cb, done_cb, error_cb):
+    """在背景執行緒跑 backfill_tpex_history_via_finmind，機制跟 run_backfill_in_thread
+    相同（背景執行緒＋queue＋QTimer 輪詢送回 Qt 主執行緒）。跟 TWSE 版不同的是
+    done_cb 收到的是一個 dict（done/total/newly_fetched/stopped_reason），不是單一
+    整數，因為額度可能用完提早停止，呼叫端需要分開處理「跑完」跟「額度用完」兩種
+    情況（見 TpexBackfillDialog._on_done）。"""
+    q = queue.Queue()
+
+    def worker():
+        try:
+            result = backfill_tpex_history_via_finmind(
+                HISTORY_DB_PATH,
+                token,
+                target_days=target_days,
+                on_progress=lambda done, total, ticker: q.put(("progress", done, total, ticker)),
+            )
+            q.put(("done", result, None, None))
+        except Exception as e:  # noqa: BLE001 - surface any failure to the caller
+            q.put(("error", str(e), None, None))
+
+    timer = QtCore.QTimer(parent)
+
+    def poll():
+        try:
+            while True:
+                kind, a, b, c = q.get_nowait()
+                if kind == "progress":
+                    progress_cb(a, b, c)
+                elif kind == "done":
+                    timer.stop()
+                    done_cb(a)
+                    return
+                elif kind == "error":
+                    timer.stop()
+                    error_cb(a)
+                    return
+        except queue.Empty:
+            pass
+
+    timer.timeout.connect(poll)
+    timer.start(150)
+    threading.Thread(target=worker, daemon=True).start()
+    return timer
+
+
+def _format_fetched_at(iso_string):
+    """position_detail_cache.json 存的 fetched_at 是 isoformat 字串，這裡轉成
+    畫面上顯示用的「YYYY-MM-DD HH:MM」，解析失敗（格式意外跑掉）就原字串照印，
+    不要為了美化格式讓整個部位詳細資訊區塊噴錯。"""
+    try:
+        return datetime.fromisoformat(iso_string).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return iso_string
 
 
 def run_task_in_thread(parent, work_fn, on_done, on_error):
@@ -776,6 +831,65 @@ class BackfillDialog(QtWidgets.QDialog):
         self.close_button.setEnabled(True)
 
 
+class TpexBackfillDialog(QtWidgets.QDialog):
+    """用 FinMind 補上櫃（TPEX）歷史資料的進度視窗，跟 BackfillDialog（TWSE）
+    UI 風格一致，但完成訊息要分兩種：真的補完，跟額度用完提早停止——後者不是
+    錯誤，是預期中會發生的事（FinMind 免費額度 600 次／小時，全市場上櫃約 800
+    檔，一次通常補不完），文案要讓使用者知道「之後再點一次會自動接續」，不要
+    看起來像失敗。"""
+
+    def __init__(self, parent, token, target_days=DEFAULT_BACKFILL_TARGET_DAYS, on_complete=None):
+        super().__init__(parent)
+        self.setWindowTitle("使用 FinMind 補上櫃缺口")
+        self.setMinimumWidth(360)
+        self.on_complete = on_complete
+
+        self.status_label = QtWidgets.QLabel("準備檢查上櫃股票歷史資料缺口...")
+        self.status_label.setWordWrap(True)
+        self.close_button = QtWidgets.QPushButton("關閉")
+        self.close_button.setEnabled(False)
+        self.close_button.clicked.connect(self.accept)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 16)
+        layout.addWidget(self.status_label)
+        layout.addSpacing(10)
+        layout.addWidget(self.close_button, alignment=QtCore.Qt.AlignHCenter)
+
+        self._timer = run_tpex_finmind_backfill_in_thread(
+            self,
+            token,
+            target_days,
+            progress_cb=lambda done, total, ticker: self.status_label.setText(
+                f"已檢查 {done}/{total} 檔（{ticker}）..."
+            ),
+            done_cb=self._on_done,
+            error_cb=self._on_error,
+        )
+
+    def _on_done(self, result):
+        done, total = result["done"], result["total"]
+        newly = result["newly_fetched"]
+        if result["stopped_reason"] == "quota_exhausted":
+            self.status_label.setText(
+                f"已達 FinMind 每小時額度上限，本次新補 {newly} 檔"
+                f"（累計 {done}/{total} 檔已達標）。\n"
+                "額度約 1 小時後重置，之後再按一次這個按鈕即可自動接續，"
+                "不會重新從頭補。"
+            )
+        else:
+            self.status_label.setText(
+                f"上櫃歷史資料回補完成，{total} 檔全數達標（本次新補 {newly} 檔）。"
+            )
+        self.close_button.setEnabled(True)
+        if self.on_complete:
+            self.on_complete()
+
+    def _on_error(self, message):
+        self.status_label.setText(f"回補失敗：{message}")
+        self.close_button.setEnabled(True)
+
+
 class RefreshDialog(QtWidgets.QDialog):
     """點擊「重新整理」時彈出，顯示連線取得即時報價／寫入歷史資料庫的階段進度。
     on_complete(snapshot, error) 完成時被呼叫：成功時 snapshot 是新快照、error 是
@@ -932,6 +1046,22 @@ def populate_flow_chart(chart, db_path, snapshot, avg_days=5, on_industry_click=
     )
 
     chart.enableAutoRange()
+
+
+def _limit_zoom_to_data(chart, xs, ys, x_floor=1.0, y_floor=1.0):
+    """限制往外縮的下限，最多縮到剛好看見全部資料為止，避免縮出一大片空白；
+    放大則不受影響，仍可無限拉近。邊界抓資料範圍的 15% 當緩衝。"""
+    vb = chart.getPlotItem().getViewBox()
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+    x_pad = max((x_max - x_min) * 0.15, x_floor)
+    y_pad = max((y_max - y_min) * 0.15, y_floor)
+    vb.setLimits(
+        xMin=x_min - x_pad,
+        xMax=x_max + x_pad,
+        yMin=y_min - y_pad,
+        yMax=y_max + y_pad,
+    )
 
 
 class TradingCalendarWidget(QtWidgets.QCalendarWidget):
@@ -1465,6 +1595,26 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         dialog = BackfillDialog(self, target_days=target_days, on_complete=on_complete)
         dialog.exec()
 
+    def open_tpex_backfill_dialog(self):
+        token = self.settings.get("finmind_token", "")
+        if not token:
+            QtWidgets.QMessageBox.information(
+                self,
+                "提示",
+                "請先在「設定」分頁填入 FinMind API Token 才能使用這個功能。",
+            )
+            return
+
+        target_days = self.settings.get("backfill_target_days", DEFAULT_BACKFILL_TARGET_DAYS)
+
+        def on_complete():
+            self.refresh_flow_tab()
+            self._refresh_history_status()
+            self.update_finmind_count_label()
+
+        dialog = TpexBackfillDialog(self, token, target_days=target_days, on_complete=on_complete)
+        dialog.exec()
+
     def _sync_history_continuity(self):
         def on_progress(done, target):
             self.continuity_note = f"同步歷史資料中... {done}/{target} 天"
@@ -1536,7 +1686,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
         header = QtWidgets.QLabel(
             "個股詳細資訊（選取上方部位查看，含 FinMind 三大法人120日資金流向、"
-            "融資融券餘額、外資持股、借券與停資停券）"
+            "融資融券餘額、外資持股、借券與停資停券、VPT 量價趨勢、MFI 資金流量）"
         )
         header.setProperty("header", True)
         outer_layout.addWidget(header)
@@ -1570,6 +1720,20 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.position_margin_chart.setMinimumHeight(200)
         self.position_margin_chart.addLegend()
         layout.addWidget(self.position_margin_chart)
+
+        self.position_vpt_chart = pg.PlotWidget()
+        self.position_vpt_chart.setBackground(COLOR_BG)
+        self.position_vpt_chart.showGrid(x=True, y=True, alpha=0.15)
+        self.position_vpt_chart.setMinimumHeight(200)
+        self.position_vpt_chart.addLegend()
+        layout.addWidget(self.position_vpt_chart)
+
+        self.position_mfi_chart = pg.PlotWidget()
+        self.position_mfi_chart.setBackground(COLOR_BG)
+        self.position_mfi_chart.showGrid(x=True, y=True, alpha=0.15)
+        self.position_mfi_chart.setMinimumHeight(200)
+        self.position_mfi_chart.addLegend()
+        layout.addWidget(self.position_mfi_chart)
 
         return container
 
@@ -1646,6 +1810,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self.position_detail_label.setText("尚未選取部位。")
             self.position_flow_chart.clear()
             self.position_margin_chart.clear()
+            self.position_vpt_chart.clear()
+            self.position_mfi_chart.clear()
             return
         pos = find_position(self.positions, position_id)
         if pos is None:
@@ -1660,28 +1826,35 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         concepts = self._ticker_concept_map.get(pos.ticker) or []
         concept_text = "、".join(concepts) if concepts else "（尚無分類，可編輯 concepts.json 新增）"
         header = f"{pos.ticker} {pos.name or ''}　族群：{industry}　概念股：{concept_text}"
-        self.position_detail_label.setText(f"{header}\n\nFinMind 查詢中...")
-        self.position_flow_chart.clear()
-        self.position_margin_chart.clear()
+
+        # 先看 position_detail_cache.json 有沒有這檔股票上次查到、永久存下來的
+        # 結果：有就先顯示（不用等這次背景查詢），沒有才顯示「查詢中」空白狀態。
+        # 不管有沒有快取，下面都照樣背景重打一次 FinMind 拿最新資料、查到就覆寫
+        # 快取檔——快取讓「隨時可以取用」，不是拿來取代查新資料。
+        cached = load_position_detail_cache(POSITION_DETAIL_CACHE_PATH, pos.ticker)
+        if cached is not None:
+            note = f"（上次查詢：{_format_fetched_at(cached['fetched_at'])}，背景更新中...）"
+            self._render_position_detail(header, cached, note)
+        else:
+            self.position_detail_label.setText(f"{header}\n\nFinMind 查詢中...")
+            self.position_flow_chart.clear()
+            self.position_margin_chart.clear()
+            self.position_vpt_chart.clear()
+            self.position_mfi_chart.clear()
 
         token = self.settings.get("finmind_token", "")
         market = pos.market
 
         def fetch():
-            return (
-                fetch_valuation(pos.ticker, token, market=market),
-                fetch_institutional_investors_history(pos.ticker, token, lookback_days=120),
-                fetch_margin_short_sale_history(pos.ticker, token, lookback_days=120),
-                fetch_foreign_shareholding(pos.ticker, token),
-                fetch_securities_lending_summary(pos.ticker, token),
-                fetch_margin_short_sale_suspension(pos.ticker, token),
-            )
+            data = fetch_position_detail(pos.ticker, token, market=market)
+            save_position_detail_cache(POSITION_DETAIL_CACHE_PATH, pos.ticker, data)
+            return data
 
         self._position_detail_timer = run_task_in_thread(
             self,
             fetch,
             lambda result: self._on_position_detail_done(pos, header, result),
-            lambda message: self._on_position_detail_error(pos, header, message),
+            lambda message: self._on_position_detail_error(pos, header, message, cached),
         )
 
     def _is_current_detail_target(self, pos):
@@ -1690,15 +1863,26 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
     def _on_position_detail_done(self, pos, header, result):
         if not self._is_current_detail_target(pos):
             return  # 使用者查詢途中已切換到別筆部位，這份結果過期了，不套用
-        (
-            valuation,
-            history,
-            margin_history,
-            foreign_shareholding,
-            lending,
-            suspension,
-        ) = result
-        lines = [header, ""]
+        self._render_position_detail(header, result)
+        self.update_finmind_count_label()
+
+    def _render_position_detail(self, header, data, note=None):
+        """畫「部位詳細資訊」文字摘要＋兩張趨勢圖。data 是 fetch_position_detail()
+        的結果（不管是這次剛查到的，還是 position_detail_cache.json 讀出來的
+        上次結果都是同一個 shape，見 tradingnote_finmind.POSITION_DETAIL_FIELDS），
+        用同一個函式畫，不用各自維護一份。note 非 None 時插在 header 下面一行，
+        用來標示「這是上次的快取，背景更新中」或「背景更新失敗，顯示上次結果」。"""
+        valuation = data["valuation"]
+        history = data["institutional_history"]
+        margin_history = data["margin_history"]
+        foreign_shareholding = data["foreign_shareholding"]
+        lending = data["lending"]
+        suspension = data["suspension"]
+
+        lines = [header]
+        if note:
+            lines.append(note)
+        lines.append("")
 
         if valuation is None:
             lines.append("FinMind 基本面：查無資料")
@@ -1760,10 +1944,23 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.position_detail_label.setText("\n".join(lines))
         self._populate_position_flow_chart(history)
         self._populate_position_margin_chart(margin_history)
-        self.update_finmind_count_label()
+        self._populate_position_vpt_chart(data.get("vpt_mfi_history"))
+        self._populate_position_mfi_chart(data.get("vpt_mfi_history"))
 
-    def _on_position_detail_error(self, pos, header, message):
+    def _on_position_detail_error(self, pos, header, message, cached=None):
         if not self._is_current_detail_target(pos):
+            return
+        # 有上次的快取結果就繼續顯示它（只是把「背景更新中」的提示換成「更新
+        # 失敗」），不要因為這次背景重查失敗就把已經在畫面上的舊資料清空——
+        # 這正是「另外存放，隨時可以取用」要解決的情境：沒 token／超額度／
+        # 沒網路時，至少還能看上次查到的結果，不是一片空白。
+        if cached is not None:
+            note = (
+                f"（背景更新失敗：{message}；顯示上次查詢結果 "
+                f"{_format_fetched_at(cached['fetched_at'])}）"
+            )
+            self._render_position_detail(header, cached, note)
+            self.update_finmind_count_label()
             return
         self.position_detail_label.setText(
             f"{header}\n\nFinMind 查詢失敗：{message}\n\n"
@@ -1771,6 +1968,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         )
         self.position_flow_chart.clear()
         self.position_margin_chart.clear()
+        self.position_vpt_chart.clear()
+        self.position_mfi_chart.clear()
         self.update_finmind_count_label()
 
     def _populate_position_flow_chart(self, history):
@@ -1787,12 +1986,14 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         )
 
         bucket_colors = {"外資": "#1f77b4", "投信": "#2ca02c", "自營商": "#d62728"}
+        all_y = [0]  # 包含 0，讓下面的零軸參考線不會被縮出視野邊界外
         for label, series in history["series"].items():
             cumulative = []
             running_total = 0
             for net in series:
                 running_total += net
                 cumulative.append(running_total)
+            all_y.extend(cumulative)
             chart.plot(
                 x,
                 cumulative,
@@ -1803,6 +2004,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         chart.addLine(y=0, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
         chart.setLabel("left", "累計淨買賣超（股）", color=COLOR_TEXT)
         chart.setTitle(f"三大法人累計買賣超｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
+        _limit_zoom_to_data(chart, x, all_y)
+        chart.enableAutoRange()
 
     def _populate_position_margin_chart(self, margin_history):
         """融資融券餘額趨勢圖：跟 _populate_position_flow_chart 不同，這裡的資料
@@ -1821,7 +2024,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         )
 
         series_colors = {"融資餘額": "#9467bd", "融券餘額": "#ff7f0e"}
+        all_y = []
         for label, series in margin_history["series"].items():
+            all_y.extend(series)
             chart.plot(
                 x,
                 series,
@@ -1831,6 +2036,62 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
         chart.setLabel("left", "餘額（張）", color=COLOR_TEXT)
         chart.setTitle(f"融資融券餘額｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
+        _limit_zoom_to_data(chart, x, all_y)
+        chart.enableAutoRange()
+
+    def _populate_position_vpt_chart(self, vpt_mfi_history):
+        chart = self.position_vpt_chart
+        chart.clear()
+        if vpt_mfi_history is None or not vpt_mfi_history["dates"]:
+            return
+
+        dates = vpt_mfi_history["dates"]
+        x = list(range(len(dates)))
+        step = max(1, len(dates) // 8)
+        chart.getPlotItem().getAxis("bottom").setTicks(
+            [[(i, dates[i]) for i in range(0, len(dates), step)]]
+        )
+
+        series = vpt_mfi_history["vpt"]
+        chart.plot(x, series, pen=pg.mkPen("#17becf", width=2), name="VPT")
+        chart.setLabel("left", "VPT", color=COLOR_TEXT)
+        chart.setTitle(f"VPT 量價趨勢｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
+        _limit_zoom_to_data(chart, x, series)
+        # 這個區塊一開始被 QScrollArea 捲到看不見的地方（選部位當下使用者通常
+        # 還沒捲到這裡），widget 還沒有真正的版面尺寸時呼叫 enableAutoRange()／
+        # chart.autoRange() 算出來的範圍不可靠（實測會卡在 ±1 附近的退化值）。
+        # 直接用剛剛算好的資料範圍 setRange，不依賴 pyqtgraph 的自動偵測；
+        # y_pad 下限跟 _limit_zoom_to_data 的 y_floor 同樣抓 1.0，避免 VPT
+        # 全程沒有變化（min==max）時 setYRange 收斂成高度 0 的退化範圍。
+        y_lo, y_hi = min(series), max(series)
+        y_pad = max((y_hi - y_lo) * 0.1, 1.0)
+        chart.setXRange(min(x), max(x), padding=0.02)
+        chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
+
+    def _populate_position_mfi_chart(self, vpt_mfi_history):
+        """MFI 值域固定在 0～100，圖上加 80／20 兩條參考線（超買／超賣，MFI
+        標準慣例），跟 _populate_position_flow_chart 的零軸參考線同一種畫法。"""
+        chart = self.position_mfi_chart
+        chart.clear()
+        if vpt_mfi_history is None or not vpt_mfi_history["dates"]:
+            return
+
+        dates = vpt_mfi_history["dates"]
+        x = list(range(len(dates)))
+        step = max(1, len(dates) // 8)
+        chart.getPlotItem().getAxis("bottom").setTicks(
+            [[(i, dates[i]) for i in range(0, len(dates), step)]]
+        )
+
+        series = vpt_mfi_history["mfi"]
+        chart.plot(x, series, pen=pg.mkPen("#bcbd22", width=2), name="MFI")
+        chart.addLine(y=80, pen=pg.mkPen(COLOR_LOSS, style=QtCore.Qt.DashLine, width=1))
+        chart.addLine(y=20, pen=pg.mkPen(COLOR_GAIN, style=QtCore.Qt.DashLine, width=1))
+        chart.setLabel("left", "MFI", color=COLOR_TEXT)
+        chart.setTitle(f"MFI 資金流量｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
+        _limit_zoom_to_data(chart, x, series + [0, 100])
+        chart.setXRange(min(x), max(x), padding=0.02)
+        chart.setYRange(0, 100, padding=0.02)
 
     def _update_status_bar(self):
         cache_note = ""
@@ -2369,7 +2630,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addSpacing(10)
 
         backfill_days_row = QtWidgets.QHBoxLayout()
-        backfill_days_row.addWidget(QtWidgets.QLabel("回補天數（上市 TWSE）"))
+        backfill_days_row.addWidget(QtWidgets.QLabel("回補天數（上市 TWSE／上櫃 TPEX 共用）"))
         self.backfill_days_spin = QtWidgets.QSpinBox()
         self.backfill_days_spin.setRange(20, 500)
         self.backfill_days_spin.setSingleStep(10)
@@ -2383,18 +2644,26 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addLayout(backfill_days_row)
 
         backfill_days_hint = QtWidgets.QLabel(
-            "只影響上市（TWSE）——上櫃（TPEX）沒有可用的免費歷史回補端點，"
-            "只能靠每日快照逐日累積。調整後，下次按「回補歷史資料」或自動同步才會套用新天數。"
+            "上市（TWSE）按「回補歷史資料」，走官方免費端點，逐日回補。"
+            "上櫃（TPEX）沒有官方免費歷史端點，改按「使用 FinMind 補上櫃缺口」，"
+            "逐檔呼叫 FinMind（需先設定好 finmind_token）；免費額度 600 次／小時，"
+            "全市場上櫃約 800 檔，一次通常補不完，額度用完會自動暫停並記錄進度，"
+            "之後再按一次即可接續，不會重補。調整天數後，下次按按鈕或自動同步才會套用新天數。"
         )
         backfill_days_hint.setProperty("muted", True)
         backfill_days_hint.setWordWrap(True)
         layout.addWidget(backfill_days_hint)
         layout.addSpacing(10)
 
-        layout.addWidget(
-            accent_button("回補歷史資料", self.open_backfill_dialog),
-            alignment=QtCore.Qt.AlignLeft,
+        backfill_buttons_row = QtWidgets.QHBoxLayout()
+        backfill_buttons_row.addWidget(
+            accent_button("回補歷史資料", self.open_backfill_dialog)
         )
+        backfill_buttons_row.addWidget(
+            QtWidgets.QPushButton("使用 FinMind 補上櫃缺口", clicked=self.open_tpex_backfill_dialog)
+        )
+        backfill_buttons_row.addStretch(1)
+        layout.addLayout(backfill_buttons_row)
 
         layout.addSpacing(20)
         status_header = QtWidgets.QLabel("資料庫狀態")

@@ -56,6 +56,31 @@ def write_file_cache(cache_path, payload):
         )
 
 
+def load_keyed_store(store_path):
+    """讀整份「以 key 分開存放、永久保留」的 JSON 檔（例如逐股票各自一筆記錄，
+    跟上面 load_fresh_file_cache／write_file_cache 假設整份檔案只有一個
+    fetched_at、命中一次全部更新的用途不同）。檔案不存在回傳空 dict；不判斷
+    新鮮度——是否重新查詢、要不要覆寫某個 key 由呼叫端決定，這裡只負責讀寫。"""
+    p = Path(store_path)
+    if not p.exists():
+        return {}
+    with p.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_keyed_entry(store_path, key, payload):
+    """更新 store_path 這份 keyed JSON 檔裡 key 對應的一筆記錄（其餘 key 不動、
+    不會被覆寫掉），payload 是要存的內容，自動補上目前時間當 fetched_at。
+    每次呼叫都整份讀回、改一筆、整份寫回；呼叫頻率低（例如使用者選取某筆
+    部位才查一次）不需要更精細的鎖定或部分寫入機制。"""
+    store = load_keyed_store(store_path)
+    store[key] = {"fetched_at": datetime.now().isoformat(), **payload}
+    p = Path(store_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8") as f:
+        json.dump(store, f, ensure_ascii=False, indent=2)
+
+
 class TTLCache:
     """行程內記憶體 TTL 快取。key 可以是任意 hashable（只需要單一份快取的
     情境固定用 None 當 key，例如整份市場一起快取的資料；需要依查詢條件分開

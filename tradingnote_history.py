@@ -112,7 +112,8 @@ def _connect(db_path):
     return conn
 
 
-# ---------- 每日快照累積（TPEX 逐日累積的唯一來源） ----------
+# ---------- 每日快照累積（TPEX 逐日累積的基礎來源，另見下方 upsert_daily_prices／
+# tradingnote_finmind.backfill_tpex_history_via_finmind 的 FinMind 補缺口機制） ----------
 
 def record_snapshot(db_path, snapshot, as_of_date=None):
     """`as_of_date` 給定時強制套用到每一筆（呼叫端明確指定的情況）；未給定時改採
@@ -142,6 +143,27 @@ def record_snapshot(db_path, snapshot, as_of_date=None):
                 )
                 for price in snapshot.values()
             ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def upsert_daily_prices(db_path, rows):
+    """寫入一批 (date, ticker, market, name, close, change_pct, volume, trading_value)
+    tuple 到 daily_prices（INSERT OR REPLACE，跟 record_snapshot 寫入邏輯一致），
+    供不同來源共用同一個寫入路徑而不用各自重寫一次 SQL／欄位順序——目前給
+    tradingnote_finmind.backfill_tpex_history_via_finmind() 寫入 FinMind 補齊的
+    上櫃歷史資料用。rows 為空時直接 return，不開連線。"""
+    if not rows:
+        return
+    conn = _connect(db_path)
+    try:
+        conn.executemany(
+            """INSERT OR REPLACE INTO daily_prices
+               (date, ticker, market, name, close, change_pct, volume, trading_value)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
         )
         conn.commit()
     finally:
@@ -205,8 +227,10 @@ def prune_history(db_path, keep_trading_days=DEFAULT_BACKFILL_TARGET_DAYS):
 
 
 # ---------- TWSE 歷史回補 ----------
-# TPEX 沒有可用的免費歷史回補端點（已測試 stk_quote_result.php 的 d 參數會被忽略，
-# 永遠只回傳今天的資料），所以只有 TWSE 能一次回補，TPEX 靠 record_snapshot 逐日累積。
+# TPEX 沒有官方的免費歷史回補端點（已測試 stk_quote_result.php 的 d 參數會被忽略，
+# 永遠只回傳今天的資料），這裡只處理 TWSE；TPEX 改用 FinMind TaiwanStockPrice
+# 資料集回補（有免費額度限制，見 tradingnote_finmind.backfill_tpex_history_via_finmind），
+# 沒有 FinMind token 或額度用完時，仍舊只能靠 record_snapshot 逐日累積。
 
 def fetch_twse_historical_day(date_str):
     """date_str 格式 YYYYMMDD。回傳當天全部上市股票紀錄；非交易日回傳 None。"""
@@ -393,6 +417,32 @@ def get_ticker_history(db_path, ticker, limit=None):
     finally:
         conn.close()
     return rows
+
+
+def get_ticker_history_day_counts(db_path, tickers, market=None):
+    """回傳 {ticker: 交易日數}（distinct date 計數），一次查詢取代逐檔各查一次，
+    給批次判斷「哪些股票歷史資料已經足夠、可以跳過」用（見
+    tradingnote_finmind.backfill_tpex_history_via_finmind：判斷某檔上櫃股票是否
+    已達 target_days 天，達到就跳過不重打 FinMind）。market 給定時只計入該市場
+    的紀錄；tickers 為空回傳空字典，不開連線。"""
+    if not tickers:
+        return {}
+    conn = _connect(db_path)
+    try:
+        placeholders = ",".join("?" * len(tickers))
+        sql = (
+            f"SELECT ticker, COUNT(DISTINCT date) FROM daily_prices "
+            f"WHERE ticker IN ({placeholders})"
+        )
+        params = list(tickers)
+        if market:
+            sql += " AND market = ?"
+            params.append(market)
+        sql += " GROUP BY ticker"
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    return dict(rows)
 
 
 # ---------- 日期選擇（給資金流向頁的日曆式區間選擇器用，取代原本直接輸入天數；
