@@ -4,12 +4,10 @@
 新 session 開頭只需要讀這一段（原則上不超過 20 行）；下面「詳細內容」是備查用，需要細節才展開讀，省 token。**每次交接前，把最新、最需要注意的事更新到這一段，並保持精簡**——細節寫進下方對應章節，不要塞在這裡。
 
 - **這是什麼**：台股部位紀錄＋產業資金流向＋個股基本面查詢＋期貨盤後行情＋AI 問答的桌面程式（PySide6 + pyqtgraph）。位置：`/Users/zhengyufan/Claude/tradingnote`，跟同層 `trade-journal` 無關。
-- **Git 狀態**：`main` branch，先前所有工作已 commit 到 `95a6c71` 並 **push** 到 `origin/main`（工作樹乾淨）。本次對話**尚未 commit**的異動：`tradingnote_finmind.py`／`tradingnote_gui.py`（沒有新檔案）。
-- **本次改動（2026-08-10 續，尚未 commit，同一個工作階段兩個子項）**：
-  ①「個股」分頁雙擊股票彈出的 `StockDetailDialog`，新增「顯示完整籌碼面資訊（同部位紀錄）」按鈕——點下去才背景查 FinMind、顯示跟「部位紀錄」頁選取部位時**完全相同**的資料＋趨勢圖，不點按鈕不會多打 API（維持原本雙擊只查本益比／三大法人最新一天這個輕量版本），避免瀏覽「個股」頁1700檔清單時無謂燒 FinMind 額度。兩邊共用同一份 `data/position_detail_cache.json`（key 是 ticker）。實作上把原本掛在 `TradingNoteWindow` 的畫面 method 抽成模組層級函式（`_render_detail_block`／`_populate_*_chart`，緊接在 `_limit_zoom_to_data` 後面），兩處呼叫端都改吃這組共用函式、傳入各自的 label／圖表 widget。
-  ②詳細資訊區塊（兩處都有）新增第五張圖——**歷史股價**趨勢圖，畫在最前面（三大法人／融資融券／VPT／MFI 之前）。新增 `tradingnote_finmind.fetch_stock_price_history()` 呼叫（沿用既有函式，原本只給 TPEX 回補用；`POSITION_DETAIL_FIELDS` 新增 `"price_history"` 欄位，lookback_days=120 跟三大法人／融資融券兩張圖同一個窗口），GUI 端新增 `_populate_price_chart`（只畫收盤價，跟 VPT 圖同一招用算好的範圍 `setXRange`/`setYRange`，不用 `enableAutoRange()`，避開 `QScrollArea` 範圍計算陷阱）、`position_price_chart`／`full_detail_price_chart` 兩個 widget。
-  **已實機驗證**（headless `QT_QPA_PLATFORM=offscreen`＋真實 FinMind token，對 2330）：①按鈕點擊後五張圖（價格1條／三大法人3條／融資融券2條／VPT1條／MFI1條）都正確顯示，跟部位紀錄頁內容逐字一致；②快取命中路徑（同 ticker 第二次點擊）正確先同步顯示「上次查詢：...，背景更新中」再背景覆寫；③「部位紀錄」頁回歸測試：選取部位仍正常顯示，`data/positions.json` 未被覆寫；④手動建構缺少 `price_history` key 的舊快取 dict 直接餵給 `_render_detail_block`，確認舊快取（這次改動前存的）不會因為少這個新欄位而炸掉，價格圖正確保持空白。
-- **已知缺口（非本次改動範圍，發現但沒動）**：①「設定」分頁沒有 FinMind API Token 輸入欄位（只能手動編輯 `data/settings.json`）；②「部位紀錄」頁既有的三大法人／融資融券兩張圖仍用 `enableAutoRange()`，跟 VPT／MFI／股價圖修掉的 `QScrollArea` 範圍計算陷阱理論上有同樣風險，還沒動。
+- **Git 狀態**：`main` branch，`366a9c9` 為止已 **push** 到 `origin/main`。本次對話**尚未 commit**的異動：`tradingnote_gui.py`（沒有新檔案）。
+- **本次改動（2026-08-11，尚未 commit）**：`StockDetailDialog`「顯示完整籌碼面資訊」按鈕展開的五張圖，從 `QScrollArea` 疊起來捲動瀏覽，改成 `QTabWidget` 分頁選單（歷史股價／三大法人／融資融券／VPT／MFI 五個分頁，選單在上方切換，文字摘要固定顯示在分頁上方，不用捲動）。只動 `_build_full_detail_widgets`；`_render_detail_block` 簽名不變，「部位紀錄」頁的 `_build_position_detail_section`（嵌在分頁裡，仍是 `QScrollArea` 疊圖）沒有跟著改，兩處目前是不同的呈現方式。**順手修掉一個被分頁放大的既有隱患**：`_populate_flow_chart`／`_populate_margin_chart` 原本收尾用 `chart.enableAutoRange()`，這兩張圖現在常態是「目前沒被切到的分頁」（隱藏、沒有真正版面尺寸），跟先前 VPT／MFI／股價圖修過的 `QScrollArea` 陷阱是同一個成因，改成跟那三張圖一樣手動 `setXRange`/`setYRange`。
+  **已實機驗證**（headless `QT_QPA_PLATFORM=offscreen`＋真實 FinMind token＋`/opt/homebrew/bin/python3.12`，對 2330）：按下按鈕後 5 個分頁都建立（`full_detail_tabs.count()==5`，標題順序正確）；用 `getViewBox().viewRange()` 逐一檢查五張圖（含 flow／margin 這兩張初始為隱藏分頁）的 X/Y range，皆為正常非退化值（沒有卡在 `enableAutoRange()` 那種 ±1 附近的退化範圍）。**沒有**：真的用滑鼠點分頁切換驗證畫面（同前幾次改動，這台機器終端機沒有 Accessibility 權限，走程式碼路徑＋`viewRange()` 數值驗證，不是點擊模擬）；沒有動「部位紀錄」頁的 `QScrollArea` 版本。
+- **已知缺口（非本次改動範圍，發現但沒動）**：①「設定」分頁沒有 FinMind API Token 輸入欄位（只能手動編輯 `data/settings.json`）；②「部位紀錄」頁詳細資訊區塊仍是 `QScrollArea` 疊五張圖捲動瀏覽，沒有跟著改成分頁——如果之後也想要同樣的分頁 UI，要另外改 `_build_position_detail_section`。
 - **只是要接著開發新功能**：讀到這裡就夠了。要動到 GUI 分頁結構、期貨模組、概念股清單、或想知道更早的變更緣由，才需要往下展開「詳細內容」。
 
 ---
@@ -47,12 +45,19 @@ tradingnote/
 ### GUI 現況：六個分頁
 1. **資金流向分析**（預設頁）：pyqtgraph 泡泡圖（大小＝資金比重%），可觸控板/滾輪縮放平移，點擊泡泡看該產業前十大成分股；下方有「資金動向清單」（產業層級）跟「個股量比異常清單」（個股層級，2026-08-05 新增）兩個表格。泡泡圖「流向區間」與清單「資料區間」都是日曆式起始日期選擇器（點按鈕開 `TradingDateDialog`，見下方「變更歷史 → 2026-08-08」），沒有歷史資料的日期反白不能選，結束日固定是今天／最新資料。
 2. **部位紀錄**：`QTableWidget`（含族群／概念股欄位，本地資料即時顯示），新增/刪除/查價/重新整理；表格下方是 `QSplitter` 分隔的詳細資訊區塊，選取某筆部位時背景查 FinMind 顯示本益比/殖利率/股價淨值比，以及三大法人（外資/投信/自營商）近120個交易日累計買賣超趨勢圖（`pg.PlotWidget`，三條線）。概念股清單來自專案根目錄 `concepts.json`（人工維護，見 `tradingnote_concepts.py`）。
-3. **個股**：`QTreeWidget` 依產業族群列出全市場約1700檔股票（現價/漲跌%，資料來自本地快取），雙擊某檔叫 FinMind API 查最新本益比/殖利率/股價淨值比/三大法人買賣超（`StockDetailDialog`，「個股量比異常清單」雙擊也共用同一個對話框）。彈窗內有「顯示完整籌碼面資訊（同部位紀錄）」按鈕，點下去才另外查跟「部位紀錄」頁選取部位時相同的六項資料＋五張趨勢圖（歷史股價／三大法人／融資融券／VPT／MFI，見下方「變更歷史 → 2026-08-10」），不點不會多打 API。
+3. **個股**：`QTreeWidget` 依產業族群列出全市場約1700檔股票（現價/漲跌%，資料來自本地快取），雙擊某檔叫 FinMind API 查最新本益比/殖利率/股價淨值比/三大法人買賣超（`StockDetailDialog`，「個股量比異常清單」雙擊也共用同一個對話框）。彈窗內有「顯示完整籌碼面資訊（同部位紀錄）」按鈕，點下去才另外查跟「部位紀錄」頁選取部位時相同的六項資料＋五張趨勢圖（歷史股價／三大法人／融資融券／VPT／MFI，用上方分頁選單切換、不用捲動，見下方「變更歷史 → 2026-08-11」），不點不會多打 API。
 4. **期貨**：TX（臺股期貨）／MTX（小型臺指期貨）近月合約盤後行情，資料來自 TAIFEX 官方免金鑰端點，一天更新一次，非即時。
 5. **AI 助理**：Gemini API（`gemini-flash-lite-latest`）自然語言問答，模型自動判斷呼叫股票查詢/本益比/法人買賣等工具，需要「設定」分頁填入 Gemini API Key。
 6. **設定**：自動檢測開關、回補天數（TWSE／TPEX 共用）、「回補歷史資料」（TWSE 官方端點）／「使用 FinMind 補上櫃缺口」（TPEX，見下方「變更歷史 → 2026-08-09」）兩個回補按鈕、Gemini API Key（密碼遮罩＋顯示切換、`editingFinished` 自動存檔）。**注意**：目前沒有 FinMind API Token 的輸入欄位——`finmind_token` 只能手動編輯 `data/settings.json`，這是既有缺口（見上方「必讀簡介 → 已知缺口」），不是這次改動造成的。
 
 ### 變更歷史
+
+#### 2026-08-11：`StockDetailDialog` 完整籌碼面資訊改用分頁（QTabWidget）取代捲動（QScrollArea）
+- **動機**：使用者要求「不用要捲動 改成在上面 以分頁形式選擇」——原本「顯示完整籌碼面資訊」按鈕展開後，五張圖（歷史股價／三大法人／融資融券／VPT／MFI）疊在 `QScrollArea` 裡要捲動才看得到全部，改成上方分頁選單切換，一次只顯示一張圖。
+- **改法**：只動 `StockDetailDialog._build_full_detail_widgets`（`tradingnote_gui.py`）。文字摘要 `full_detail_label` 固定顯示在按鈕下方（不放進分頁），五張 `pg.PlotWidget` 改用 `QTabWidget.addTab(chart, 標題)` 掛進去，拿掉原本的 `QScrollArea`／`content` 包裝；圖表 `setMinimumHeight` 從 200 調到 320（一次只顯示一張，可以給更多高度），對話框預設大小從 `resize(700, 900)` 縮成 `resize(700, 620)`。`_render_detail_block` 呼叫端與簽名完全沒動——它只認得傳進來的 widget 參數，不管外層容器是 `QScrollArea` 還是 `QTabWidget`。「部位紀錄」頁的 `_build_position_detail_section` 這次**沒有**跟著改，仍是 `QScrollArea` 疊圖（使用者這次的要求聚焦在「個股」頁彈窗，見上一輪對話），兩處呈現方式暫時不一致，之後如果也要分頁化要另外處理。
+  - **順手修的既有隱患**：`_populate_flow_chart`／`_populate_margin_chart` 原本收尾呼叫 `chart.enableAutoRange()`（三大法人／融資融券兩張圖），跟 2026-08-10 那則 change log 修掉的 `QScrollArea` 陷阱是同一個成因——widget 還沒有真正版面尺寸（此處是「目前沒被切到的 `QTabWidget` 分頁，被隱藏」）時，`enableAutoRange()` 算出來的範圍不可靠。分頁化之後這兩張圖幾乎每次首次渲染都會踩到（歷史股價分頁預設最先顯示，法人／融資融券分頁是隱藏的），改成跟 `_populate_price_chart`／`_populate_vpt_chart`／`_populate_mfi_chart` 同一招，用算好的資料範圍直接 `setXRange`/`setYRange`。
+- **驗證**：`python3 -m py_compile`（`/opt/homebrew/bin/python3.12`）通過。Headless GUI 實機驗證（`QT_QPA_PLATFORM=offscreen`，真實 FinMind token，對 2330）：按下「顯示完整籌碼面資訊」後，`full_detail_tabs.count()==5`、分頁標題順序正確（歷史股價／三大法人／融資融券／VPT／MFI）；用 `chart.getPlotItem().getViewBox().viewRange()` 逐一檢查五張圖（含 flow／margin 這兩張此時是隱藏分頁）的 X/Y range，皆為正常數值（例如 flow 的 Y range 落在實際買賣超金額量級，不是退化成 ±1 附近）。**沒有**：真的用滑鼠點分頁籤切換驗證畫面（這台機器終端機沒有 Accessibility 權限，跟先前幾次改動一樣走程式碼路徑＋數值驗證，不是點擊模擬）；沒有動「部位紀錄」頁的 `QScrollArea` 版本，也沒有回歸測試它。
+- **刻意留白／已知限制**：「部位紀錄」頁詳細資訊區塊維持 `QScrollArea` 疊圖，沒有跟著改成分頁——見上方「必讀簡介 → 已知缺口」。
 
 #### 2026-08-10（續）：詳細資訊區塊新增「歷史股價」趨勢圖
 - **動機**：使用者要求「詳細資訊新增一個歷史股價資訊圖」——「部位紀錄」頁跟「個股」頁按鈕（見下一則change log）共用的詳細資訊區塊，原本只有三大法人／融資融券／VPT／MFI 四張圖，都是「跟股價連動的衍生指標」，沒有股價本身的走勢圖可以對照。

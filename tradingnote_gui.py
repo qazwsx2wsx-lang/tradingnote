@@ -758,10 +758,10 @@ class StockDetailDialog(QtWidgets.QDialog):
 
     def _build_full_detail_widgets(self):
         """第一次按下「顯示完整籌碼面資訊」時才建立這些 widget，插在按鈕跟
-        關閉鈕之間。跟「部位紀錄」頁 _build_position_detail_section 同一招用
-        QScrollArea 包住文字摘要＋五張圖表，避免視窗一次要塞下五張圖撐爆
-        畫面；同時把視窗放大到看得下內容的尺寸（初始只有一行狀態文字時不需要
-        這麼大）。"""
+        關閉鈕之間。文字摘要固定顯示在上方，五張圖表改用 QTabWidget（分頁
+        選單在上方切換），一次只顯示一張圖，不用像 QScrollArea 那樣把五張圖
+        疊起來捲動瀏覽；同時把視窗放大到看得下內容的尺寸（初始只有一行狀態
+        文字時不需要這麼大）。"""
         self.full_detail_label = QtWidgets.QLabel("")
         self.full_detail_label.setWordWrap(True)
 
@@ -779,27 +779,22 @@ class StockDetailDialog(QtWidgets.QDialog):
         ):
             chart.setBackground(COLOR_BG)
             chart.showGrid(x=True, y=True, alpha=0.15)
-            chart.setMinimumHeight(200)
+            chart.setMinimumHeight(320)
             chart.addLegend()
 
-        content = QtWidgets.QWidget()
-        content_layout = QtWidgets.QVBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.addWidget(self.full_detail_label)
-        content_layout.addWidget(self.full_detail_price_chart)
-        content_layout.addWidget(self.full_detail_flow_chart)
-        content_layout.addWidget(self.full_detail_margin_chart)
-        content_layout.addWidget(self.full_detail_vpt_chart)
-        content_layout.addWidget(self.full_detail_mfi_chart)
+        self.full_detail_tabs = QtWidgets.QTabWidget()
+        self.full_detail_tabs.addTab(self.full_detail_price_chart, "歷史股價")
+        self.full_detail_tabs.addTab(self.full_detail_flow_chart, "三大法人")
+        self.full_detail_tabs.addTab(self.full_detail_margin_chart, "融資融券")
+        self.full_detail_tabs.addTab(self.full_detail_vpt_chart, "VPT")
+        self.full_detail_tabs.addTab(self.full_detail_mfi_chart, "MFI")
 
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(content)
-
-        self._layout.insertWidget(self._layout.indexOf(self.full_detail_button) + 1, scroll)
+        insert_at = self._layout.indexOf(self.full_detail_button) + 1
+        self._layout.insertWidget(insert_at, self.full_detail_label)
+        self._layout.insertWidget(insert_at + 1, self.full_detail_tabs)
         self._full_detail_widgets_built = True
         self.setMinimumSize(640, 300)
-        self.resize(700, 900)
+        self.resize(700, 620)
 
     def _on_show_full_detail(self):
         if not self._full_detail_widgets_built:
@@ -1269,7 +1264,13 @@ def _populate_flow_chart(chart, history):
     chart.setLabel("left", "累計淨買賣超（股）", color=COLOR_TEXT)
     chart.setTitle(f"三大法人累計買賣超｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
     _limit_zoom_to_data(chart, x, all_y)
-    chart.enableAutoRange()
+    # 現在這張圖可能是 QTabWidget 裡目前沒被切到的分頁（隱藏、還沒有真正版面
+    # 尺寸），這時 enableAutoRange() 算出來的範圍不可靠（同 _populate_price_chart
+    # 的理由），改用算好的資料範圍直接 setRange。
+    y_lo, y_hi = min(all_y), max(all_y)
+    y_pad = max((y_hi - y_lo) * 0.1, 1.0)
+    chart.setXRange(min(x), max(x), padding=0.02)
+    chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
 
 
 def _populate_margin_chart(chart, margin_history):
@@ -1301,7 +1302,12 @@ def _populate_margin_chart(chart, margin_history):
     chart.setLabel("left", "餘額（張）", color=COLOR_TEXT)
     chart.setTitle(f"融資融券餘額｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
     _limit_zoom_to_data(chart, x, all_y)
-    chart.enableAutoRange()
+    # 同 _populate_flow_chart：這張圖也可能是 QTabWidget 裡目前沒被切到的
+    # 分頁，enableAutoRange() 不可靠，改用算好的資料範圍直接 setRange。
+    y_lo, y_hi = min(all_y), max(all_y)
+    y_pad = max((y_hi - y_lo) * 0.1, 1.0)
+    chart.setXRange(min(x), max(x), padding=0.02)
+    chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
 
 
 def _populate_vpt_chart(chart, vpt_mfi_history):
