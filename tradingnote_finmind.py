@@ -397,6 +397,7 @@ def fetch_institutional_investors_history(ticker, token, lookback_days=120):
 # 讀取端對應的 key，不用同步調整每一處按位置解包的程式碼。
 POSITION_DETAIL_FIELDS = (
     "valuation",
+    "price_history",
     "institutional_history",
     "margin_history",
     "foreign_shareholding",
@@ -407,16 +408,22 @@ POSITION_DETAIL_FIELDS = (
 
 
 def fetch_position_detail(ticker, token, market=None):
-    """一次抓齊「部位紀錄」頁個股詳細資訊區塊要顯示的七項資料（本益比／殖利率／
-    股價淨值比、三大法人120日趨勢、融資融券120日趨勢、外資持股比例、借券成交、
-    停資停券公告、VPT／MFI量價指標），回傳 dict（key 見 POSITION_DETAIL_FIELDS）。
-    每項各自沿用原本的 _dataset_cache（30分鐘行程內快取，擋短時間內重複查詢），
-    呼叫端（tradingnote_gui._load_position_detail）另外會把整份結果存進
-    position_detail_cache.json 永久保存（見 save_position_detail_cache），
-    跟 _dataset_cache 是兩層不同用途：一層擋重複打 API，一層讓資料重開程式
-    也不會消失。"""
+    """一次抓齊「部位紀錄」頁個股詳細資訊區塊要顯示的八項資料（本益比／殖利率／
+    股價淨值比、歷史股價、三大法人120日趨勢、融資融券120日趨勢、外資持股比例、
+    借券成交、停資停券公告、VPT／MFI量價指標），回傳 dict（key 見
+    POSITION_DETAIL_FIELDS）。每項各自沿用原本的 _dataset_cache（30分鐘行程內
+    快取，擋短時間內重複查詢），呼叫端（tradingnote_gui._load_position_detail）
+    另外會把整份結果存進 position_detail_cache.json 永久保存（見
+    save_position_detail_cache），跟 _dataset_cache 是兩層不同用途：一層擋重複
+    打 API，一層讓資料重開程式也不會消失。
+
+    price_history 沿用既有的 fetch_stock_price_history()（原本是給 TPEX 歷史
+    回補用），這裡拿來畫「歷史股價」趨勢圖；lookback_days=120 跟三大法人／
+    融資融券兩張趨勢圖用同一個窗口（日曆天），三張圖時間軸大致對得上，方便
+    互相比對。"""
     return {
         "valuation": fetch_valuation(ticker, token, market=market),
+        "price_history": fetch_stock_price_history(ticker, token, lookback_days=120),
         "institutional_history": fetch_institutional_investors_history(
             ticker, token, lookback_days=120
         ),

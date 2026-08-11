@@ -675,23 +675,37 @@ class StockDetailDialog(QtWidgets.QDialog):
     交易日的三大法人買賣超。上櫃（TPEX）股票的本益比／殖利率改查 TPEX 官方端點
     （不吃 FinMind 額度，見 tradingnote_finmind.fetch_valuation）；上市（TWSE）
     股票、以及不分市場的三大法人買賣超，仍查 FinMind。查詢在背景執行緒跑
-    （run_task_in_thread），避免網路延遲卡住整個視窗。"""
+    （run_task_in_thread），避免網路延遲卡住整個視窗。「顯示完整籌碼面資訊」
+    按鈕另外提供跟「部位紀錄」頁選取部位時同一份資料（融資融券／外資持股／
+    借券／停資停券／VPT／MFI，見 _on_show_full_detail），共用同一份
+    position_detail_cache.json（key 是 ticker，不分是從部位紀錄還是這裡查
+    的）、也共用 _render_detail_block 畫面邏輯；不點按鈕就不會多打那六支
+    FinMind API，避免瀏覽「個股」頁清單時無謂燒額度。"""
 
     def __init__(self, parent, ticker, name, finmind_token, market=None):
         super().__init__(parent)
+        self.ticker = ticker
+        self.name = name
+        self.finmind_token = finmind_token
+        self.market = market
         self.setWindowTitle(f"{ticker} {name}")
         self.setMinimumWidth(360)
 
         self.status_label = QtWidgets.QLabel("查詢中...")
         self.status_label.setWordWrap(True)
 
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 16)
-        layout.addWidget(self.status_label)
+        self._layout = QtWidgets.QVBoxLayout(self)
+        self._layout.setContentsMargins(20, 20, 20, 16)
+        self._layout.addWidget(self.status_label)
+
+        self.full_detail_button = QtWidgets.QPushButton("顯示完整籌碼面資訊（同部位紀錄）")
+        self.full_detail_button.clicked.connect(self._on_show_full_detail)
+        self._layout.addWidget(self.full_detail_button)
+        self._full_detail_widgets_built = False
 
         close_btn = QtWidgets.QPushButton("關閉")
         close_btn.clicked.connect(self.accept)
-        layout.addWidget(close_btn, alignment=QtCore.Qt.AlignRight)
+        self._layout.addWidget(close_btn, alignment=QtCore.Qt.AlignRight)
 
         def fetch_both():
             return (
@@ -741,6 +755,134 @@ class StockDetailDialog(QtWidgets.QDialog):
         update = getattr(self.parent(), "update_finmind_count_label", None)
         if update is not None:
             update()
+
+    def _build_full_detail_widgets(self):
+        """第一次按下「顯示完整籌碼面資訊」時才建立這些 widget，插在按鈕跟
+        關閉鈕之間。跟「部位紀錄」頁 _build_position_detail_section 同一招用
+        QScrollArea 包住文字摘要＋五張圖表，避免視窗一次要塞下五張圖撐爆
+        畫面；同時把視窗放大到看得下內容的尺寸（初始只有一行狀態文字時不需要
+        這麼大）。"""
+        self.full_detail_label = QtWidgets.QLabel("")
+        self.full_detail_label.setWordWrap(True)
+
+        self.full_detail_price_chart = pg.PlotWidget()
+        self.full_detail_flow_chart = pg.PlotWidget()
+        self.full_detail_margin_chart = pg.PlotWidget()
+        self.full_detail_vpt_chart = pg.PlotWidget()
+        self.full_detail_mfi_chart = pg.PlotWidget()
+        for chart in (
+            self.full_detail_price_chart,
+            self.full_detail_flow_chart,
+            self.full_detail_margin_chart,
+            self.full_detail_vpt_chart,
+            self.full_detail_mfi_chart,
+        ):
+            chart.setBackground(COLOR_BG)
+            chart.showGrid(x=True, y=True, alpha=0.15)
+            chart.setMinimumHeight(200)
+            chart.addLegend()
+
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.addWidget(self.full_detail_label)
+        content_layout.addWidget(self.full_detail_price_chart)
+        content_layout.addWidget(self.full_detail_flow_chart)
+        content_layout.addWidget(self.full_detail_margin_chart)
+        content_layout.addWidget(self.full_detail_vpt_chart)
+        content_layout.addWidget(self.full_detail_mfi_chart)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(content)
+
+        self._layout.insertWidget(self._layout.indexOf(self.full_detail_button) + 1, scroll)
+        self._full_detail_widgets_built = True
+        self.setMinimumSize(640, 300)
+        self.resize(700, 900)
+
+    def _on_show_full_detail(self):
+        if not self._full_detail_widgets_built:
+            self._build_full_detail_widgets()
+
+        self.full_detail_button.setEnabled(False)
+        self.full_detail_button.setText("查詢中...")
+        header = f"{self.ticker} {self.name or ''}"
+
+        # 跟「部位紀錄」頁 _load_position_detail 同一招：先顯示上次永久存下來
+        # 的結果（有的話），背景照樣重打一次 FinMind 拿最新資料。
+        cached = load_position_detail_cache(POSITION_DETAIL_CACHE_PATH, self.ticker)
+        if cached is not None:
+            note = f"（上次查詢：{_format_fetched_at(cached['fetched_at'])}，背景更新中...）"
+            _render_detail_block(
+                self.full_detail_label,
+                self.full_detail_price_chart,
+                self.full_detail_flow_chart,
+                self.full_detail_margin_chart,
+                self.full_detail_vpt_chart,
+                self.full_detail_mfi_chart,
+                header,
+                cached,
+                note,
+            )
+        else:
+            self.full_detail_label.setText(f"{header}\n\nFinMind 查詢中...")
+
+        def fetch():
+            data = fetch_position_detail(self.ticker, self.finmind_token, market=self.market)
+            save_position_detail_cache(POSITION_DETAIL_CACHE_PATH, self.ticker, data)
+            return data
+
+        self._full_detail_timer = run_task_in_thread(
+            self,
+            fetch,
+            lambda result: self._on_full_detail_done(header, result),
+            lambda message: self._on_full_detail_error(header, message, cached),
+        )
+
+    def _on_full_detail_done(self, header, data):
+        self.full_detail_button.setEnabled(True)
+        self.full_detail_button.setText("重新整理完整籌碼面資訊")
+        _render_detail_block(
+            self.full_detail_label,
+            self.full_detail_price_chart,
+            self.full_detail_flow_chart,
+            self.full_detail_margin_chart,
+            self.full_detail_vpt_chart,
+            self.full_detail_mfi_chart,
+            header,
+            data,
+        )
+        self._notify_finmind_call()
+
+    def _on_full_detail_error(self, header, message, cached):
+        self.full_detail_button.setEnabled(True)
+        # 跟部位紀錄頁一樣：有上次快取就繼續顯示它＋「背景更新失敗」提示，
+        # 不要把已經在畫面上的舊資料清空。
+        if cached is not None:
+            self.full_detail_button.setText("重新整理完整籌碼面資訊")
+            note = (
+                f"（背景更新失敗：{message}；顯示上次查詢結果 "
+                f"{_format_fetched_at(cached['fetched_at'])}）"
+            )
+            _render_detail_block(
+                self.full_detail_label,
+                self.full_detail_price_chart,
+                self.full_detail_flow_chart,
+                self.full_detail_margin_chart,
+                self.full_detail_vpt_chart,
+                self.full_detail_mfi_chart,
+                header,
+                cached,
+                note,
+            )
+        else:
+            self.full_detail_button.setText("顯示完整籌碼面資訊（同部位紀錄）")
+            self.full_detail_label.setText(
+                f"{header}\n\nFinMind 查詢失敗：{message}\n\n"
+                "可能原因：FinMind token 未設定或已失效、已超過免費額度，或該股票暫無此資料。"
+            )
+        self._notify_finmind_call()
 
 
 class IndustryTopStocksDialog(QtWidgets.QDialog):
@@ -1062,6 +1204,245 @@ def _limit_zoom_to_data(chart, xs, ys, x_floor=1.0, y_floor=1.0):
         yMin=y_min - y_pad,
         yMax=y_max + y_pad,
     )
+
+
+def _populate_price_chart(chart, price_history):
+    """歷史股價走勢圖：price_history 是 fetch_stock_price_history() 的回傳格式
+    （list of {"date":, "close":, ...}，由舊到新排序），跟其他幾張圖吃的
+    {"dates":, "series":/"vpt":/"mfi":} dict 格式不同，這裡直接吃 list。只畫
+    收盤價（使用者要的是「歷史股價資訊圖」，不是另外疊漲跌%／成交量，避免跟
+    其他幾張圖一樣的軸混在一起）。"""
+    chart.clear()
+    if not price_history:
+        return
+
+    dates = [row["date"] for row in price_history]
+    closes = [row["close"] for row in price_history]
+    x = list(range(len(dates)))
+    step = max(1, len(dates) // 8)
+    chart.getPlotItem().getAxis("bottom").setTicks(
+        [[(i, dates[i]) for i in range(0, len(dates), step)]]
+    )
+
+    chart.plot(x, closes, pen=pg.mkPen("#e377c2", width=2), name="收盤價")
+    chart.setLabel("left", "收盤價", color=COLOR_TEXT)
+    chart.setTitle(f"歷史股價｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
+    _limit_zoom_to_data(chart, x, closes)
+    # 跟 _populate_vpt_chart 同樣的理由：這張圖也可能一開始被 QScrollArea 捲到
+    # 看不見的地方，enableAutoRange() 算出來的範圍在 widget 還沒有真正版面
+    # 尺寸時不可靠，改用算好的資料範圍直接 setRange。
+    y_lo, y_hi = min(closes), max(closes)
+    y_pad = max((y_hi - y_lo) * 0.1, 1.0)
+    chart.setXRange(min(x), max(x), padding=0.02)
+    chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
+
+
+def _populate_flow_chart(chart, history):
+    chart.clear()
+    if history is None or not history["dates"]:
+        return
+
+    dates = history["dates"]
+    x = list(range(len(dates)))
+    step = max(1, len(dates) // 8)
+    chart.getPlotItem().getAxis("bottom").setTicks(
+        [[(i, dates[i]) for i in range(0, len(dates), step)]]
+    )
+
+    bucket_colors = {"外資": "#1f77b4", "投信": "#2ca02c", "自營商": "#d62728"}
+    all_y = [0]  # 包含 0，讓下面的零軸參考線不會被縮出視野邊界外
+    for label, series in history["series"].items():
+        cumulative = []
+        running_total = 0
+        for net in series:
+            running_total += net
+            cumulative.append(running_total)
+        all_y.extend(cumulative)
+        chart.plot(
+            x,
+            cumulative,
+            pen=pg.mkPen(bucket_colors.get(label, COLOR_TEXT), width=2),
+            name=label,
+        )
+
+    chart.addLine(y=0, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
+    chart.setLabel("left", "累計淨買賣超（股）", color=COLOR_TEXT)
+    chart.setTitle(f"三大法人累計買賣超｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
+    _limit_zoom_to_data(chart, x, all_y)
+    chart.enableAutoRange()
+
+
+def _populate_margin_chart(chart, margin_history):
+    """融資融券餘額趨勢圖：跟 _populate_flow_chart 不同，這裡的資料本來就是
+    「餘額」（TodayBalance），不是逐日買賣超流量，所以直接畫原始值，不能再
+    累加一次（累加會變成「餘額的餘額」，數字沒有意義）。"""
+    chart.clear()
+    if margin_history is None or not margin_history["dates"]:
+        return
+
+    dates = margin_history["dates"]
+    x = list(range(len(dates)))
+    step = max(1, len(dates) // 8)
+    chart.getPlotItem().getAxis("bottom").setTicks(
+        [[(i, dates[i]) for i in range(0, len(dates), step)]]
+    )
+
+    series_colors = {"融資餘額": "#9467bd", "融券餘額": "#ff7f0e"}
+    all_y = []
+    for label, series in margin_history["series"].items():
+        all_y.extend(series)
+        chart.plot(
+            x,
+            series,
+            pen=pg.mkPen(series_colors.get(label, COLOR_TEXT), width=2),
+            name=label,
+        )
+
+    chart.setLabel("left", "餘額（張）", color=COLOR_TEXT)
+    chart.setTitle(f"融資融券餘額｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
+    _limit_zoom_to_data(chart, x, all_y)
+    chart.enableAutoRange()
+
+
+def _populate_vpt_chart(chart, vpt_mfi_history):
+    chart.clear()
+    if vpt_mfi_history is None or not vpt_mfi_history["dates"]:
+        return
+
+    dates = vpt_mfi_history["dates"]
+    x = list(range(len(dates)))
+    step = max(1, len(dates) // 8)
+    chart.getPlotItem().getAxis("bottom").setTicks(
+        [[(i, dates[i]) for i in range(0, len(dates), step)]]
+    )
+
+    series = vpt_mfi_history["vpt"]
+    chart.plot(x, series, pen=pg.mkPen("#17becf", width=2), name="VPT")
+    chart.setLabel("left", "VPT", color=COLOR_TEXT)
+    chart.setTitle(f"VPT 量價趨勢｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
+    _limit_zoom_to_data(chart, x, series)
+    # 這個區塊可能一開始被 QScrollArea 捲到看不見的地方，widget 還沒有真正的
+    # 版面尺寸時呼叫 enableAutoRange()／chart.autoRange() 算出來的範圍不可靠
+    # （實測會卡在 ±1 附近的退化值）。直接用剛剛算好的資料範圍 setRange，不
+    # 依賴 pyqtgraph 的自動偵測；y_pad 下限跟 _limit_zoom_to_data 的 y_floor
+    # 同樣抓 1.0，避免 VPT 全程沒有變化（min==max）時 setYRange 收斂成高度 0
+    # 的退化範圍。
+    y_lo, y_hi = min(series), max(series)
+    y_pad = max((y_hi - y_lo) * 0.1, 1.0)
+    chart.setXRange(min(x), max(x), padding=0.02)
+    chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
+
+
+def _populate_mfi_chart(chart, vpt_mfi_history):
+    """MFI 值域固定在 0～100，圖上加 80／20 兩條參考線（超買／超賣，MFI
+    標準慣例），跟 _populate_flow_chart 的零軸參考線同一種畫法。"""
+    chart.clear()
+    if vpt_mfi_history is None or not vpt_mfi_history["dates"]:
+        return
+
+    dates = vpt_mfi_history["dates"]
+    x = list(range(len(dates)))
+    step = max(1, len(dates) // 8)
+    chart.getPlotItem().getAxis("bottom").setTicks(
+        [[(i, dates[i]) for i in range(0, len(dates), step)]]
+    )
+
+    series = vpt_mfi_history["mfi"]
+    chart.plot(x, series, pen=pg.mkPen("#bcbd22", width=2), name="MFI")
+    chart.addLine(y=80, pen=pg.mkPen(COLOR_LOSS, style=QtCore.Qt.DashLine, width=1))
+    chart.addLine(y=20, pen=pg.mkPen(COLOR_GAIN, style=QtCore.Qt.DashLine, width=1))
+    chart.setLabel("left", "MFI", color=COLOR_TEXT)
+    chart.setTitle(f"MFI 資金流量｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
+    _limit_zoom_to_data(chart, x, series + [0, 100])
+    chart.setXRange(min(x), max(x), padding=0.02)
+    chart.setYRange(0, 100, padding=0.02)
+
+
+def _render_detail_block(
+    label, price_chart, flow_chart, margin_chart, vpt_chart, mfi_chart, header, data, note=None
+):
+    """畫「個股籌碼面詳細資訊」文字摘要＋五張趨勢圖（歷史股價／三大法人／
+    融資融券／VPT／MFI）。data 是 fetch_position_detail() 的回傳值（不管是剛
+    查到的，還是 position_detail_cache.json 讀出來的上次結果，shape 都相同，見
+    tradingnote_finmind.POSITION_DETAIL_FIELDS）；「部位紀錄」頁跟「個股」頁的
+    StockDetailDialog 共用這份畫面邏輯，畫在各自傳入的 label／圖表 widget 上。
+    note 非 None 時插在 header 下面一行，用來標示「這是上次的快取，背景更新中」
+    或「背景更新失敗，顯示上次結果」。"""
+    valuation = data["valuation"]
+    history = data["institutional_history"]
+    margin_history = data["margin_history"]
+    foreign_shareholding = data["foreign_shareholding"]
+    lending = data["lending"]
+    suspension = data["suspension"]
+
+    lines = [header]
+    if note:
+        lines.append(note)
+    lines.append("")
+
+    if valuation is None:
+        lines.append("FinMind 基本面：查無資料")
+    else:
+        per = valuation["per"]
+        pbr = valuation["pbr"]
+        yield_pct = valuation["dividend_yield"]
+        lines.append(
+            f"FinMind 基本面（{valuation['date']}）　本益比：{per if per is not None else 'N/A'}　"
+            f"股價淨值比：{pbr if pbr is not None else 'N/A'}　"
+            f"殖利率：{yield_pct if yield_pct is not None else 'N/A'}%"
+        )
+
+    if history is None or not history["dates"]:
+        lines.append("三大法人買賣超：查無資料")
+    else:
+        latest_date = history["dates"][-1]
+        lines.append(f"三大法人買賣超（最新 {latest_date}，單位：股）")
+        for label_name, series in history["series"].items():
+            lines.append(f"　{label_name}：淨買超 {series[-1]:+,}")
+
+    if margin_history is None:
+        lines.append("融資融券：查無資料")
+    else:
+        latest = margin_history["latest"]
+        lines.append(
+            f"融資融券（最新 {latest['date']}，單位：張）　"
+            f"融資餘額：{latest['margin_balance']:,}（{latest['margin_change']:+,}）　"
+            f"融券餘額：{latest['short_balance']:,}（{latest['short_change']:+,}）"
+        )
+
+    if foreign_shareholding is None or foreign_shareholding["ratio"] is None:
+        lines.append("外資持股比例：查無資料")
+    else:
+        change = foreign_shareholding["change"]
+        change_text = f"（{change:+.2f}pp）" if change is not None else ""
+        lines.append(
+            f"外資持股比例（{foreign_shareholding['date']}）："
+            f"{foreign_shareholding['ratio']:.2f}%{change_text}"
+        )
+
+    if lending is None or not lending["volume"]:
+        lines.append("借券成交：查無資料")
+    else:
+        fee_text = (
+            f"，均費率 {lending['avg_fee_rate']:.2f}%"
+            if lending["avg_fee_rate"] is not None
+            else ""
+        )
+        lines.append(f"借券成交（{lending['date']}）：合計 {lending['volume']:,} 張{fee_text}")
+
+    if suspension:
+        for event in suspension:
+            lines.append(
+                f"⚠ 停資停券公告　{event['date']} ～ {event['end_date'] or '未提供'}　"
+                f"原因：{event['reason'] or '未提供'}"
+            )
+
+    label.setText("\n".join(lines))
+    _populate_price_chart(price_chart, data.get("price_history"))
+    _populate_flow_chart(flow_chart, history)
+    _populate_margin_chart(margin_chart, margin_history)
+    _populate_vpt_chart(vpt_chart, data.get("vpt_mfi_history"))
+    _populate_mfi_chart(mfi_chart, data.get("vpt_mfi_history"))
 
 
 class TradingCalendarWidget(QtWidgets.QCalendarWidget):
@@ -1685,8 +2066,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         outer_layout.setContentsMargins(0, 10, 0, 0)
 
         header = QtWidgets.QLabel(
-            "個股詳細資訊（選取上方部位查看，含 FinMind 三大法人120日資金流向、"
-            "融資融券餘額、外資持股、借券與停資停券、VPT 量價趨勢、MFI 資金流量）"
+            "個股詳細資訊（選取上方部位查看，含 FinMind 歷史股價、三大法人120日"
+            "資金流向、融資融券餘額、外資持股、借券與停資停券、VPT 量價趨勢、"
+            "MFI 資金流量）"
         )
         header.setProperty("header", True)
         outer_layout.addWidget(header)
@@ -1706,6 +2088,13 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.position_detail_label = QtWidgets.QLabel("尚未選取部位。")
         self.position_detail_label.setWordWrap(True)
         layout.addWidget(self.position_detail_label)
+
+        self.position_price_chart = pg.PlotWidget()
+        self.position_price_chart.setBackground(COLOR_BG)
+        self.position_price_chart.showGrid(x=True, y=True, alpha=0.15)
+        self.position_price_chart.setMinimumHeight(200)
+        self.position_price_chart.addLegend()
+        layout.addWidget(self.position_price_chart)
 
         self.position_flow_chart = pg.PlotWidget()
         self.position_flow_chart.setBackground(COLOR_BG)
@@ -1808,6 +2197,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         position_id = self._selected_position_id()
         if position_id is None:
             self.position_detail_label.setText("尚未選取部位。")
+            self.position_price_chart.clear()
             self.position_flow_chart.clear()
             self.position_margin_chart.clear()
             self.position_vpt_chart.clear()
@@ -1837,6 +2227,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self._render_position_detail(header, cached, note)
         else:
             self.position_detail_label.setText(f"{header}\n\nFinMind 查詢中...")
+            self.position_price_chart.clear()
             self.position_flow_chart.clear()
             self.position_margin_chart.clear()
             self.position_vpt_chart.clear()
@@ -1867,85 +2258,21 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.update_finmind_count_label()
 
     def _render_position_detail(self, header, data, note=None):
-        """畫「部位詳細資訊」文字摘要＋兩張趨勢圖。data 是 fetch_position_detail()
-        的結果（不管是這次剛查到的，還是 position_detail_cache.json 讀出來的
-        上次結果都是同一個 shape，見 tradingnote_finmind.POSITION_DETAIL_FIELDS），
-        用同一個函式畫，不用各自維護一份。note 非 None 時插在 header 下面一行，
-        用來標示「這是上次的快取，背景更新中」或「背景更新失敗，顯示上次結果」。"""
-        valuation = data["valuation"]
-        history = data["institutional_history"]
-        margin_history = data["margin_history"]
-        foreign_shareholding = data["foreign_shareholding"]
-        lending = data["lending"]
-        suspension = data["suspension"]
-
-        lines = [header]
-        if note:
-            lines.append(note)
-        lines.append("")
-
-        if valuation is None:
-            lines.append("FinMind 基本面：查無資料")
-        else:
-            per = valuation["per"]
-            pbr = valuation["pbr"]
-            yield_pct = valuation["dividend_yield"]
-            lines.append(
-                f"FinMind 基本面（{valuation['date']}）　本益比：{per if per is not None else 'N/A'}　"
-                f"股價淨值比：{pbr if pbr is not None else 'N/A'}　"
-                f"殖利率：{yield_pct if yield_pct is not None else 'N/A'}%"
-            )
-
-        if history is None or not history["dates"]:
-            lines.append("三大法人買賣超：查無資料")
-        else:
-            latest_date = history["dates"][-1]
-            lines.append(f"三大法人買賣超（最新 {latest_date}，單位：股）")
-            for label, series in history["series"].items():
-                lines.append(f"　{label}：淨買超 {series[-1]:+,}")
-
-        if margin_history is None:
-            lines.append("融資融券：查無資料")
-        else:
-            latest = margin_history["latest"]
-            lines.append(
-                f"融資融券（最新 {latest['date']}，單位：張）　"
-                f"融資餘額：{latest['margin_balance']:,}（{latest['margin_change']:+,}）　"
-                f"融券餘額：{latest['short_balance']:,}（{latest['short_change']:+,}）"
-            )
-
-        if foreign_shareholding is None or foreign_shareholding["ratio"] is None:
-            lines.append("外資持股比例：查無資料")
-        else:
-            change = foreign_shareholding["change"]
-            change_text = f"（{change:+.2f}pp）" if change is not None else ""
-            lines.append(
-                f"外資持股比例（{foreign_shareholding['date']}）："
-                f"{foreign_shareholding['ratio']:.2f}%{change_text}"
-            )
-
-        if lending is None or not lending["volume"]:
-            lines.append("借券成交：查無資料")
-        else:
-            fee_text = (
-                f"，均費率 {lending['avg_fee_rate']:.2f}%"
-                if lending["avg_fee_rate"] is not None
-                else ""
-            )
-            lines.append(f"借券成交（{lending['date']}）：合計 {lending['volume']:,} 張{fee_text}")
-
-        if suspension:
-            for event in suspension:
-                lines.append(
-                    f"⚠ 停資停券公告　{event['date']} ～ {event['end_date'] or '未提供'}　"
-                    f"原因：{event['reason'] or '未提供'}"
-                )
-
-        self.position_detail_label.setText("\n".join(lines))
-        self._populate_position_flow_chart(history)
-        self._populate_position_margin_chart(margin_history)
-        self._populate_position_vpt_chart(data.get("vpt_mfi_history"))
-        self._populate_position_mfi_chart(data.get("vpt_mfi_history"))
+        """畫「部位詳細資訊」文字摘要＋五張趨勢圖。實際畫面邏輯是模組層級的
+        _render_detail_block（跟「個股」頁 StockDetailDialog 的「顯示完整籌碼
+        面資訊」按鈕共用同一份），這裡只是把部位紀錄頁自己的 label／圖表
+        widget 傳進去。"""
+        _render_detail_block(
+            self.position_detail_label,
+            self.position_price_chart,
+            self.position_flow_chart,
+            self.position_margin_chart,
+            self.position_vpt_chart,
+            self.position_mfi_chart,
+            header,
+            data,
+            note,
+        )
 
     def _on_position_detail_error(self, pos, header, message, cached=None):
         if not self._is_current_detail_target(pos):
@@ -1966,132 +2293,12 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             f"{header}\n\nFinMind 查詢失敗：{message}\n\n"
             "可能原因：FinMind token 未設定或已失效、已超過免費額度，或該股票暫無此資料。"
         )
+        self.position_price_chart.clear()
         self.position_flow_chart.clear()
         self.position_margin_chart.clear()
         self.position_vpt_chart.clear()
         self.position_mfi_chart.clear()
         self.update_finmind_count_label()
-
-    def _populate_position_flow_chart(self, history):
-        chart = self.position_flow_chart
-        chart.clear()
-        if history is None or not history["dates"]:
-            return
-
-        dates = history["dates"]
-        x = list(range(len(dates)))
-        step = max(1, len(dates) // 8)
-        chart.getPlotItem().getAxis("bottom").setTicks(
-            [[(i, dates[i]) for i in range(0, len(dates), step)]]
-        )
-
-        bucket_colors = {"外資": "#1f77b4", "投信": "#2ca02c", "自營商": "#d62728"}
-        all_y = [0]  # 包含 0，讓下面的零軸參考線不會被縮出視野邊界外
-        for label, series in history["series"].items():
-            cumulative = []
-            running_total = 0
-            for net in series:
-                running_total += net
-                cumulative.append(running_total)
-            all_y.extend(cumulative)
-            chart.plot(
-                x,
-                cumulative,
-                pen=pg.mkPen(bucket_colors.get(label, COLOR_TEXT), width=2),
-                name=label,
-            )
-
-        chart.addLine(y=0, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
-        chart.setLabel("left", "累計淨買賣超（股）", color=COLOR_TEXT)
-        chart.setTitle(f"三大法人累計買賣超｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
-        _limit_zoom_to_data(chart, x, all_y)
-        chart.enableAutoRange()
-
-    def _populate_position_margin_chart(self, margin_history):
-        """融資融券餘額趨勢圖：跟 _populate_position_flow_chart 不同，這裡的資料
-        本來就是「餘額」（TodayBalance），不是逐日買賣超流量，所以直接畫原始值，
-        不能再累加一次（累加會變成「餘額的餘額」，數字沒有意義）。"""
-        chart = self.position_margin_chart
-        chart.clear()
-        if margin_history is None or not margin_history["dates"]:
-            return
-
-        dates = margin_history["dates"]
-        x = list(range(len(dates)))
-        step = max(1, len(dates) // 8)
-        chart.getPlotItem().getAxis("bottom").setTicks(
-            [[(i, dates[i]) for i in range(0, len(dates), step)]]
-        )
-
-        series_colors = {"融資餘額": "#9467bd", "融券餘額": "#ff7f0e"}
-        all_y = []
-        for label, series in margin_history["series"].items():
-            all_y.extend(series)
-            chart.plot(
-                x,
-                series,
-                pen=pg.mkPen(series_colors.get(label, COLOR_TEXT), width=2),
-                name=label,
-            )
-
-        chart.setLabel("left", "餘額（張）", color=COLOR_TEXT)
-        chart.setTitle(f"融資融券餘額｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
-        _limit_zoom_to_data(chart, x, all_y)
-        chart.enableAutoRange()
-
-    def _populate_position_vpt_chart(self, vpt_mfi_history):
-        chart = self.position_vpt_chart
-        chart.clear()
-        if vpt_mfi_history is None or not vpt_mfi_history["dates"]:
-            return
-
-        dates = vpt_mfi_history["dates"]
-        x = list(range(len(dates)))
-        step = max(1, len(dates) // 8)
-        chart.getPlotItem().getAxis("bottom").setTicks(
-            [[(i, dates[i]) for i in range(0, len(dates), step)]]
-        )
-
-        series = vpt_mfi_history["vpt"]
-        chart.plot(x, series, pen=pg.mkPen("#17becf", width=2), name="VPT")
-        chart.setLabel("left", "VPT", color=COLOR_TEXT)
-        chart.setTitle(f"VPT 量價趨勢｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
-        _limit_zoom_to_data(chart, x, series)
-        # 這個區塊一開始被 QScrollArea 捲到看不見的地方（選部位當下使用者通常
-        # 還沒捲到這裡），widget 還沒有真正的版面尺寸時呼叫 enableAutoRange()／
-        # chart.autoRange() 算出來的範圍不可靠（實測會卡在 ±1 附近的退化值）。
-        # 直接用剛剛算好的資料範圍 setRange，不依賴 pyqtgraph 的自動偵測；
-        # y_pad 下限跟 _limit_zoom_to_data 的 y_floor 同樣抓 1.0，避免 VPT
-        # 全程沒有變化（min==max）時 setYRange 收斂成高度 0 的退化範圍。
-        y_lo, y_hi = min(series), max(series)
-        y_pad = max((y_hi - y_lo) * 0.1, 1.0)
-        chart.setXRange(min(x), max(x), padding=0.02)
-        chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
-
-    def _populate_position_mfi_chart(self, vpt_mfi_history):
-        """MFI 值域固定在 0～100，圖上加 80／20 兩條參考線（超買／超賣，MFI
-        標準慣例），跟 _populate_position_flow_chart 的零軸參考線同一種畫法。"""
-        chart = self.position_mfi_chart
-        chart.clear()
-        if vpt_mfi_history is None or not vpt_mfi_history["dates"]:
-            return
-
-        dates = vpt_mfi_history["dates"]
-        x = list(range(len(dates)))
-        step = max(1, len(dates) // 8)
-        chart.getPlotItem().getAxis("bottom").setTicks(
-            [[(i, dates[i]) for i in range(0, len(dates), step)]]
-        )
-
-        series = vpt_mfi_history["mfi"]
-        chart.plot(x, series, pen=pg.mkPen("#bcbd22", width=2), name="MFI")
-        chart.addLine(y=80, pen=pg.mkPen(COLOR_LOSS, style=QtCore.Qt.DashLine, width=1))
-        chart.addLine(y=20, pen=pg.mkPen(COLOR_GAIN, style=QtCore.Qt.DashLine, width=1))
-        chart.setLabel("left", "MFI", color=COLOR_TEXT)
-        chart.setTitle(f"MFI 資金流量｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
-        _limit_zoom_to_data(chart, x, series + [0, 100])
-        chart.setXRange(min(x), max(x), padding=0.02)
-        chart.setYRange(0, 100, padding=0.02)
 
     def _update_status_bar(self):
         cache_note = ""
