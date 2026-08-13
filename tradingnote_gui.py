@@ -3,6 +3,7 @@
 
 import html
 import queue
+import statistics
 import threading
 from collections import Counter
 from datetime import date, datetime
@@ -14,6 +15,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from tradingnote_core import (
     add_position,
     compute_pnl,
+    fetch_tpex_valuation_all,
+    fetch_twse_valuation_all,
     find_position,
     get_market_snapshot,
     load_positions,
@@ -31,6 +34,7 @@ from tradingnote_history import (
     _change_pct,
     backfill_twse_history,
     compute_industry_flow,
+    compute_valuation_flow,
     compute_volume_ratio_outliers,
     default_start_date_for_days,
     get_available_dates,
@@ -40,6 +44,7 @@ from tradingnote_history import (
     get_industry_top_stocks_range,
     get_latest_ticker_record,
     record_snapshot,
+    record_valuation_snapshot,
     trading_days_between,
 )
 from tradingnote_finmind import (
@@ -420,6 +425,23 @@ def run_task_in_thread(parent, work_fn, on_done, on_error):
     return timer
 
 
+def _record_valuation_snapshot_best_effort():
+    """盡力而為記錄今天的本益比／股價淨值比快照（TWSE／TPEX 官方 bulk 端點各打
+    一次），供泡泡圖「估值百分位」新模式逐日累積用（見 tradingnote_history.
+    compute_valuation_flow）。刻意用寬鬆的 `except Exception`（不是專案慣例的窄範圍
+    例外）：這是輔助性的背景累積動作，任何失敗（離線、端點暫時掛掉、格式意外跑掉）
+    都不應該讓啟動或「重新整理」流程跟著失敗——當天只是沒新增一筆 valuation_history，
+    不影響其他既有功能，之後正常連線時自然會補上。"""
+    try:
+        record_valuation_snapshot(HISTORY_DB_PATH, fetch_twse_valuation_all(), "TWSE")
+    except Exception:
+        pass
+    try:
+        record_valuation_snapshot(HISTORY_DB_PATH, fetch_tpex_valuation_all(), "TPEX")
+    except Exception:
+        pass
+
+
 def run_refresh_in_thread(parent, progress_cb, done_cb, error_cb):
     """在背景執行緒重新整理即時報價＋寫入歷史資料庫，機制跟 run_backfill_in_thread／
     run_task_in_thread 相同（背景執行緒＋queue＋QTimer 輪詢送回 Qt 主執行緒）。
@@ -440,6 +462,7 @@ def run_refresh_in_thread(parent, progress_cb, done_cb, error_cb):
             )
             q.put(("progress", 3, total_steps, "正在寫入歷史資料庫..."))
             record_snapshot(HISTORY_DB_PATH, snapshot)
+            _record_valuation_snapshot_best_effort()
             q.put(("progress", 4, total_steps, "完成"))
             q.put(("done", snapshot, None, None))
         except PriceFetchError as e:  # noqa: BLE001 - surface any failure to the caller
@@ -490,6 +513,7 @@ def run_startup_preload_in_thread(parent, progress_cb, done_cb, error_cb):
             )
             q.put(("progress", 3, total_steps, "正在寫入歷史資料庫..."))
             record_snapshot(HISTORY_DB_PATH, snapshot)
+            _record_valuation_snapshot_best_effort()
             q.put(("progress", 3, total_steps, "正在更新產業分類..."))
             get_industry_map(HISTORY_DB_PATH)
             q.put(("progress", 4, total_steps, "完成"))
@@ -883,9 +907,11 @@ class StockDetailDialog(QtWidgets.QDialog):
 class IndustryTopStocksDialog(QtWidgets.QDialog):
     """點擊「資金流向分析」頁的產業泡泡／資金動向清單時彈出的小視窗，顯示該產業
     近 days 個交易日累積成交金額前 N 大成分股（市值資料的代理指標，見
-    get_industry_top_stocks_range；N 不足時全部顯示）。純本地資料，不打任何
+    get_industry_top_stocks_range；N 不足時全部顯示），並附上近日成交量／均量／
+    本益比。純本地資料（daily_prices／valuation_history 快取），不打任何
     API，開啟即顯示。泡泡圖跟清單各自有獨立的「資料區間」設定，這裡的 days
-    就是觸發點擊當下那邊的區間天數，讓彈出視窗的口徑跟畫面上看到的一致。"""
+    就是觸發點擊當下那邊的區間天數，讓彈出視窗的口徑跟畫面上看到的一致；均量／
+    本益比則固定用 get_industry_top_stocks_range 內建的天數，不受 days 影響。"""
 
     def __init__(self, parent, industry, top_stocks, days):
         super().__init__(parent)
@@ -895,8 +921,19 @@ class IndustryTopStocksDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 12)
 
-        table = QtWidgets.QTableWidget(len(top_stocks), 5)
-        table.setHorizontalHeaderLabels(["代號", "名稱", "現價", "累積漲跌%", "累積成交金額(億)"])
+        table = QtWidgets.QTableWidget(len(top_stocks), 8)
+        table.setHorizontalHeaderLabels(
+            [
+                "代號",
+                "名稱",
+                "現價",
+                "累積漲跌%",
+                "累積成交金額(億)",
+                "近日量(張)",
+                "均量(張)",
+                "本益比",
+            ]
+        )
         table.verticalHeader().setVisible(False)
         table.setAlternatingRowColors(True)
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -905,16 +942,21 @@ class IndustryTopStocksDialog(QtWidgets.QDialog):
             change_pct = stock["change_pct"]
             change_str = f"{change_pct:+.2f}%" if change_pct is not None else "N/A"
             color = COLOR_GAIN if (change_pct or 0) >= 0 else COLOR_LOSS
+            avg_volume = stock["avg_volume"]
+            per = stock["per"]
             values = [
                 stock["ticker"],
                 stock["name"] or "-",
                 f"{stock['close']:.2f}",
                 change_str,
                 f"{stock['trading_value'] / 1e8:,.2f}",
+                f"{stock['today_volume'] / 1000:,.0f}" if stock["today_volume"] is not None else "-",
+                f"{avg_volume / 1000:,.0f}" if avg_volume is not None else "-",
+                f"{per:.2f}" if per is not None else "N/A",
             ]
             for col, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
-                if col in (0, 2, 3, 4):
+                if col in (0, 2, 3, 4, 5, 6, 7):
                     item.setTextAlignment(QtCore.Qt.AlignCenter)
                 if col == 3 and change_pct is not None:
                     item.setForeground(QtGui.QColor(color))
@@ -1106,26 +1148,74 @@ class FlowChartWidget(pg.PlotWidget):
         return super().event(ev)
 
 
-def populate_flow_chart(chart, db_path, snapshot, avg_days=5, on_industry_click=None):
-    """把產業資金流向資料畫進既有的 FlowChartWidget（保留使用者目前的縮放/平移狀態不做）。
-    avg_days 決定 X／Y 兩軸的天數（5/10/20 日流向切換）。on_industry_click 若提供，
-    點擊泡泡時會被呼叫並帶入該產業名稱（例如用來刷新下方的成分股面板）。"""
-    chart.clear()
-    flow = compute_industry_flow(db_path, snapshot, avg_days=avg_days)
-    plotted = [f for f in flow if f.volume_ratio is not None and f.avg_change_pct is not None]
-    skipped = len(flow) - len(plotted)
+VALUATION_METRIC_LABELS = {"per": "本益比 PER", "pbr": "股價淨值比 PBR"}
 
+
+def populate_flow_chart(
+    chart, db_path, snapshot, avg_days=5, on_industry_click=None, mode="momentum", valuation_metric="per"
+):
+    """把產業資金流向資料畫進既有的 FlowChartWidget（保留使用者目前的縮放/平移狀態不做）。
+    avg_days 決定 X／Y 兩軸的天數（5/10/20 日流向切換），只影響 mode="momentum"；
+    mode="valuation" 有自己固定的 5/20 日資金流入窗口（見下），不吃 avg_days。
+    on_industry_click 若提供，點擊泡泡時會被呼叫並帶入該產業名稱（例如用來刷新
+    下方的成分股面板）。
+
+    `mode="momentum"`（預設）：X＝近 avg_days 日累積漲跌%、Y＝今日量比，即原本的
+    「產業資金流向」泡泡圖。`mode="valuation"`：X＝valuation_metric（PER 或 PBR）
+    最新一筆數值（成交金額加權平均，只需要今天/最近一次的估值快照，不用等歷史
+    百分位）、Y＝資金流入強度（近 5 日均額 ÷ 近 20 日均額），找的是左上角——
+    估值比其他產業便宜、流入強度高（錢已經在進）的產業，見 compute_valuation_flow。"""
+    chart.clear()
     vb = chart.getPlotItem().getViewBox()
 
-    if not plotted:
-        text = pg.TextItem(
-            "尚無足夠歷史資料可繪製（請先執行「回補歷史資料」，\n或等待逐日累積達到最小天數）",
-            color=COLOR_MUTED,
-            anchor=(0.5, 0.5),
+    if mode == "valuation":
+        valuation_short_days, valuation_long_days = 5, 20
+        flow = compute_valuation_flow(
+            db_path,
+            snapshot,
+            short_days=valuation_short_days,
+            long_days=valuation_long_days,
+            metric=valuation_metric,
         )
+        plotted = [
+            f for f in flow if f.latest_valuation is not None and f.money_flow_ratio is not None
+        ]
+        xs_of = lambda f: f.latest_valuation  # noqa: E731
+        ys_of = lambda f: f.money_flow_ratio  # noqa: E731
+        metric_label = VALUATION_METRIC_LABELS[valuation_metric]
+        empty_hint = "尚無估值資料可繪製（等待下一次「重新整理」或啟動時的估值快照）"
+        empty_title = "產業估值 vs 資金流向"
+        x_label = f"最新 {metric_label}（成交金額加權中位數）"
+        y_label = f"資金流入強度（近{valuation_short_days}日均額 / 近{valuation_long_days}日均額）"
+        title_prefix = (
+            f"產業估值 vs 資金流向｜最新{metric_label} × "
+            f"{valuation_short_days}/{valuation_long_days}日資金流入強度"
+        )
+        # X 沒有像百分位那樣天然的 0～100 參考值，改用「所有產業目前值的中位數」當
+        # 參考線——落在線左邊＝比其他產業便宜、右邊＝比其他產業貴，是同業間的相對定位，
+        # 不是自身歷史定位（後者需要長天期歷史，見 compute_valuation_flow 的取捨說明）。
+        xs_for_ref = [xs_of(f) for f in plotted]
+        x_ref_line = statistics.median(xs_for_ref) if xs_for_ref else 0
+        y_ref_line = 1
+    else:
+        flow = compute_industry_flow(db_path, snapshot, avg_days=avg_days)
+        plotted = [f for f in flow if f.volume_ratio is not None and f.avg_change_pct is not None]
+        xs_of = lambda f: f.avg_change_pct  # noqa: E731
+        ys_of = lambda f: f.volume_ratio  # noqa: E731
+        empty_hint = "尚無足夠歷史資料可繪製（請先執行「回補歷史資料」，\n或等待逐日累積達到最小天數）"
+        empty_title = "產業資金流向"
+        x_label = f"近{avg_days}日成交金額加權平均累積漲跌 %"
+        y_label = f"今日成交量 / 近{avg_days}日均量"
+        title_prefix = f"產業資金流向｜{avg_days}日"
+        x_ref_line, y_ref_line = 0, 1
+
+    skipped = len(flow) - len(plotted)
+
+    if not plotted:
+        text = pg.TextItem(empty_hint, color=COLOR_MUTED, anchor=(0.5, 0.5))
         chart.addItem(text)
         text.setPos(0, 0)
-        chart.setTitle("產業資金流向", color=COLOR_TEXT, size="13pt")
+        chart.setTitle(empty_title, color=COLOR_TEXT, size="13pt")
         vb.setLimits(xMin=None, xMax=None, yMin=None, yMax=None)
         return
 
@@ -1134,11 +1224,12 @@ def populate_flow_chart(chart, db_path, snapshot, avg_days=5, on_industry_click=
     max_share = max(f.capital_share_pct for f in plotted)
 
     for i, f in enumerate(plotted):
+        x, y = xs_of(f), ys_of(f)
         size = max(14.0, (f.capital_share_pct / max_share) ** 0.5 * 55.0)
         color = QtGui.QColor(TAB20_COLORS[i % len(TAB20_COLORS)])
         scatter = pg.ScatterPlotItem(
-            x=[f.avg_change_pct],
-            y=[f.volume_ratio],
+            x=[x],
+            y=[y],
             size=size,
             brush=pg.mkBrush(color.red(), color.green(), color.blue(), 190),
             pen=pg.mkPen(COLOR_TEXT, width=0.6),
@@ -1154,14 +1245,26 @@ def populate_flow_chart(chart, db_path, snapshot, avg_days=5, on_industry_click=
         label = pg.TextItem(
             f"{f.industry}\n{f.capital_share_pct:.1f}%", color=COLOR_TEXT, anchor=(0.5, 0.5)
         )
-        label.setPos(f.avg_change_pct, f.volume_ratio)
+        label.setPos(x, y)
         chart.addItem(label)
 
-    chart.addLine(x=0, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
-    chart.addLine(y=1, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
-    chart.setLabel("bottom", f"近{avg_days}日成交金額加權平均累積漲跌 %", color=COLOR_TEXT)
-    chart.setLabel("left", f"今日成交量 / 近{avg_days}日均量", color=COLOR_TEXT)
-    title = f"產業資金流向｜{avg_days}日（泡泡大小＝資金比重%，點擊可查看成分股）"
+    chart.addLine(x=x_ref_line, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
+    chart.addLine(y=y_ref_line, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
+    if mode == "valuation":
+        # 使用者要找的目標象限：左上角＝估值百分位低（便宜）＋資金流入強度高
+        # （錢已經在進），用一個角落註記標出來，不用使用者自己對兩條參考線。
+        xs_all = [xs_of(f) for f in plotted]
+        ys_all = [ys_of(f) for f in plotted]
+        corner = pg.TextItem(
+            "◤ 資金流入、估值仍便宜",
+            color=COLOR_GAIN,
+            anchor=(0, 1),
+        )
+        corner.setPos(min(xs_all + [x_ref_line]), max(ys_all + [y_ref_line]))
+        chart.addItem(corner)
+    chart.setLabel("bottom", x_label, color=COLOR_TEXT)
+    chart.setLabel("left", y_label, color=COLOR_TEXT)
+    title = f"{title_prefix}（泡泡大小＝資金比重%，點擊可查看成分股）"
     if skipped:
         title += f"　（另有 {skipped} 個產業因歷史資料不足未顯示）"
     chart.setTitle(title, color=COLOR_TEXT, size="13pt")
@@ -1169,8 +1272,8 @@ def populate_flow_chart(chart, db_path, snapshot, avg_days=5, on_industry_click=
     # 限制縮小（滾輪／觸控板捏合）的下限，最多縮到剛好看見全部泡泡為止，避免
     # 縮出一大片空白；邊界抓資料範圍的 15% 當緩衝，讓泡泡本身（半徑）與旁邊的
     # 產業名稱標籤不會被邊緣裁到。上限（放大）不受影響，仍可無限拉近。
-    xs = [f.avg_change_pct for f in plotted]
-    ys = [f.volume_ratio for f in plotted]
+    xs = [xs_of(f) for f in plotted]
+    ys = [ys_of(f) for f in plotted]
     x_min, x_max = min(xs), max(xs)
     y_min, y_max = min(ys), max(ys)
     x_pad = max((x_max - x_min) * 0.15, 1.0)
@@ -1607,6 +1710,10 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         # 完成後重繪資金流向圖。
         if self.settings.get("auto_check_continuity", True):
             self._sync_history_continuity()
+            # 估值歷史（valuation_history）不在這裡回補：泡泡圖「估值」模式改成只看
+            # 每檔股票「最新一筆」PER/PBR（見 compute_valuation_flow），不需要長天期
+            # 歷史。「最新一筆」資料靠每次「重新整理」／啟動都會呼叫的
+            # _record_valuation_snapshot_best_effort 存一筆快照即可，足夠這個模式使用。
 
         self._new_data_check_timer = QtCore.QTimer(self)
         self._new_data_check_timer.timeout.connect(self._check_for_new_data)
@@ -1696,6 +1803,22 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.flow_date_button = QtWidgets.QPushButton()
         self.flow_date_button.clicked.connect(self._open_flow_date_picker)
         toolbar.addWidget(self.flow_date_button)
+
+        toolbar.addSpacing(16)
+        toolbar.addWidget(QtWidgets.QLabel("泡泡圖模式："))
+        self.flow_bubble_mode_combo = QtWidgets.QComboBox()
+        self.flow_bubble_mode_combo.addItem("動能（漲跌% × 量比）", "momentum")
+        self.flow_bubble_mode_combo.addItem("估值（PER/PBR 百分位 × 資金流入強度）", "valuation")
+        self.flow_bubble_mode_combo.currentIndexChanged.connect(self._on_flow_bubble_mode_changed)
+        toolbar.addWidget(self.flow_bubble_mode_combo)
+
+        self.flow_valuation_metric_combo = QtWidgets.QComboBox()
+        self.flow_valuation_metric_combo.addItem("本益比 PER", "per")
+        self.flow_valuation_metric_combo.addItem("股價淨值比 PBR", "pbr")
+        self.flow_valuation_metric_combo.currentIndexChanged.connect(lambda _: self.refresh_flow_tab())
+        self.flow_valuation_metric_combo.setVisible(False)
+        toolbar.addWidget(self.flow_valuation_metric_combo)
+
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
         self._update_flow_date_button()
@@ -1714,6 +1837,11 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.flow_date_button.setText(
             f"{self.flow_start_date} 起（近 {self.flow_avg_days} 個交易日）　▾"
         )
+
+    def _on_flow_bubble_mode_changed(self, _index):
+        is_valuation = self.flow_bubble_mode_combo.currentData() == "valuation"
+        self.flow_valuation_metric_combo.setVisible(is_valuation)
+        self.refresh_flow_tab()
 
     def _open_flow_date_picker(self):
         # 可選的起始日只到「今天以前」——avg_days 的語意本來就是「今天以前 N 個交易日」
@@ -1734,6 +1862,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self.snapshot,
             avg_days=self.flow_avg_days,
             on_industry_click=self._on_industry_bubble_clicked,
+            mode=self.flow_bubble_mode_combo.currentData(),
+            valuation_metric=self.flow_valuation_metric_combo.currentData(),
         )
         self.refresh_flow_list()
         self.refresh_volume_outliers_list()
@@ -2064,9 +2194,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         即時顯示，見 self._ticker_concept_map／get_industry_map）＋ FinMind
         本益比／殖利率／三大法人買賣超／融資融券餘額／外資持股／借券／停資停券
         （背景查詢，見 _load_position_detail）。跟「個股」頁的 StockDetailDialog
-        不同，這裡不彈窗，直接嵌在部位紀錄頁裡。文字摘要＋兩張趨勢圖疊起來可能
-        比下方分割區塊的可視高度還高，用 QScrollArea 包起來讓內容用捲軸瀏覽
-        （跟「資金流向分析」頁 _build_flow_tab 同一招），而不是把圖硬擠壓變形。"""
+        不同，這裡不彈窗，直接嵌在部位紀錄頁裡。文字摘要固定顯示在上方，五張
+        圖表用 QTabWidget 分頁選單切換（跟 StockDetailDialog._build_full_detail_widgets
+        同一招），一次只顯示一張，不用像以前那樣把五張圖疊起來捲動瀏覽。"""
         container = QtWidgets.QWidget()
         outer_layout = QtWidgets.QVBoxLayout(container)
         outer_layout.setContentsMargins(0, 10, 0, 0)
@@ -2080,55 +2210,34 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         outer_layout.addWidget(header)
         outer_layout.addSpacing(4)
 
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        outer_layout.addWidget(scroll)
-
-        content = QtWidgets.QWidget()
-        scroll.setWidget(content)
-        layout = QtWidgets.QVBoxLayout(content)
-        layout.setContentsMargins(0, 0, 0, 0)
-
         self.position_detail_label = QtWidgets.QLabel("尚未選取部位。")
         self.position_detail_label.setWordWrap(True)
-        layout.addWidget(self.position_detail_label)
+        outer_layout.addWidget(self.position_detail_label)
 
         self.position_price_chart = pg.PlotWidget()
-        self.position_price_chart.setBackground(COLOR_BG)
-        self.position_price_chart.showGrid(x=True, y=True, alpha=0.15)
-        self.position_price_chart.setMinimumHeight(200)
-        self.position_price_chart.addLegend()
-        layout.addWidget(self.position_price_chart)
-
         self.position_flow_chart = pg.PlotWidget()
-        self.position_flow_chart.setBackground(COLOR_BG)
-        self.position_flow_chart.showGrid(x=True, y=True, alpha=0.15)
-        self.position_flow_chart.setMinimumHeight(200)
-        self.position_flow_chart.addLegend()
-        layout.addWidget(self.position_flow_chart)
-
         self.position_margin_chart = pg.PlotWidget()
-        self.position_margin_chart.setBackground(COLOR_BG)
-        self.position_margin_chart.showGrid(x=True, y=True, alpha=0.15)
-        self.position_margin_chart.setMinimumHeight(200)
-        self.position_margin_chart.addLegend()
-        layout.addWidget(self.position_margin_chart)
-
         self.position_vpt_chart = pg.PlotWidget()
-        self.position_vpt_chart.setBackground(COLOR_BG)
-        self.position_vpt_chart.showGrid(x=True, y=True, alpha=0.15)
-        self.position_vpt_chart.setMinimumHeight(200)
-        self.position_vpt_chart.addLegend()
-        layout.addWidget(self.position_vpt_chart)
-
         self.position_mfi_chart = pg.PlotWidget()
-        self.position_mfi_chart.setBackground(COLOR_BG)
-        self.position_mfi_chart.showGrid(x=True, y=True, alpha=0.15)
-        self.position_mfi_chart.setMinimumHeight(200)
-        self.position_mfi_chart.addLegend()
-        layout.addWidget(self.position_mfi_chart)
+        for chart in (
+            self.position_price_chart,
+            self.position_flow_chart,
+            self.position_margin_chart,
+            self.position_vpt_chart,
+            self.position_mfi_chart,
+        ):
+            chart.setBackground(COLOR_BG)
+            chart.showGrid(x=True, y=True, alpha=0.15)
+            chart.setMinimumHeight(320)
+            chart.addLegend()
+
+        position_detail_tabs = QtWidgets.QTabWidget()
+        position_detail_tabs.addTab(self.position_price_chart, "歷史股價")
+        position_detail_tabs.addTab(self.position_flow_chart, "三大法人")
+        position_detail_tabs.addTab(self.position_margin_chart, "融資融券")
+        position_detail_tabs.addTab(self.position_vpt_chart, "VPT")
+        position_detail_tabs.addTab(self.position_mfi_chart, "MFI")
+        outer_layout.addWidget(position_detail_tabs)
 
         return container
 
@@ -2877,6 +2986,16 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         )
         backfill_buttons_row.addStretch(1)
         layout.addLayout(backfill_buttons_row)
+
+        layout.addSpacing(10)
+        valuation_backfill_hint = QtWidgets.QLabel(
+            "「資金流向分析」頁泡泡圖的「估值」模式（PER/PBR）只看每檔股票最新一筆"
+            "本益比／淨值比，靠每次「重新整理」／啟動時自動存的估值快照即可，"
+            "不需要另外回補歷史資料，也沒有對應的設定選項。"
+        )
+        valuation_backfill_hint.setProperty("muted", True)
+        valuation_backfill_hint.setWordWrap(True)
+        layout.addWidget(valuation_backfill_hint)
 
         layout.addSpacing(20)
         status_header = QtWidgets.QLabel("資料庫狀態")

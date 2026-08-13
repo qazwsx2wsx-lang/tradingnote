@@ -15,6 +15,7 @@ from tradingnote_http import PriceFetchError, http_get_json, to_float, to_int
 TWSE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TPEX_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
 TPEX_PERATIO_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis"
+TWSE_VALUATION_URL = "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL"
 
 CACHE_TTL_SECONDS = 30 * 60
 # 上櫃股票本益比／殖利率／股價淨值比，實測跟 FinMind 同一天數值完全一致（FinMind
@@ -265,6 +266,25 @@ def fetch_tpex_valuation_all():
             "per": to_float(rec.get("PriceEarningRatio")),
             "pbr": to_float(rec.get("PriceBookRatio")),
             "dividend_yield": to_float(rec.get("YieldRatio")),
+        }
+    return result
+
+
+def fetch_twse_valuation_all():
+    """打一次 BWIBBU_ALL，回傳今日全部上市股票的 {ticker: {"per":, "pbr":,
+    "dividend_yield":}}（跟 fetch_tpex_valuation_all 同精神，一次拿全市場，
+    不用逐檔查、不吃 FinMind 額度）。虧損公司算不出本益比的欄位是空字串，
+    `to_float` 已經會轉成 None，不用特別處理。"""
+    rows = http_get_json(TWSE_VALUATION_URL)
+    result = {}
+    for rec in rows:
+        code = (rec.get("Code") or "").strip()
+        if not code:
+            continue
+        result[code] = {
+            "per": to_float(rec.get("PEratio")),
+            "pbr": to_float(rec.get("PBratio")),
+            "dividend_yield": to_float(rec.get("DividendYield")),
         }
     return result
 

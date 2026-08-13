@@ -108,6 +108,23 @@ def _connect(db_path):
             updated_at TEXT
         )"""
     )
+    # 個股本益比／股價淨值比逐日累積（record_valuation_snapshot），供泡泡圖「估值」
+    # 模式取「最新一筆」計算產業估值定位（見 compute_valuation_flow）。
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS valuation_history (
+            date TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            market TEXT,
+            per REAL,
+            pbr REAL,
+            dividend_yield REAL,
+            PRIMARY KEY (date, ticker)
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_valuation_history_ticker_date "
+        "ON valuation_history (ticker, date DESC)"
+    )
     conn.commit()
     return conn
 
@@ -168,6 +185,40 @@ def upsert_daily_prices(db_path, rows):
         conn.commit()
     finally:
         conn.close()
+
+
+def upsert_valuation_history(db_path, rows):
+    """寫入一批 (date, ticker, market, per, pbr, dividend_yield) tuple 到
+    valuation_history（INSERT OR REPLACE），供逐日累積（record_valuation_snapshot）
+    用。rows 為空時直接 return，不開連線。"""
+    if not rows:
+        return
+    conn = _connect(db_path)
+    try:
+        conn.executemany(
+            """INSERT OR REPLACE INTO valuation_history
+               (date, ticker, market, per, pbr, dividend_yield)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def record_valuation_snapshot(db_path, valuation_map, market, as_of_date=None):
+    """valuation_map：{ticker: {"per":, "pbr":, "dividend_yield":}}（來自
+    tradingnote_core.fetch_twse_valuation_all／fetch_tpex_valuation_all，多出來的
+    "date" key 這裡用不到，忽略即可），逐日累積進 valuation_history，機制跟
+    record_snapshot（daily_prices）一致。呼叫端（GUI 的啟動前置作業／重新整理）
+    應該把這個包成 best-effort（失敗不影響其他功能），見 tradingnote_gui 對應
+    change log。"""
+    today_iso = as_of_date or date.today().isoformat()
+    rows = [
+        (today_iso, ticker, market, v.get("per"), v.get("pbr"), v.get("dividend_yield"))
+        for ticker, v in valuation_map.items()
+    ]
+    upsert_valuation_history(db_path, rows)
 
 
 def get_history_status(db_path):
@@ -676,13 +727,148 @@ def compute_industry_flow(db_path, snapshot, avg_days=5):
     return results
 
 
+@dataclass
+class IndustryValuationFlow:
+    industry: str
+    latest_valuation: float | None
+    money_flow_ratio: float | None
+    total_trading_value: float
+    capital_share_pct: float
+    stock_count: int
+
+
+def _weighted_median(pairs):
+    """pairs 為 [(value, weight), ...]；回傳加權中位數（權重累積到總權重一半時的
+    value）。權重須為正數；輸入為空回傳 None。"""
+    pairs = sorted((v, w) for v, w in pairs if w > 0)
+    total_weight = sum(w for _, w in pairs)
+    if total_weight <= 0:
+        return None
+    half = total_weight / 2
+    cumulative = 0.0
+    for value, weight in pairs:
+        cumulative += weight
+        if cumulative >= half:
+            return value
+    return pairs[-1][0]
+
+
+def compute_valuation_flow(db_path, snapshot, short_days=5, long_days=20, metric="per"):
+    """泡泡圖「估值」模式：X＝該產業成分股「最新一筆」metric（本益比 PER 或股價
+    淨值比 PBR，用今日成交金額加權中位數彙總到產業層級，見 _weighted_median 的
+    取捨說明）；Y＝資金流入強度（近
+    short_days 日均成交金額 ÷ 近 long_days 日均成交金額，短天期均額相對長天期均額
+    墊高＝錢開始流入，比「今日單日 ÷ N 日均額」更不怕單日爆量雜訊）。找的是 X 低、
+    Y 高的左上角（便宜、但錢已經在進）。
+
+    X 只需要每檔股票「當下最新一筆」valuation_history 紀錄即可（不需要一段歷史去
+    算百分位），只要今天（或最近一次）的 record_valuation_snapshot 有抓到就算數，
+    TWSE／TPEX 都適用；不像先前的「自身歷史百分位」版本要等 backfill 補到
+    MIN_VALUATION_HISTORY_POINTS 天以上才有值，那個版本在整批回補跑完前，
+    大部分產業都會因為資料不足被濾掉不顯示，體驗上像是「泡泡圖沒蓋到所有族群」。"""
+    assert metric in ("per", "pbr")
+    industry_map = get_industry_map(db_path)
+
+    groups = {}
+    for price in snapshot.values():
+        if price.close is None or price.trading_value is None:
+            continue
+        industry = industry_map.get(price.ticker)
+        if not industry:
+            continue
+        g = groups.setdefault(industry, {"trading_value": 0.0, "ticker_values": {}})
+        g["trading_value"] += price.trading_value
+        g["ticker_values"][price.ticker] = price.trading_value
+
+    total_market_value = sum(g["trading_value"] for g in groups.values())
+
+    min_history_days = max(short_days, long_days // 2)
+    cutoff = (date.today() - timedelta(days=long_days * 3)).isoformat()
+    today_iso = date.today().isoformat()
+
+    conn = _connect(db_path)
+    try:
+        value_rows = conn.execute(
+            """SELECT ticker, date, trading_value FROM daily_prices
+               WHERE date < ? AND date >= ? ORDER BY date DESC""",
+            (today_iso, cutoff),
+        ).fetchall()
+        column = "per" if metric == "per" else "pbr"
+        valuation_rows = conn.execute(
+            f"""SELECT ticker, date, {column} FROM valuation_history
+               WHERE {column} IS NOT NULL ORDER BY date DESC"""
+        ).fetchall()
+    finally:
+        conn.close()
+
+    ticker_value_history = {}
+    for ticker, _day, tv in value_rows:
+        ticker_value_history.setdefault(ticker, []).append(tv or 0.0)
+
+    # valuation_rows 已經是 date DESC，同一檔股票第一次出現的即為目前最新一筆
+    # （若今天已經跑過 record_valuation_snapshot，這筆就是今天的資料）。
+    ticker_latest_valuation = {}
+    for ticker, _day, value in valuation_rows:
+        if ticker not in ticker_latest_valuation:
+            ticker_latest_valuation[ticker] = value
+
+    results = []
+    for industry, g in groups.items():
+        if g["trading_value"] <= 0:
+            continue
+
+        valuation_pairs = []
+        short_sum, long_sum = 0.0, 0.0
+        eligible_count = 0
+        for ticker, tv in g["ticker_values"].items():
+            latest_valuation = ticker_latest_valuation.get(ticker)
+            if latest_valuation is None:
+                continue
+            days = ticker_value_history.get(ticker, [])
+            if len(days) < min_history_days:
+                continue
+
+            short_window = days[:short_days]
+            long_window = days[:long_days]
+            short_sum += sum(short_window) / len(short_window)
+            long_sum += sum(long_window) / len(long_window)
+
+            valuation_pairs.append((latest_valuation, tv))
+            eligible_count += 1
+
+        # 用成交金額加權「中位數」而非加權平均：本益比是比值，少數獲利趨近於零、
+        # 本益比被推到數百甚至數千倍的個股（例如虧損邊緣、稅後淨利極小的公司），
+        # 只要當天成交金額不小，就能把加權平均整個拉爆、跟該產業實際水準脫節；
+        # 中位數不受這種極端值影響，維持「產業裡有代表性水準的那個數字」。
+        latest_valuation_avg = _weighted_median(valuation_pairs)
+        money_flow_ratio = (short_sum / long_sum) if long_sum > 0 else None
+
+        capital_share_pct = (
+            (g["trading_value"] / total_market_value * 100) if total_market_value > 0 else 0.0
+        )
+
+        results.append(
+            IndustryValuationFlow(
+                industry=industry,
+                latest_valuation=latest_valuation_avg,
+                money_flow_ratio=money_flow_ratio,
+                total_trading_value=g["trading_value"],
+                capital_share_pct=capital_share_pct,
+                stock_count=eligible_count,
+            )
+        )
+
+    results.sort(key=lambda r: r.total_trading_value, reverse=True)
+    return results
+
+
 # ---------- 產業成分股（依累積成交金額排序，作為市值代理指標） ----------
 # 本專案沒有股本／發行股數資料（PriceInfo、daily_prices 都只有收盤價、成交量、成交
 # 金額），無法計算真正市值，因此「前N大成分股」改以區間累積成交金額排序，資料來源是
 # 即時 snapshot（今日）＋ daily_prices（歷史），不額外打 API，跟「個股」分頁列清單的
 # 原則一致。
 
-def get_industry_top_stocks_range(db_path, snapshot, industry, days, top_n=30):
+def get_industry_top_stocks_range(db_path, snapshot, industry, days, top_n=30, volume_avg_days=5):
     """回傳某產業前 top_n 大成分股，排序依據是近 days 個交易日（含今日）的
     「累積成交金額」，讓成分股排名跟「資金流向分析」頁（泡泡圖／資金動向清單）的
     資料區間口徑一致。今日成交金額／收盤來自即時 snapshot，
@@ -690,7 +876,16 @@ def get_industry_top_stocks_range(db_path, snapshot, industry, days, top_n=30):
     （today 不在 daily_prices 裡，用 date < today 排除，避免重複計入）。change_pct
     是區間累積漲跌%（區間起點收盤到今日收盤），跟清單「加權漲跌%」欄位定義一致。
     歷史筆數不足 days 天的 ticker 仍會列入、用實際可拿到的筆數計算，不像
-    compute_industry_flow 會整檔排除——這裡只是排序用途，不要求嚴謹的樣本數。"""
+    compute_industry_flow 會整檔排除——這裡只是排序用途，不要求嚴謹的樣本數。
+
+    另外附上近日成交量／均量／本益比，純粹讀既有本地快取（daily_prices、
+    valuation_history），不額外打任何 API：today_volume 取自 snapshot（今日
+    quantity），avg_volume 是近 volume_avg_days 天 daily_prices.volume 的簡單
+    平均（跟 compute_volume_ratio_outliers 同一套算法，天數語意跟排序用的
+    days 無關，固定用 volume_avg_days，沒有歷史資料則為 None）；per 是該股
+    valuation_history 裡「最新一筆」本益比（跟 compute_valuation_flow 同一套
+    取值邏輯：按 date DESC 排序，每檔股票第一次出現的即為最新值），沒有資料
+    則為 None。"""
     industry_map = get_industry_map(db_path)
 
     today_by_ticker = {}
@@ -705,33 +900,54 @@ def get_industry_top_stocks_range(db_path, snapshot, industry, days, top_n=30):
         return []
 
     tickers = list(today_by_ticker)
-    cutoff = (date.today() - timedelta(days=max(days, 1) * 3)).isoformat()
+    today_iso = date.today().isoformat()
+    cutoff = (date.today() - timedelta(days=max(days, volume_avg_days, 1) * 3)).isoformat()
     conn = _connect(db_path)
     try:
         placeholders = ",".join("?" * len(tickers))
         rows = conn.execute(
-            f"""SELECT ticker, date, close, trading_value FROM daily_prices
+            f"""SELECT ticker, date, close, trading_value, volume FROM daily_prices
                WHERE ticker IN ({placeholders}) AND date < ? AND date >= ?
                ORDER BY date DESC""",
-            (*tickers, date.today().isoformat(), cutoff),
+            (*tickers, today_iso, cutoff),
+        ).fetchall()
+        valuation_rows = conn.execute(
+            f"""SELECT ticker, date, per FROM valuation_history
+               WHERE ticker IN ({placeholders}) AND per IS NOT NULL
+               ORDER BY date DESC""",
+            tickers,
         ).fetchall()
     finally:
         conn.close()
 
     ticker_history = {}
-    for ticker, day, close, trading_value in rows:
-        ticker_history.setdefault(ticker, []).append((day, close, trading_value or 0.0))
+    for ticker, day, close, trading_value, volume in rows:
+        ticker_history.setdefault(ticker, []).append(
+            (day, close, trading_value or 0.0, volume or 0)
+        )
+
+    # valuation_rows 已經是 date DESC，同一檔股票第一次出現的即為目前最新一筆
+    # （跟 compute_valuation_flow 同一套取值邏輯）。
+    ticker_latest_per = {}
+    for ticker, _day, per in valuation_rows:
+        if ticker not in ticker_latest_per:
+            ticker_latest_per[ticker] = per
 
     results = []
     for ticker, price in today_by_ticker.items():
-        history = ticker_history.get(ticker, [])[: max(days - 1, 0)]
-        total_trading_value = price.trading_value + sum(v for _, _, v in history)
+        full_history = ticker_history.get(ticker, [])
+        history = full_history[: max(days - 1, 0)]
+        total_trading_value = price.trading_value + sum(v for _, _, v, _ in history)
         baseline_close = history[-1][1] if history else price.close
         change_pct = (
             (price.close - baseline_close) / baseline_close * 100
             if baseline_close
             else None
         )
+
+        volume_history = [v for _, _, _, v in full_history[:volume_avg_days]]
+        avg_volume = sum(volume_history) / len(volume_history) if volume_history else None
+
         results.append(
             {
                 "ticker": ticker,
@@ -739,6 +955,9 @@ def get_industry_top_stocks_range(db_path, snapshot, industry, days, top_n=30):
                 "close": price.close,
                 "change_pct": change_pct,
                 "trading_value": total_trading_value,
+                "today_volume": price.volume,
+                "avg_volume": avg_volume,
+                "per": ticker_latest_per.get(ticker),
             }
         )
 
