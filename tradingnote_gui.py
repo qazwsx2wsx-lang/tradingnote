@@ -4,6 +4,7 @@
 import html
 import queue
 import statistics
+import sys
 import threading
 from collections import Counter
 from datetime import date, datetime
@@ -123,7 +124,15 @@ TAB20_COLORS = [
     "#17becf", "#9edae5",
 ]
 
-FONT_FAMILY = "PingFang TC"
+# 依作業系統選擇內建的繁體中文字型：macOS 用 PingFang TC，Windows 用微軟正黑體
+# （Microsoft JhengHei），其他平台留給 Qt 自行 fallback。字型名稱不存在時 Qt 會
+# 回退到預設字型，不會報錯，但指定正確的系統字型中文才不會變成方框／宋體。
+if sys.platform == "darwin":
+    FONT_FAMILY = "PingFang TC"
+elif sys.platform.startswith("win"):
+    FONT_FAMILY = "Microsoft JhengHei"
+else:
+    FONT_FAMILY = "Noto Sans CJK TC"
 
 STYLESHEET = f"""
 QMainWindow, QWidget {{
@@ -791,12 +800,14 @@ class StockDetailDialog(QtWidgets.QDialog):
 
         self.full_detail_price_chart = pg.PlotWidget()
         self.full_detail_flow_chart = pg.PlotWidget()
+        self.full_detail_institutional_detail_chart = pg.PlotWidget()
         self.full_detail_margin_chart = pg.PlotWidget()
         self.full_detail_vpt_chart = pg.PlotWidget()
         self.full_detail_mfi_chart = pg.PlotWidget()
         for chart in (
             self.full_detail_price_chart,
             self.full_detail_flow_chart,
+            self.full_detail_institutional_detail_chart,
             self.full_detail_margin_chart,
             self.full_detail_vpt_chart,
             self.full_detail_mfi_chart,
@@ -809,6 +820,7 @@ class StockDetailDialog(QtWidgets.QDialog):
         self.full_detail_tabs = QtWidgets.QTabWidget()
         self.full_detail_tabs.addTab(self.full_detail_price_chart, "歷史股價")
         self.full_detail_tabs.addTab(self.full_detail_flow_chart, "三大法人")
+        self.full_detail_tabs.addTab(self.full_detail_institutional_detail_chart, "法人分別")
         self.full_detail_tabs.addTab(self.full_detail_margin_chart, "融資融券")
         self.full_detail_tabs.addTab(self.full_detail_vpt_chart, "VPT")
         self.full_detail_tabs.addTab(self.full_detail_mfi_chart, "MFI")
@@ -837,6 +849,7 @@ class StockDetailDialog(QtWidgets.QDialog):
                 self.full_detail_label,
                 self.full_detail_price_chart,
                 self.full_detail_flow_chart,
+                self.full_detail_institutional_detail_chart,
                 self.full_detail_margin_chart,
                 self.full_detail_vpt_chart,
                 self.full_detail_mfi_chart,
@@ -866,6 +879,7 @@ class StockDetailDialog(QtWidgets.QDialog):
             self.full_detail_label,
             self.full_detail_price_chart,
             self.full_detail_flow_chart,
+            self.full_detail_institutional_detail_chart,
             self.full_detail_margin_chart,
             self.full_detail_vpt_chart,
             self.full_detail_mfi_chart,
@@ -888,6 +902,7 @@ class StockDetailDialog(QtWidgets.QDialog):
                 self.full_detail_label,
                 self.full_detail_price_chart,
                 self.full_detail_flow_chart,
+                self.full_detail_institutional_detail_chart,
                 self.full_detail_margin_chart,
                 self.full_detail_vpt_chart,
                 self.full_detail_mfi_chart,
@@ -1376,6 +1391,61 @@ def _populate_flow_chart(chart, history):
     chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
 
 
+def _populate_institutional_detail_chart(chart, detail_history):
+    """法人分別累計買賣超：跟 _populate_flow_chart（合併三大類）完全同一種畫法
+    ——逐日淨買賣超累加成累計曲線、加一條零軸參考線——但畫的是五個細項各自
+    一條線（外資／外資自營商／投信／自營商(自行)／自營商(避險)，見
+    tradingnote_finmind.INSTITUTIONAL_DETAIL_BUCKETS），讓使用者看得出「哪一
+    類法人在持續進出」而不只是合併後的三大類。detail_history 是
+    fetch_institutional_investors_detailed_history() 的回傳值（也就是
+    fetch_position_detail() 存進 institutional_detail_history 的那份）。"""
+    chart.clear()
+    if detail_history is None or not detail_history["dates"]:
+        return
+
+    dates = detail_history["dates"]
+    x = list(range(len(dates)))
+    step = max(1, len(dates) // 8)
+    chart.getPlotItem().getAxis("bottom").setTicks(
+        [[(i, dates[i]) for i in range(0, len(dates), step)]]
+    )
+
+    detail_colors = {
+        "外資": "#1f77b4",
+        "外資自營商": "#17becf",
+        "投信": "#2ca02c",
+        "自營商(自行)": "#d62728",
+        "自營商(避險)": "#ff7f0e",
+    }
+    all_y = [0]  # 包含 0，讓零軸參考線不會被縮出視野邊界外
+    for label, series in detail_history["series"].items():
+        cumulative = []
+        running_total = 0
+        for net in series:
+            running_total += net
+            cumulative.append(running_total)
+        all_y.extend(cumulative)
+        chart.plot(
+            x,
+            cumulative,
+            pen=pg.mkPen(detail_colors.get(label, COLOR_TEXT), width=2),
+            name=label,
+        )
+
+    chart.addLine(y=0, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
+    chart.setLabel("left", "累計淨買賣超（股）", color=COLOR_TEXT)
+    chart.setTitle(
+        f"法人分別累計買賣超｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt"
+    )
+    _limit_zoom_to_data(chart, x, all_y)
+    # 同 _populate_flow_chart：這張圖可能是 QTabWidget 裡目前沒被切到的隱藏分頁，
+    # enableAutoRange() 算出來的範圍不可靠，改用算好的資料範圍直接 setRange。
+    y_lo, y_hi = min(all_y), max(all_y)
+    y_pad = max((y_hi - y_lo) * 0.1, 1.0)
+    chart.setXRange(min(x), max(x), padding=0.02)
+    chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
+
+
 def _populate_margin_chart(chart, margin_history):
     """融資融券餘額趨勢圖：跟 _populate_flow_chart 不同，這裡的資料本來就是
     「餘額」（TodayBalance），不是逐日買賣超流量，所以直接畫原始值，不能再
@@ -1468,10 +1538,19 @@ def _populate_mfi_chart(chart, vpt_mfi_history):
 
 
 def _render_detail_block(
-    label, price_chart, flow_chart, margin_chart, vpt_chart, mfi_chart, header, data, note=None
+    label,
+    price_chart,
+    flow_chart,
+    institutional_detail_chart,
+    margin_chart,
+    vpt_chart,
+    mfi_chart,
+    header,
+    data,
+    note=None,
 ):
-    """畫「個股籌碼面詳細資訊」文字摘要＋五張趨勢圖（歷史股價／三大法人／
-    融資融券／VPT／MFI）。data 是 fetch_position_detail() 的回傳值（不管是剛
+    """畫「個股籌碼面詳細資訊」文字摘要＋六張趨勢圖（歷史股價／三大法人／
+    法人分別／融資融券／VPT／MFI）。data 是 fetch_position_detail() 的回傳值（不管是剛
     查到的，還是 position_detail_cache.json 讀出來的上次結果，shape 都相同，見
     tradingnote_finmind.POSITION_DETAIL_FIELDS）；「部位紀錄」頁跟「個股」頁的
     StockDetailDialog 共用這份畫面邏輯，畫在各自傳入的 label／圖表 widget 上。
@@ -1549,6 +1628,9 @@ def _render_detail_block(
     label.setText("\n".join(lines))
     _populate_price_chart(price_chart, data.get("price_history"))
     _populate_flow_chart(flow_chart, history)
+    _populate_institutional_detail_chart(
+        institutional_detail_chart, data.get("institutional_detail_history")
+    )
     _populate_margin_chart(margin_chart, margin_history)
     _populate_vpt_chart(vpt_chart, data.get("vpt_mfi_history"))
     _populate_mfi_chart(mfi_chart, data.get("vpt_mfi_history"))
@@ -2194,17 +2276,17 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         即時顯示，見 self._ticker_concept_map／get_industry_map）＋ FinMind
         本益比／殖利率／三大法人買賣超／融資融券餘額／外資持股／借券／停資停券
         （背景查詢，見 _load_position_detail）。跟「個股」頁的 StockDetailDialog
-        不同，這裡不彈窗，直接嵌在部位紀錄頁裡。文字摘要固定顯示在上方，五張
+        不同，這裡不彈窗，直接嵌在部位紀錄頁裡。文字摘要固定顯示在上方，六張
         圖表用 QTabWidget 分頁選單切換（跟 StockDetailDialog._build_full_detail_widgets
-        同一招），一次只顯示一張，不用像以前那樣把五張圖疊起來捲動瀏覽。"""
+        同一招），一次只顯示一張，不用像以前那樣把圖疊起來捲動瀏覽。"""
         container = QtWidgets.QWidget()
         outer_layout = QtWidgets.QVBoxLayout(container)
         outer_layout.setContentsMargins(0, 10, 0, 0)
 
         header = QtWidgets.QLabel(
             "個股詳細資訊（選取上方部位查看，含 FinMind 歷史股價、三大法人120日"
-            "資金流向、融資融券餘額、外資持股、借券與停資停券、VPT 量價趨勢、"
-            "MFI 資金流量）"
+            "資金流向、法人分別（五細項）累計買賣超、融資融券餘額、外資持股、"
+            "借券與停資停券、VPT 量價趨勢、MFI 資金流量）"
         )
         header.setProperty("header", True)
         outer_layout.addWidget(header)
@@ -2216,12 +2298,14 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
         self.position_price_chart = pg.PlotWidget()
         self.position_flow_chart = pg.PlotWidget()
+        self.position_institutional_detail_chart = pg.PlotWidget()
         self.position_margin_chart = pg.PlotWidget()
         self.position_vpt_chart = pg.PlotWidget()
         self.position_mfi_chart = pg.PlotWidget()
         for chart in (
             self.position_price_chart,
             self.position_flow_chart,
+            self.position_institutional_detail_chart,
             self.position_margin_chart,
             self.position_vpt_chart,
             self.position_mfi_chart,
@@ -2234,6 +2318,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         position_detail_tabs = QtWidgets.QTabWidget()
         position_detail_tabs.addTab(self.position_price_chart, "歷史股價")
         position_detail_tabs.addTab(self.position_flow_chart, "三大法人")
+        position_detail_tabs.addTab(self.position_institutional_detail_chart, "法人分別")
         position_detail_tabs.addTab(self.position_margin_chart, "融資融券")
         position_detail_tabs.addTab(self.position_vpt_chart, "VPT")
         position_detail_tabs.addTab(self.position_mfi_chart, "MFI")
@@ -2314,6 +2399,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self.position_detail_label.setText("尚未選取部位。")
             self.position_price_chart.clear()
             self.position_flow_chart.clear()
+            self.position_institutional_detail_chart.clear()
             self.position_margin_chart.clear()
             self.position_vpt_chart.clear()
             self.position_mfi_chart.clear()
@@ -2344,6 +2430,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self.position_detail_label.setText(f"{header}\n\nFinMind 查詢中...")
             self.position_price_chart.clear()
             self.position_flow_chart.clear()
+            self.position_institutional_detail_chart.clear()
             self.position_margin_chart.clear()
             self.position_vpt_chart.clear()
             self.position_mfi_chart.clear()
@@ -2381,6 +2468,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self.position_detail_label,
             self.position_price_chart,
             self.position_flow_chart,
+            self.position_institutional_detail_chart,
             self.position_margin_chart,
             self.position_vpt_chart,
             self.position_mfi_chart,
@@ -2410,6 +2498,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         )
         self.position_price_chart.clear()
         self.position_flow_chart.clear()
+        self.position_institutional_detail_chart.clear()
         self.position_margin_chart.clear()
         self.position_vpt_chart.clear()
         self.position_mfi_chart.clear()

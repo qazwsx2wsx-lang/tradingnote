@@ -76,6 +76,19 @@ INSTITUTIONAL_BUCKETS = [
     ("自營商", ("Dealer_self", "Dealer_Hedging", "Dealer")),
 ]
 
+# 「法人分別」五細項（不合併成三大類），給 fetch_institutional_investors_detailed_history
+# 的120日累積折線用：外資、外資自營商、投信、自營商(自行)、自營商(避險)各自一條線，
+# 跟上面 INSTITUTIONAL_BUCKETS（合併成三大類）是同一份資料的兩種呈現粒度。舊制的
+# 合併代碼 "Dealer" 不納入——近年 FinMind 資料都已拆成自行/避險兩碼；真的遇到只有
+# 舊代碼的日期，那天的兩個自營商細項會是 0，屬可接受的邊角情況。
+INSTITUTIONAL_DETAIL_BUCKETS = [
+    ("外資", ("Foreign_Investor",)),
+    ("外資自營商", ("Foreign_Dealer_Self",)),
+    ("投信", ("Investment_Trust",)),
+    ("自營商(自行)", ("Dealer_self",)),
+    ("自營商(避險)", ("Dealer_Hedging",)),
+]
+
 # 每次打 FinMind API 的時間戳記，給「個股」／「AI 助理」頁顯示用量統計；
 # 只存在記憶體中，重啟程式會歸零，不代表 FinMind 帳號其他來源的真實用量。
 _call_timestamps = []
@@ -389,6 +402,46 @@ def fetch_institutional_investors_history(ticker, token, lookback_days=120):
     return {"dates": dates, "series": series}
 
 
+def fetch_institutional_investors_detailed_history(ticker, token, lookback_days=120):
+    """跟 fetch_institutional_investors_history 相同的資料來源／區間，但不把
+    五細項合併成三大類，而是外資／外資自營商／投信／自營商(自行)／自營商(避險)
+    各自一條逐日淨買賣超序列（見 INSTITUTIONAL_DETAIL_BUCKETS），供「部位紀錄」
+    頁與「個股」頁的「法人分別」120日累積折線圖用。
+
+    走 _fetch_dataset 同一套快取、lookback_days 預設 120 也跟
+    fetch_institutional_investors_history 一致，所以同一檔股票的「三大類趨勢」
+    與「法人分別」會命中同一筆快取、只實際打一次 FinMind API，不會因為多這張
+    圖就多燒一次額度。
+
+    回傳 {"dates": [...], "series": {label: [每日淨買賣超(股), ...], ...}}，
+    dates 由舊到新，series 是逐日淨買賣超（買-賣，未累積；累積由 GUI 繪圖端
+    計算，跟既有三大類趨勢圖 _populate_flow_chart 同一種畫法）；查無資料回傳
+    None。"""
+    rows = _fetch_dataset(
+        "TaiwanStockInstitutionalInvestorsBuySell", ticker, token, lookback_days
+    )
+    if not rows:
+        return None
+
+    by_date = {}
+    for row in rows:
+        by_date.setdefault(row["date"], {})[row["name"]] = row
+
+    dates = sorted(by_date)
+    series = {label: [] for label, _names in INSTITUTIONAL_DETAIL_BUCKETS}
+    for d in dates:
+        day_rows = by_date[d]
+        for label, names in INSTITUTIONAL_DETAIL_BUCKETS:
+            net = 0
+            for name in names:
+                row = day_rows.get(name)
+                if row is not None:
+                    net += (row.get("buy") or 0) - (row.get("sell") or 0)
+            series[label].append(net)
+
+    return {"dates": dates, "series": series}
+
+
 # ---------- 「部位紀錄」頁個股詳細資訊：一次抓齊六項＋永久存檔 ----------
 
 # fetch_position_detail() 回傳 dict 的固定欄位順序，跟 GUI 顯示順序一致；
@@ -399,6 +452,7 @@ POSITION_DETAIL_FIELDS = (
     "valuation",
     "price_history",
     "institutional_history",
+    "institutional_detail_history",
     "margin_history",
     "foreign_shareholding",
     "lending",
@@ -408,9 +462,10 @@ POSITION_DETAIL_FIELDS = (
 
 
 def fetch_position_detail(ticker, token, market=None):
-    """一次抓齊「部位紀錄」頁個股詳細資訊區塊要顯示的八項資料（本益比／殖利率／
-    股價淨值比、歷史股價、三大法人120日趨勢、融資融券120日趨勢、外資持股比例、
-    借券成交、停資停券公告、VPT／MFI量價指標），回傳 dict（key 見
+    """一次抓齊「部位紀錄」頁個股詳細資訊區塊要顯示的九項資料（本益比／殖利率／
+    股價淨值比、歷史股價、三大法人120日趨勢、法人分別（五細項）120日趨勢、
+    融資融券120日趨勢、外資持股比例、借券成交、停資停券公告、VPT／MFI量價
+    指標），回傳 dict（key 見
     POSITION_DETAIL_FIELDS）。每項各自沿用原本的 _dataset_cache（30分鐘行程內
     快取，擋短時間內重複查詢），呼叫端（tradingnote_gui._load_position_detail）
     另外會把整份結果存進 position_detail_cache.json 永久保存（見
@@ -425,6 +480,9 @@ def fetch_position_detail(ticker, token, market=None):
         "valuation": fetch_valuation(ticker, token, market=market),
         "price_history": fetch_stock_price_history(ticker, token, lookback_days=120),
         "institutional_history": fetch_institutional_investors_history(
+            ticker, token, lookback_days=120
+        ),
+        "institutional_detail_history": fetch_institutional_investors_detailed_history(
             ticker, token, lookback_days=120
         ),
         "margin_history": fetch_margin_short_sale_history(ticker, token, lookback_days=120),
