@@ -125,6 +125,30 @@ def _connect(db_path):
         "CREATE INDEX IF NOT EXISTS idx_valuation_history_ticker_date "
         "ON valuation_history (ticker, date DESC)"
     )
+    # 期貨大額交易人未沖銷部位逐日歷史（backfill_large_traders_history，資料來源是
+    # TAIFEX 網站的歷史 CSV 下載端點，見 tradingnote_taifex.py）。contract 是大額
+    # 端點自己的契約代碼（TX／CD／BRF…，股票期貨去尾 F），settlement_month 的
+    # 999999＝所有契約合計，trader_type 0＝所有交易人、1＝特定法人。供「期貨」頁
+    # 選取某商品時畫前10大未沖銷部位趨勢圖用。
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS large_traders_history (
+            date TEXT NOT NULL,
+            contract TEXT NOT NULL,
+            settlement_month TEXT NOT NULL,
+            trader_type TEXT NOT NULL,
+            contract_name TEXT,
+            top5_buy INTEGER,
+            top5_sell INTEGER,
+            top10_buy INTEGER,
+            top10_sell INTEGER,
+            market_oi INTEGER,
+            PRIMARY KEY (date, contract, settlement_month, trader_type)
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_large_traders_history_contract_date "
+        "ON large_traders_history (contract, settlement_month, trader_type, date)"
+    )
     conn.commit()
     return conn
 
@@ -183,6 +207,71 @@ def upsert_daily_prices(db_path, rows):
             rows,
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def upsert_large_traders_history(db_path, rows):
+    """寫入一批 (date, contract, settlement_month, trader_type, contract_name,
+    top5_buy, top5_sell, top10_buy, top10_sell, market_oi) tuple 到
+    large_traders_history（INSERT OR REPLACE，以 (date, contract, settlement_month,
+    trader_type) 為主鍵，重複回補同一天同一契約會覆蓋而非重複）。rows 為空時直接
+    return，不開連線。"""
+    if not rows:
+        return
+    conn = _connect(db_path)
+    try:
+        conn.executemany(
+            """INSERT OR REPLACE INTO large_traders_history
+               (date, contract, settlement_month, trader_type, contract_name,
+                top5_buy, top5_sell, top10_buy, top10_sell, market_oi)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_large_traders_history_date_range(db_path):
+    """回傳 large_traders_history 目前已存的最早／最新日期（ISO 字串）
+    (min_date, max_date)；整張表還沒有任何資料時回傳 (None, None)。給
+    backfill_large_traders_history 判斷還缺哪段日期用。"""
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT MIN(date), MAX(date) FROM large_traders_history"
+        ).fetchone()
+        return (row[0], row[1]) if row else (None, None)
+    finally:
+        conn.close()
+
+
+def get_large_traders_history_series(db_path, contract, settlement_month, trader_type):
+    """回傳某契約某到期月別（settlement_month，999999＝所有契約合計）某交易人類別
+    （trader_type，'0'＝所有交易人、'1'＝特定法人）的逐日大額未沖銷部位序列，
+    依日期由舊到新排序：[{"date":, "top5_buy":, "top5_sell":, "top10_buy":,
+    "top10_sell":, "market_oi":}, ...]。給「期貨」頁趨勢圖用；查無資料回傳空清單。"""
+    conn = _connect(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT date, top5_buy, top5_sell, top10_buy, top10_sell, market_oi "
+            "FROM large_traders_history "
+            "WHERE contract = ? AND settlement_month = ? AND trader_type = ? "
+            "ORDER BY date",
+            (contract, settlement_month, trader_type),
+        )
+        return [
+            {
+                "date": d,
+                "top5_buy": t5b,
+                "top5_sell": t5s,
+                "top10_buy": t10b,
+                "top10_sell": t10s,
+                "market_oi": moi,
+            }
+            for d, t5b, t5s, t10b, t10s, moi in cur.fetchall()
+        ]
     finally:
         conn.close()
 

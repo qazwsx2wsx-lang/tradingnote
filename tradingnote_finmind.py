@@ -14,12 +14,25 @@ CLI／GUI 都可以各自 import。「個股」模組使用者雙擊個股、跟
 本模組另外查詢融資融券餘額（TaiwanStockMarginPurchaseShortSale）、外資持股比例
 （TaiwanStockShareholding）、借券成交（TaiwanStockSecuritiesLending）、停資停券
 公告（TaiwanStockMarginShortSaleSuspension），供「部位紀錄」頁籌碼面資訊使用，
-一樣不分市場一律查 FinMind（沒有對應的 TPEX 官方端點）。故意不查的兩個資料集：
+一樣不分市場一律查 FinMind（沒有對應的 TPEX 官方端點）。故意不查的資料集：
 ①TaiwanStockHoldingSharesPer（股權分散表/大戶持股）——實測需要 FinMind 付費
 Sponsor 方案，免費 token 回 HTTP 400「Your level is register. Please update
-your user level.」，拿不到資料；②TaiwanDailyShortSaleBalances——欄位
-（SBLShortSales*／MarginShortSales*）跟 TaiwanStockMarginPurchaseShortSale 的
-ShortSale* 系列大量重複，多打一次 API 換不到多少新資訊，不值得。
+your user level.」，拿不到資料。
+
+②TaiwanDailyShortSaleBalances 原本整組都沒查（見舊版本此處註解：「欄位跟
+TaiwanStockMarginPurchaseShortSale 的 ShortSale* 系列大量重複，不值得」），
+後來使用者要「借券餘額」才發現判斷太粗——這個資料集其實是兩組不同性質的
+欄位混在一起：MarginShortSales*（融券）數字經比對後確實跟既有
+ShortSaleTodayBalance 只是單位不同（股 vs 張，數值上就是同一件事，故意繼續
+不查這半），但 SBLShortSales*（借券賣出）是完全不同的另一個信用交易管道
+（證券商辦理有價證券借貸），沒有其他免費來源可以拿到，見
+fetch_short_sale_balance()。
+
+③「融資成本」「融資維持率」查遍 FinMind 與 TWSE OpenAPI（143 個端點）都沒有
+逐股公開發布的欄位——這兩個是「融資帳戶」層級的私有資訊，交易所不會公開。
+融資成本改用 fetch_margin_cost_estimate() 從歷史融資買賣量反推的近似值（明確
+標示為估算）；融資維持率因為還需要「該股融資成數」（逐股不同、查無來源），
+無法算出可信的數字，經使用者確認後不做。
 
 `backfill_tpex_history_via_finmind()` 用 TaiwanStockPrice 資料集補上 TPEX
 （上櫃）沒有官方免費歷史端點的缺口（見 tradingnote_history.py「TWSE 歷史回補」
@@ -207,6 +220,74 @@ def fetch_margin_short_sale_history(ticker, token, lookback_days=120):
             - (latest.get("ShortSaleYesterdayBalance") or 0),
         },
     }
+
+
+def fetch_short_sale_balance(ticker, token, lookback_days=10):
+    """回傳最新交易日「借券賣出餘額」：{"date":, "balance":, "change":}。
+    資料來源 TaiwanDailyShortSaleBalances 的 SBLShortSalesCurrentDayBalance
+    （單位：股，不是張）——這是證券商辦理「有價證券借貸」讓人借去放空的餘額，
+    跟融資融券（fetch_margin_short_sale_history 的「融券餘額」）是兩個不同的
+    信用交易管道，數字不重複（該資料集另一半 MarginShortSales* 才是跟融券餘額
+    重複的部分，故意不查，見本模組開頭 docstring）。change 是跟前一日餘額比較
+    的變化（股）；查無資料回傳 None。"""
+    rows = _fetch_dataset("TaiwanDailyShortSaleBalances", ticker, token, lookback_days)
+    if not rows:
+        return None
+
+    latest = max(rows, key=lambda r: r["date"])
+    balance = latest.get("SBLShortSalesCurrentDayBalance")
+    if balance is None:
+        return None
+    previous = latest.get("SBLShortSalesPreviousDayBalance") or 0
+    return {"date": latest["date"], "balance": balance, "change": balance - previous}
+
+
+def fetch_margin_cost_estimate(ticker, token, margin_lookback_days=120, price_lookback_days=150):
+    """估算目前融資餘額的加權平均成本（使用者要的「融資價格」）。
+
+    交易所不會公開逐股融資成本（帳戶層級私有資訊），這裡用「移動加權平均法」
+    從歷史融資餘額變化反推近似值：融資餘額比前一天增加時，把當天收盤價併入
+    加權平均成本；減少時（賣出或現金償還）維持原加權平均成本不變（會計上
+    移動加權平均法的標準慣例——賣出不影響剩餘部位的單位成本）。第一筆資料
+    當天已有的既存餘額，會直接假設是當天收盤價買進（起點近似），所以
+    margin_lookback_days 內週轉率越高估算越準；長期没变动、起点前就存在的
+    舊部位，用短窗口會失真。回傳值務必在畫面上標示「估算」，不是券商公告的
+    真實成本。
+
+    margin_lookback_days／price_lookback_days 故意跟既有函式
+    （fetch_margin_short_sale_history 預設 120、fetch_vpt_mfi_history 預設 150）
+    採用同一預設值，讓 fetch_position_detail 一次呼叫時能命中同一份
+    _fetch_dataset 快取，不會為了這個新欄位多打 API。
+
+    回傳 {"date":, "cost":, "balance":}（date/balance 是最新一筆融資餘額
+    對應的日期／股數，cost 是估算成本，單位同收盤價）；融資或價格任一查無
+    資料、或融資餘額全程為 0，回傳 None。"""
+    margin_rows = _fetch_dataset(
+        "TaiwanStockMarginPurchaseShortSale", ticker, token, margin_lookback_days
+    )
+    price_rows = _fetch_dataset("TaiwanStockPrice", ticker, token, price_lookback_days)
+    if not margin_rows or not price_rows:
+        return None
+
+    margin_rows = sorted(margin_rows, key=lambda r: r["date"])
+    close_by_date = {
+        r["date"]: r["close"] for r in price_rows if r.get("close") is not None
+    }
+
+    avg_cost = None
+    balance = 0
+    for row in margin_rows:
+        new_balance = row.get("MarginPurchaseTodayBalance") or 0
+        net_buy = new_balance - balance
+        close = close_by_date.get(row["date"])
+        if net_buy > 0 and close is not None and new_balance:
+            prior_value = (avg_cost if avg_cost is not None else close) * balance
+            avg_cost = (prior_value + net_buy * close) / new_balance
+        balance = new_balance
+
+    if avg_cost is None or balance <= 0:
+        return None
+    return {"date": margin_rows[-1]["date"], "cost": avg_cost, "balance": balance}
 
 
 def fetch_vpt_mfi_history(ticker, token, lookback_days=150, mfi_period=14):
@@ -458,14 +539,16 @@ POSITION_DETAIL_FIELDS = (
     "lending",
     "suspension",
     "vpt_mfi_history",
+    "sbl_short_balance",
+    "margin_cost_estimate",
 )
 
 
 def fetch_position_detail(ticker, token, market=None):
-    """一次抓齊「部位紀錄」頁個股詳細資訊區塊要顯示的九項資料（本益比／殖利率／
+    """一次抓齊「部位紀錄」頁個股詳細資訊區塊要顯示的十一項資料（本益比／殖利率／
     股價淨值比、歷史股價、三大法人120日趨勢、法人分別（五細項）120日趨勢、
     融資融券120日趨勢、外資持股比例、借券成交、停資停券公告、VPT／MFI量價
-    指標），回傳 dict（key 見
+    指標、借券賣出餘額、融資成本估算），回傳 dict（key 見
     POSITION_DETAIL_FIELDS）。每項各自沿用原本的 _dataset_cache（30分鐘行程內
     快取，擋短時間內重複查詢），呼叫端（tradingnote_gui._load_position_detail）
     另外會把整份結果存進 position_detail_cache.json 永久保存（見
@@ -475,7 +558,9 @@ def fetch_position_detail(ticker, token, market=None):
     price_history 沿用既有的 fetch_stock_price_history()（原本是給 TPEX 歷史
     回補用），這裡拿來畫「歷史股價」趨勢圖；lookback_days=120 跟三大法人／
     融資融券兩張趨勢圖用同一個窗口（日曆天），三張圖時間軸大致對得上，方便
-    互相比對。"""
+    互相比對。margin_cost_estimate 的 lookback_days 故意跟 margin_history／
+    vpt_mfi_history 用同一預設值（120／150），命中同一份 _fetch_dataset 快取，
+    不會為了新增這兩項多打 API（見 fetch_margin_cost_estimate docstring）。"""
     return {
         "valuation": fetch_valuation(ticker, token, market=market),
         "price_history": fetch_stock_price_history(ticker, token, lookback_days=120),
@@ -490,6 +575,8 @@ def fetch_position_detail(ticker, token, market=None):
         "lending": fetch_securities_lending_summary(ticker, token),
         "suspension": fetch_margin_short_sale_suspension(ticker, token),
         "vpt_mfi_history": fetch_vpt_mfi_history(ticker, token),
+        "sbl_short_balance": fetch_short_sale_balance(ticker, token),
+        "margin_cost_estimate": fetch_margin_cost_estimate(ticker, token),
     }
 
 

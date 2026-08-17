@@ -43,6 +43,7 @@ from tradingnote_history import (
     get_industry_directory,
     get_industry_map,
     get_industry_top_stocks_range,
+    get_large_traders_history_series,
     get_latest_ticker_record,
     record_snapshot,
     record_valuation_snapshot,
@@ -61,8 +62,17 @@ from tradingnote_finmind import (
 from tradingnote_concepts import build_ticker_concept_map, load_concepts
 from tradingnote_taifex import (
     DEFAULT_FUTURES_PRODUCTS,
+    LARGE_TRADERS_ALL_CONTRACTS_MONTH,
+    LARGE_TRADERS_HISTORY_ALL_CONTRACTS_MONTH,
+    backfill_large_traders_history,
+    build_large_traders_name_map,
+    build_ssf_map,
     get_cached_daily_futures_report,
+    get_cached_large_traders_futures_report,
+    get_cached_ssf_list,
     get_futures_snapshot,
+    group_large_traders_all,
+    large_traders_code_for_product,
     list_all_products,
 )
 from tradingnote_ai_agent import GEMINI_RPM_HINT, run_agent_turn
@@ -73,6 +83,8 @@ DATA_DIR = Path(__file__).parent / "data"
 POSITIONS_PATH = DATA_DIR / "positions.json"
 CACHE_PATH = DATA_DIR / "price_cache.json"
 FUTURES_CACHE_PATH = DATA_DIR / "futures_cache.json"
+FUTURES_LARGE_TRADERS_CACHE_PATH = DATA_DIR / "futures_large_traders_cache.json"
+FUTURES_SSF_CACHE_PATH = DATA_DIR / "futures_ssf_cache.json"
 POSITION_DETAIL_CACHE_PATH = DATA_DIR / "position_detail_cache.json"
 HISTORY_DB_PATH = DATA_DIR / "history.db"
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -254,6 +266,28 @@ def accent_button(text, slot=None):
     return btn
 
 
+def _screen_fit_size(widget, preferred_width=None, preferred_height=None, ratio=0.85):
+    """算出 widget 開啟時的合理尺寸，讓視窗／對話框自動符合目前螢幕大小，不會
+    在小螢幕（筆電、遠端桌面）上比可視範圍還大而被裁到看不見。有給
+    preferred_width/height（對話框習慣的偏好尺寸）時取「偏好尺寸」與「螢幕可用
+    工作區 * ratio」兩者較小值；沒給（例如主視窗）就直接用比例本身，讓尺寸隨
+    螢幕大小等比縮放，大螢幕也能用到更多畫面。"""
+    screen = widget.screen() or QtWidgets.QApplication.primaryScreen()
+    avail = screen.availableGeometry()
+    max_w = int(avail.width() * ratio)
+    max_h = int(avail.height() * ratio)
+    width = max_w if preferred_width is None else min(preferred_width, max_w)
+    height = max_h if preferred_height is None else min(preferred_height, max_h)
+    return width, height
+
+
+def _center_on_screen(widget):
+    screen = widget.screen() or QtWidgets.QApplication.primaryScreen()
+    frame = widget.frameGeometry()
+    frame.moveCenter(screen.availableGeometry().center())
+    widget.move(frame.topLeft())
+
+
 def _snapshot_date(snapshot):
     """回傳快照裡最多股票共用的交易日（多數 PriceInfo.date 會是同一天，用眾數
     避免少數個股資料延遲／異常日期影響判斷）；快照是空的就回傳 None。"""
@@ -277,6 +311,25 @@ def _futures_snapshot_date(futures_snapshot):
         return None
     raw = max(dates)
     return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}"
+
+
+def _futures_date_to_iso(raw):
+    """TAIFEX 原始日期欄位 "YYYYMMDD" → "YYYY-MM-DD"；格式不符或空值回傳空字串。"""
+    if raw and len(raw) == 8 and raw.isdigit():
+        return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}"
+    return ""
+
+
+def _format_settlement_month(month):
+    """大額交易人未沖銷部位的 SettlementMonth 顯示文字：999912（TAIFEX 用來表示
+    「所有契約合計」）轉成「所有契約」；正常的 6 碼西元年月轉成 "YYYY/MM"；
+    其他非標準代碼（例如 TX 偶爾出現、全市場未沖銷僅 1 口的 666666 佔位資料）
+    原樣顯示，不臆測其語意。"""
+    if month == LARGE_TRADERS_ALL_CONTRACTS_MONTH:
+        return "所有契約"
+    if month and len(month) == 6 and month.isdigit() and "01" <= month[4:6] <= "12":
+        return f"{month[0:4]}/{month[4:6]}"
+    return month or "-"
 
 
 _MARKET_LABELS = {"TWSE": "上市 TWSE", "TPEX": "上櫃 TPEX"}
@@ -593,6 +646,7 @@ class PositionFormDialog(QtWidgets.QDialog):
 
     def __init__(self, parent, on_submit, position=None):
         super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowMaximizeButtonHint)
         self.setWindowTitle("編輯部位" if position is not None else "新增部位")
         self.on_submit = on_submit
 
@@ -657,6 +711,7 @@ class PositionFormDialog(QtWidgets.QDialog):
 class PriceLookupDialog(QtWidgets.QDialog):
     def __init__(self, parent, snapshot):
         super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowMaximizeButtonHint)
         self.setWindowTitle("查價")
         self.snapshot = snapshot
 
@@ -717,6 +772,7 @@ class StockDetailDialog(QtWidgets.QDialog):
 
     def __init__(self, parent, ticker, name, finmind_token, market=None):
         super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowMaximizeButtonHint)
         self.ticker = ticker
         self.name = name
         self.finmind_token = finmind_token
@@ -829,8 +885,10 @@ class StockDetailDialog(QtWidgets.QDialog):
         self._layout.insertWidget(insert_at, self.full_detail_label)
         self._layout.insertWidget(insert_at + 1, self.full_detail_tabs)
         self._full_detail_widgets_built = True
-        self.setMinimumSize(640, 300)
-        self.resize(700, 620)
+        width, height = _screen_fit_size(self, preferred_width=700, preferred_height=620, ratio=0.9)
+        self.setMinimumSize(min(640, width), min(300, height))
+        self.resize(width, height)
+        _center_on_screen(self)
 
     def _on_show_full_detail(self):
         if not self._full_detail_widgets_built:
@@ -930,6 +988,7 @@ class IndustryTopStocksDialog(QtWidgets.QDialog):
 
     def __init__(self, parent, industry, top_stocks, days):
         super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowMaximizeButtonHint)
         self.setWindowTitle(f"{industry}　近 {days} 日成交金額前 {len(top_stocks)} 大成分股")
         self.setMinimumWidth(420)
 
@@ -977,17 +1036,176 @@ class IndustryTopStocksDialog(QtWidgets.QDialog):
                     item.setForeground(QtGui.QColor(color))
                 table.setItem(row, col, item)
         table.resizeColumnsToContents()
-        table.setFixedHeight(min(760, 36 + table.rowCount() * 30))
+        _, height_cap = _screen_fit_size(self, preferred_height=760, ratio=0.8)
+        table.setFixedHeight(min(height_cap, 36 + table.rowCount() * 30))
         layout.addWidget(table)
 
         close_btn = QtWidgets.QPushButton("關閉")
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn, alignment=QtCore.Qt.AlignRight)
+        _center_on_screen(self)
+
+
+# 「大額交易人未沖銷部位」明細表欄位——「期貨」頁下方常駐面板（_build_futures_lt_panel）
+# 與雙擊彈窗（FuturesLargeTradersDialog）共用同一組欄位與同一份填表邏輯
+# （_populate_large_traders_table）。
+LARGE_TRADERS_TABLE_COLUMNS = [
+    "到期月份", "交易人類別", "前5大買", "前5大賣", "前10大買", "前10大賣",
+    "前10大淨", "前10大買佔比", "全市場未沖銷",
+]
+
+
+def _populate_large_traders_table(table, groups):
+    """把某商品的大額交易人未沖銷部位（get_large_traders_for_product 的回傳
+    groups）填進 table（欄位須為 LARGE_TRADERS_TABLE_COLUMNS）。每個到期月份最多
+    兩列（所有交易人／特定法人）。前10大淨＝前10大買－賣，正綠負紅；前10大買佔比
+    ＝前10大買 ÷ 全市場未沖銷。回傳實際畫出的列數（0＝查無資料）。"""
+    display_rows = []
+    for group in groups:
+        for label in ("所有交易人", "特定法人"):
+            entry = group["by_type"].get(label)
+            if entry is not None:
+                display_rows.append((group, label, entry))
+
+    table.setRowCount(len(display_rows))
+    for row, (group, label, entry) in enumerate(display_rows):
+        top10_net = (entry["top10_buy"] or 0) - (entry["top10_sell"] or 0)
+        market_oi = entry["market_oi"]
+        buy_share = (
+            f"{(entry['top10_buy'] or 0) / market_oi * 100:.1f}%" if market_oi else "-"
+        )
+        values = [
+            _format_settlement_month(group["settlement_month"]),
+            label,
+            f"{entry['top5_buy']:,}" if entry["top5_buy"] is not None else "-",
+            f"{entry['top5_sell']:,}" if entry["top5_sell"] is not None else "-",
+            f"{entry['top10_buy']:,}" if entry["top10_buy"] is not None else "-",
+            f"{entry['top10_sell']:,}" if entry["top10_sell"] is not None else "-",
+            f"{top10_net:+,}",
+            buy_share,
+            f"{market_oi:,}" if market_oi is not None else "-",
+        ]
+        for col, value in enumerate(values):
+            item = QtWidgets.QTableWidgetItem(value)
+            if col != 1:
+                item.setTextAlignment(QtCore.Qt.AlignCenter)
+            if col == 6:  # 前10大淨：正綠負紅
+                item.setForeground(QtGui.QColor(COLOR_GAIN if top10_net >= 0 else COLOR_LOSS))
+            table.setItem(row, col, item)
+    return len(display_rows)
+
+
+def _large_traders_summary_entry(groups, contract_month):
+    """從某商品的大額交易人分組挑一筆代表值給「期貨」頁主表格的摘要欄用：優先取
+    到期月份等於近月合約（contract_month）的那組，其次取「所有契約合計」，再不然
+    第一組；回傳該組的「所有交易人」entry（沒有就 None）。"""
+    if not groups:
+        return None
+    chosen = next((g for g in groups if g["settlement_month"] == contract_month), None)
+    if chosen is None:
+        chosen = next((g for g in groups if g["is_all_contracts"]), None)
+    if chosen is None:
+        chosen = groups[0]
+    return chosen["by_type"].get("所有交易人")
+
+
+def _populate_large_traders_trend(chart, series):
+    """畫某商品「所有契約合計・所有交易人」前10大買方／賣方未沖銷部位的逐日趨勢
+    （兩條線，跟 _populate_margin_chart 一樣直接畫原始「部位數（口）」、不累加）。
+    series 是 tradingnote_history.get_large_traders_history_series 的回傳（歷史由
+    背景回補累積，見 backfill_large_traders_history）；空的就清空圖並提示。
+    以「所有契約合計」為序列而非近月，是因為近月合約每月換倉會造成序列斷點，
+    所有契約合計才連續。"""
+    chart.clear()
+    if not series:
+        chart.setTitle(
+            "大額交易人未沖銷部位趨勢（尚無歷史：背景回補中，或本商品無此統計）",
+            color=COLOR_TEXT,
+            size="10pt",
+        )
+        return
+
+    dates = [r["date"] for r in series]
+    x = list(range(len(dates)))
+    step = max(1, len(dates) // 8)
+    chart.getPlotItem().getAxis("bottom").setTicks(
+        [[(i, dates[i]) for i in range(0, len(dates), step)]]
+    )
+
+    buy = [r["top10_buy"] or 0 for r in series]
+    sell = [r["top10_sell"] or 0 for r in series]
+    chart.plot(x, buy, pen=pg.mkPen("#1f77b4", width=2), name="前10大買方")
+    chart.plot(x, sell, pen=pg.mkPen("#ff7f0e", width=2), name="前10大賣方")
+    chart.setLabel("left", "未沖銷部位（口）", color=COLOR_TEXT)
+    chart.setTitle(
+        f"前10大交易人未沖銷部位趨勢（所有契約·所有交易人）｜近 {len(dates)} 日",
+        color=COLOR_TEXT,
+        size="10pt",
+    )
+    all_y = buy + sell
+    _limit_zoom_to_data(chart, x, all_y)
+    y_lo, y_hi = min(all_y), max(all_y)
+    y_pad = max((y_hi - y_lo) * 0.1, 1.0)
+    chart.setXRange(min(x), max(x), padding=0.02)
+    chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
+
+
+class FuturesLargeTradersDialog(QtWidgets.QDialog):
+    """雙擊「期貨」頁表格某商品時彈出的較大檢視：顯示該商品的「大額交易人未沖銷
+    部位」（TAIFEX OpenInterestOfLargeTradersFutures）。內容跟「期貨」頁下方常駐
+    的明細面板相同（共用 _populate_large_traders_table），只是彈窗版面更大、方便
+    細看。資料由呼叫端從「期貨」頁重新整理時已抓好的全市場清單裡篩出（純本地、
+    開啟即顯示，不另打 API）。"""
+
+    def __init__(self, parent, product, groups):
+        super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowMaximizeButtonHint)
+        title_name = groups[0]["contract_name"] if groups else ""
+        data_date = _futures_date_to_iso(groups[0]["date"]) if groups else ""
+        self.setWindowTitle(
+            f"{product} {title_name}　大額交易人未沖銷部位"
+            + (f"（{data_date}）" if data_date else "")
+        )
+        self.setMinimumWidth(560)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 12)
+
+        hint = QtWidgets.QLabel(
+            "單位：口數。「特定法人」為前述大額交易人中屬期交所公告特定法人者。"
+            "「前10大淨」＝前10大買方－賣方未沖銷部位；「前10大買佔比」＝前10大"
+            "買方未沖銷部位 ÷ 全市場未沖銷部位。資料來自 TAIFEX 官方盤後統計，"
+            "每交易日更新一次。"
+        )
+        hint.setProperty("muted", True)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        table = QtWidgets.QTableWidget(0, len(LARGE_TRADERS_TABLE_COLUMNS))
+        table.setHorizontalHeaderLabels(LARGE_TRADERS_TABLE_COLUMNS)
+        table.verticalHeader().setVisible(False)
+        table.setAlternatingRowColors(True)
+        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        row_count = _populate_large_traders_table(table, groups)
+        table.resizeColumnsToContents()
+        _, height_cap = _screen_fit_size(self, preferred_height=760, ratio=0.8)
+        table.setFixedHeight(min(height_cap, 36 + max(row_count, 1) * 30))
+        layout.addWidget(table)
+
+        if row_count == 0:
+            layout.addWidget(QtWidgets.QLabel("查無此商品的大額交易人資料。"))
+
+        close_btn = QtWidgets.QPushButton("關閉")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, alignment=QtCore.Qt.AlignRight)
+        _center_on_screen(self)
 
 
 class BackfillDialog(QtWidgets.QDialog):
     def __init__(self, parent, target_days=DEFAULT_BACKFILL_TARGET_DAYS, on_complete=None):
         super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowMaximizeButtonHint)
         self.setWindowTitle("回補歷史資料")
         self.setMinimumWidth(320)
         self.on_complete = on_complete
@@ -1034,6 +1252,7 @@ class TpexBackfillDialog(QtWidgets.QDialog):
 
     def __init__(self, parent, token, target_days=DEFAULT_BACKFILL_TARGET_DAYS, on_complete=None):
         super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowMaximizeButtonHint)
         self.setWindowTitle("使用 FinMind 補上櫃缺口")
         self.setMinimumWidth(360)
         self.on_complete = on_complete
@@ -1091,6 +1310,7 @@ class RefreshDialog(QtWidgets.QDialog):
 
     def __init__(self, parent, on_complete):
         super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowMaximizeButtonHint)
         self.setWindowTitle("重新整理")
         self.setMinimumWidth(320)
         self.on_complete = on_complete
@@ -1483,6 +1703,17 @@ def _populate_margin_chart(chart, margin_history):
     chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
 
 
+def _mark_latest_value(chart, x, dates, series, color, value_fmt="{:.1f}"):
+    """在圖上用水平虛線＋左側文字標出最後一筆資料的數值與日期，方便一眼看到
+    目前值，不用把滑鼠移到線的最右端去對。"""
+    latest_y = series[-1]
+    latest_label = f"{value_fmt.format(latest_y)}｜{dates[-1]}"
+    chart.addLine(y=latest_y, pen=pg.mkPen(color, style=QtCore.Qt.DashLine, width=1))
+    text = pg.TextItem(latest_label, color=color, anchor=(0, 0.5))
+    text.setPos(min(x), latest_y)
+    chart.addItem(text)
+
+
 def _populate_vpt_chart(chart, vpt_mfi_history):
     chart.clear()
     if vpt_mfi_history is None or not vpt_mfi_history["dates"]:
@@ -1510,6 +1741,7 @@ def _populate_vpt_chart(chart, vpt_mfi_history):
     y_pad = max((y_hi - y_lo) * 0.1, 1.0)
     chart.setXRange(min(x), max(x), padding=0.02)
     chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
+    _mark_latest_value(chart, x, dates, series, "#17becf", "{:,.0f}")
 
 
 def _populate_mfi_chart(chart, vpt_mfi_history):
@@ -1535,6 +1767,7 @@ def _populate_mfi_chart(chart, vpt_mfi_history):
     _limit_zoom_to_data(chart, x, series + [0, 100])
     chart.setXRange(min(x), max(x), padding=0.02)
     chart.setYRange(0, 100, padding=0.02)
+    _mark_latest_value(chart, x, dates, series, "#bcbd22", "{:.1f}")
 
 
 def _render_detail_block(
@@ -1596,6 +1829,24 @@ def _render_detail_block(
             f"融資融券（最新 {latest['date']}，單位：張）　"
             f"融資餘額：{latest['margin_balance']:,}（{latest['margin_change']:+,}）　"
             f"融券餘額：{latest['short_balance']:,}（{latest['short_change']:+,}）"
+        )
+
+    margin_cost = data.get("margin_cost_estimate")
+    if margin_cost is None:
+        lines.append("融資成本（估算）：查無資料")
+    else:
+        lines.append(
+            f"融資成本（估算，{margin_cost['date']}）：約 {margin_cost['cost']:.2f} 元　"
+            "※非券商真實成本，僅由歷史融資量反推近似值"
+        )
+
+    sbl_balance = data.get("sbl_short_balance")
+    if sbl_balance is None:
+        lines.append("借券賣出餘額：查無資料")
+    else:
+        lines.append(
+            f"借券賣出餘額（{sbl_balance['date']}，單位：股）："
+            f"{sbl_balance['balance']:,}（{sbl_balance['change']:+,}）"
         )
 
     if foreign_shareholding is None or foreign_shareholding["ratio"] is None:
@@ -1688,6 +1939,7 @@ class TradingDateDialog(QtWidgets.QDialog):
 
     def __init__(self, parent, valid_dates_iso, title):
         super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowMaximizeButtonHint)
         self.setWindowTitle(title)
         self.selected_date = None
 
@@ -1721,8 +1973,10 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         都已經在背景執行緒做完，這裡不再重做一次，避免視窗建立過程又卡一次網路。"""
         super().__init__()
         self.setWindowTitle("tradingnote - 台股資金流向分析")
-        self.resize(1040, 720)
         self.setMinimumSize(860, 600)
+        width, height = _screen_fit_size(self, ratio=0.85)
+        self.resize(width, height)
+        _center_on_screen(self)
 
         self.settings = load_settings(SETTINGS_PATH)
         self.positions = load_positions(POSITIONS_PATH)
@@ -1736,8 +1990,10 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         )
 
         self.continuity_note = ""
+        self.large_traders_note = ""
         self._total_pnl = None
         self._sync_timer = None
+        self._large_traders_sync_timer = None
 
         # 「有新資料可更新」提示：_known_data_date 是目前畫面上顯示的資料所屬交易日，
         # _dismissed_data_date 是使用者按過「✕」關閉、暫時不想再看到提示的那個交易日
@@ -1792,6 +2048,10 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         # 完成後重繪資金流向圖。
         if self.settings.get("auto_check_continuity", True):
             self._sync_history_continuity()
+            # 期貨大額交易人未沖銷部位歷史：同一個「每次啟動自動檢測」開關控制，綁定
+            # 同一顆「回補天數」設定，在背景把缺的日期補進 large_traders_history，供
+            # 「期貨」頁趨勢圖用（見 _sync_large_traders_history）。
+            self._sync_large_traders_history()
             # 估值歷史（valuation_history）不在這裡回補：泡泡圖「估值」模式改成只看
             # 每檔股票「最新一筆」PER/PBR（見 compute_valuation_flow），不需要長天期
             # 歷史。「最新一筆」資料靠每次「重新整理」／啟動都會呼叫的
@@ -2236,6 +2496,37 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self, target_days, on_progress, on_done, on_error
         )
 
+    def _sync_large_traders_history(self):
+        """啟動時在背景把最近「回補天數」天的期貨大額交易人未沖銷部位歷史補進
+        large_traders_history（TAIFEX 網站歷史 CSV，見
+        tradingnote_taifex.backfill_large_traders_history），供「期貨」頁趨勢圖用。
+        跟 _sync_history_continuity 同一套設計：綁定同一顆 backfill_target_days、
+        受同一個「每次啟動自動檢測」開關控制，資料已是最新時幾乎瞬間完成、狀態列
+        不留痕跡；真的補到資料才在完成後刷新目前選取商品的趨勢圖。冪等、可安全
+        中斷重跑（見 backfill_large_traders_history）。"""
+        target_days = self.settings.get("backfill_target_days", DEFAULT_BACKFILL_TARGET_DAYS)
+
+        def work():
+            return backfill_large_traders_history(HISTORY_DB_PATH, target_days)
+
+        def on_done(result):
+            had_note = bool(self.large_traders_note)
+            self.large_traders_note = ""
+            self._update_status_bar()
+            # 真的補到新資料（或本來就在等）才刷新趨勢圖，避免無謂重畫。
+            if result.get("rows") or had_note:
+                self._on_futures_row_selected()
+
+        def on_error(_message):
+            self.large_traders_note = ""
+            self._update_status_bar()
+
+        self.large_traders_note = "期貨大額交易人歷史回補中..."
+        self._update_status_bar()
+        self._large_traders_sync_timer = run_task_in_thread(
+            self, work, on_done, on_error
+        )
+
     # ---------- 部位紀錄頁 ----------
 
     def _build_positions_tab(self):
@@ -2518,8 +2809,12 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         error_note = f"　⚠ {self.last_error}" if self.last_error else ""
         staleness_note = f"　⚠ {self.staleness_warning}" if self.staleness_warning else ""
         continuity_note = f"　{self.continuity_note}" if self.continuity_note else ""
+        large_traders_note = (
+            f"　{self.large_traders_note}" if self.large_traders_note else ""
+        )
         self.status_bar.showMessage(
-            f"{cache_note}　{total_note}{error_note}{staleness_note}{continuity_note}"
+            f"{cache_note}　{total_note}{error_note}{staleness_note}"
+            f"{continuity_note}{large_traders_note}"
         )
 
     def open_add_dialog(self):
@@ -2762,8 +3057,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
     # 隨「重新整理」（見 _apply_refresh_result）跟股票資料一起刷新即可。
 
     FUTURES_COLUMNS = [
-        "商品", "契約月份", "時段", "最後成交", "漲跌", "漲跌%",
+        "商品", "標的", "契約月份", "時段", "最後成交", "漲跌", "漲跌%",
         "結算價", "成交量", "未沖銷契約數",
+        "大額前10買", "大額前10賣", "大額前10淨", "大額買佔比",
     ]
     FUTURES_SESSION_ORDER = ["一般", "盤後"]
 
@@ -2774,16 +3070,18 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         toolbar = QtWidgets.QHBoxLayout()
         toolbar.addWidget(QtWidgets.QLabel("搜尋"))
         self.futures_search_edit = QtWidgets.QLineEdit()
-        self.futures_search_edit.setPlaceholderText("輸入期貨代號，如 TX／MTX／TE")
-        self.futures_search_edit.setMaximumWidth(200)
+        self.futures_search_edit.setPlaceholderText("輸入代號／名稱，如 TX／台積電／2330／布蘭特")
+        self.futures_search_edit.setMaximumWidth(260)
         self.futures_search_edit.textChanged.connect(self._filter_futures_table)
         toolbar.addWidget(self.futures_search_edit)
 
         hint = QtWidgets.QLabel(
-            "預設顯示近月指數期貨（TX 臺股期貨／MTX 小型臺指期貨）盤後資訊，輸入代號可"
-            "搜尋 TAIFEX 全部期貨商品。資料來自 TAIFEX 官方「期貨每日交易行情」，免金鑰、"
-            "每個交易日更新一次，非即時報價——「一般」為日盤收盤後的彙總、「盤後」為夜盤"
-            "收盤後的彙總。跟其他資料一起在「設定」分頁按「重新整理所有資料」更新。"
+            "預設列出 TAIFEX 全部期貨商品盤後行情，輸入關鍵字即篩出符合的商品——可用契約"
+            "代碼（TX／CDF）、股票期貨標的代號（2330）或名稱（台積電、布蘭特）搜尋。「大額前10…」"
+            "欄是該商品近月「所有交易人」前10大未沖銷部位摘要；點選某列，下方面板會顯示該商品"
+            "完整的大額交易人未沖銷部位（各到期月份 × 所有交易人／特定法人），雙擊則開較大的彈窗。"
+            "資料來自 TAIFEX 官方免金鑰端點、每交易日更新一次、非即時報價（「一般」＝日盤、"
+            "「盤後」＝夜盤彙總），跟其他資料一起在「設定」分頁按「重新整理所有資料」更新。"
         )
         hint.setProperty("muted", True)
         hint.setWordWrap(True)
@@ -2800,13 +3098,139 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.futures_table.setHorizontalHeaderLabels(self.FUTURES_COLUMNS)
         self.futures_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.futures_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        for col, width in enumerate([70, 90, 60, 90, 80, 70, 90, 90, 110]):
+        self.futures_table.cellDoubleClicked.connect(self._on_futures_row_double_clicked)
+        self.futures_table.itemSelectionChanged.connect(self._on_futures_row_selected)
+        for col, width in enumerate(
+            [70, 130, 90, 60, 90, 80, 70, 90, 90, 110, 95, 95, 95, 90]
+        ):
             self.futures_table.setColumnWidth(col, width)
-        layout.addWidget(self.futures_table)
+
+        # 表格（上）＋大額交易人未沖銷部位明細面板（下），用 QSplitter 分隔可調高度，
+        # 跟「部位紀錄」頁「表格＋詳細區塊」的排版一致。
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        splitter.addWidget(self.futures_table)
+        splitter.addWidget(self._build_futures_lt_panel())
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter)
 
         self._futures_snapshot = {}
         self._futures_all_products = list(DEFAULT_FUTURES_PRODUCTS)
+        self._futures_large_traders_rows = []
+        self._futures_lt_by_code = {}
+        self._futures_ssf_map = {}
+        self._futures_name_map = {}
         self._rebuild_futures_table()
+
+    def _build_futures_lt_panel(self):
+        """「期貨」頁表格下方的常駐明細面板：點選某商品即顯示該商品完整的大額
+        交易人未沖銷部位（各到期月份 × 所有交易人／特定法人），跟雙擊彈窗
+        （FuturesLargeTradersDialog）共用同一份填表邏輯 _populate_large_traders_table。"""
+        container = QtWidgets.QWidget()
+        panel_layout = QtWidgets.QVBoxLayout(container)
+        panel_layout.setContentsMargins(0, 6, 0, 0)
+
+        self.futures_lt_detail_label = QtWidgets.QLabel(
+            "點選上方商品，這裡顯示其大額交易人未沖銷部位（各到期月份 × "
+            "所有交易人／特定法人）。"
+        )
+        self.futures_lt_detail_label.setWordWrap(True)
+        self.futures_lt_detail_label.setProperty("muted", True)
+        panel_layout.addWidget(self.futures_lt_detail_label)
+
+        self.futures_lt_detail_table = QtWidgets.QTableWidget(
+            0, len(LARGE_TRADERS_TABLE_COLUMNS)
+        )
+        self.futures_lt_detail_table.setHorizontalHeaderLabels(LARGE_TRADERS_TABLE_COLUMNS)
+        self.futures_lt_detail_table.verticalHeader().setVisible(False)
+        self.futures_lt_detail_table.setAlternatingRowColors(True)
+        self.futures_lt_detail_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.futures_lt_detail_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+
+        # 趨勢圖：選取商品的前10大買/賣方未沖銷部位逐日走勢（歷史由背景回補累積，
+        # 見 _sync_large_traders_history）。放在明細表右邊，用 QSplitter 可調寬度。
+        self.futures_lt_trend_chart = pg.PlotWidget()
+        self.futures_lt_trend_chart.setBackground(COLOR_BG)
+        self.futures_lt_trend_chart.showGrid(x=True, y=True, alpha=0.15)
+        self.futures_lt_trend_chart.addLegend()
+        self.futures_lt_trend_chart.setMinimumHeight(200)
+
+        inner = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        inner.addWidget(self.futures_lt_detail_table)
+        inner.addWidget(self.futures_lt_trend_chart)
+        inner.setStretchFactor(0, 3)
+        inner.setStretchFactor(1, 2)
+        panel_layout.addWidget(inner)
+        return container
+
+    def _futures_display_name(self, product):
+        """商品在「期貨」頁顯示用的名稱：股票期貨用「股票簡稱 代號」（台積電 2330），
+        其餘（指數／商品期貨）用大額端點的中文契約名（布蘭特原油期貨），都沒有則空字串。"""
+        ssf = self._futures_ssf_map.get(product)
+        if ssf:
+            return f"{ssf['stock_name'] or ''} {ssf['stock_code'] or ''}".strip()
+        return self._futures_name_map.get(product) or ""
+
+    def _futures_groups_for_product(self, product):
+        """回傳某日盤商品在大額端點對應的分組（自動換算去尾 F 的代碼）；查無回空清單。"""
+        lt_code = large_traders_code_for_product(product, self._futures_ssf_map)
+        return self._futures_lt_by_code.get(lt_code, [])
+
+    def _on_futures_row_selected(self):
+        selected = self.futures_table.selectionModel().selectedRows()
+        if not selected:
+            return
+        row = selected[0].row()
+        if row < 0 or row >= len(self._futures_rows):
+            return
+        product, _session = self._futures_rows[row]
+        groups = self._futures_groups_for_product(product)
+        name = self._futures_display_name(product)
+        header = f"{product} {name}".strip()
+        if groups:
+            self.futures_lt_detail_label.setText(f"{header}　大額交易人未沖銷部位（單位：口數）")
+        else:
+            self.futures_lt_detail_label.setText(
+                f"{header}：TAIFEX 未單獨提供此商品的大額交易人未沖銷部位。"
+            )
+        _populate_large_traders_table(self.futures_lt_detail_table, groups)
+
+        # 趨勢圖用歷史表（大額端點代碼、所有契約合計、所有交易人）。
+        lt_code = large_traders_code_for_product(product, self._futures_ssf_map)
+        trend = get_large_traders_history_series(
+            HISTORY_DB_PATH, lt_code, LARGE_TRADERS_HISTORY_ALL_CONTRACTS_MONTH, "0"
+        )
+        _populate_large_traders_trend(self.futures_lt_trend_chart, trend)
+
+    def _on_futures_row_double_clicked(self, row, _col):
+        """雙擊某商品列 → 彈出該商品的大額交易人未沖銷部位（用「期貨」頁重新
+        整理時已抓好、快取在 self._futures_large_traders_rows 的全市場清單就地
+        篩出，不另打 API）。尚未抓到大額資料時提示稍後重試。"""
+        if row < 0 or row >= len(self._futures_rows):
+            return
+        product, _session = self._futures_rows[row]
+        # 股票期貨在大額端點的代碼是去掉結尾 F（CDF→CD），指數／商品期貨沿用原碼；
+        # 換算＋查分組都在 _futures_groups_for_product 裡處理（用重新整理時已建好的
+        # self._futures_lt_by_code，不另打 API）。
+        groups = self._futures_groups_for_product(product)
+        if not groups:
+            # 區分兩種空：整份大額資料還沒載入（重新整理可解決）vs. 已載入但
+            # TAIFEX 這支端點本來就沒有這個商品（只涵蓋部分主要契約，例如小型
+            # 臺指 MTX 併入臺股期貨 TX 統計、不單獨列出，重新整理也不會有）。
+            if not self._futures_large_traders_rows:
+                message = (
+                    "大額交易人未沖銷部位資料尚未載入，請在「設定」頁按"
+                    "「重新整理所有資料」後再試。"
+                )
+            else:
+                message = (
+                    f"TAIFEX 未單獨提供 {product} 的大額交易人未沖銷部位統計"
+                    "（此端點僅涵蓋部分主要契約；小型臺指 MTX 等併入對應大型契約"
+                    "如臺股期貨 TX 一併統計）。"
+                )
+            QtWidgets.QMessageBox.information(self, "大額交易人未沖銷部位", message)
+            return
+        FuturesLargeTradersDialog(self, product, groups).exec()
 
     def _rebuild_futures_table(self):
         rows = [
@@ -2843,27 +3267,82 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             COLOR_LOSS if change is not None else None
         )
 
+        underlying_text = self._futures_display_name(product) or "-"
+
+        # 大額交易人摘要欄（近月「所有交易人」前10大未沖銷部位）。
+        summary = _large_traders_summary_entry(
+            self._futures_groups_for_product(product), data.get("contract_month")
+        )
+        if summary:
+            t10_buy, t10_sell, market_oi = (
+                summary["top10_buy"], summary["top10_sell"], summary["market_oi"],
+            )
+            lt_net = (t10_buy or 0) - (t10_sell or 0)
+            lt_buy_text = f"{t10_buy:,}" if t10_buy is not None else "-"
+            lt_sell_text = f"{t10_sell:,}" if t10_sell is not None else "-"
+            lt_net_text = f"{lt_net:+,}"
+            lt_share_text = f"{(t10_buy or 0) / market_oi * 100:.1f}%" if market_oi else "-"
+        else:
+            lt_net = None
+            lt_buy_text = lt_sell_text = lt_net_text = lt_share_text = "-"
+
         values = [
-            product, contract_month, session,
+            product, underlying_text, contract_month, session,
             last_text, change_text, change_pct_text,
             settlement_text, volume_text, oi_text,
+            lt_buy_text, lt_sell_text, lt_net_text, lt_share_text,
         ]
         for col, text in enumerate(values):
             item = QtWidgets.QTableWidgetItem(text)
-            if col in (3, 4) and color:
+            if col in (4, 5) and color:
                 item.setForeground(QtGui.QColor(color))
+            if col == 12 and lt_net is not None:  # 大額前10淨：正綠負紅
+                item.setForeground(QtGui.QColor(COLOR_GAIN if lt_net >= 0 else COLOR_LOSS))
             self.futures_table.setItem(index, col, item)
 
     def refresh_futures_tab(self, force_refresh=False):
         def fetch():
             rows = get_cached_daily_futures_report(FUTURES_CACHE_PATH, force_refresh=force_refresh)
             all_products = list_all_products(rows)
-            return all_products, get_futures_snapshot(all_products, rows=rows)
+            # 大額交易人未沖銷部位是另一支 TAIFEX 端點，抓失敗（且無舊快取）時
+            # 不該讓整個期貨盤後表格跟著壞掉——退回空清單，雙擊時再提示稍後重試。
+            try:
+                large_traders_rows = get_cached_large_traders_futures_report(
+                    FUTURES_LARGE_TRADERS_CACHE_PATH, force_refresh=force_refresh
+                )
+            except PriceFetchError:
+                large_traders_rows = []
+            # 股票期貨標的清單也是輔助資訊，抓失敗不該讓主行情表跟著壞——退回空 map，
+            # 個股期貨那幾列的「標的」欄暫時顯示 "-"、仍可用契約代碼搜尋。
+            try:
+                ssf_map = build_ssf_map(
+                    get_cached_ssf_list(FUTURES_SSF_CACHE_PATH, force_refresh=force_refresh)
+                )
+            except PriceFetchError:
+                ssf_map = {}
+            return (
+                all_products,
+                get_futures_snapshot(all_products, rows=rows),
+                large_traders_rows,
+                ssf_map,
+            )
 
         def on_done(result):
-            all_products, snapshot = result
+            all_products, snapshot, large_traders_rows, ssf_map = result
             self._futures_all_products = all_products
             self._futures_snapshot = snapshot
+            self._futures_large_traders_rows = large_traders_rows
+            self._futures_lt_by_code = group_large_traders_all(large_traders_rows)
+            self._futures_ssf_map = ssf_map
+            # 非股票期貨的中文名（供顯示／搜尋）：用大額端點的 ContractName，key 換算
+            # 成日盤商品代碼。股票期貨的名稱另外走 ssf_map（_futures_display_name 處理）。
+            lt_name_map = build_large_traders_name_map(large_traders_rows)
+            self._futures_name_map = {
+                product: lt_name_map[code]
+                for product in all_products
+                for code in [large_traders_code_for_product(product, ssf_map)]
+                if code in lt_name_map
+            }
             data_date = _futures_snapshot_date(snapshot)
             self.futures_status_label.setText(f"資料日期：{data_date}" if data_date else "")
             self._rebuild_futures_table()
@@ -2875,16 +3354,23 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self._futures_task_timer = run_task_in_thread(self, fetch, on_done, on_error)
 
     def _filter_futures_table(self, text):
-        """依商品代碼關鍵字（不分大小寫、子字串比對）篩選期貨表格：關鍵字為空
-        時只顯示預設商品（DEFAULT_FUTURES_PRODUCTS，即 TX／MTX），輸入關鍵字
-        後改成在全部商品中比對，符合的列顯示、其餘隱藏。"""
+        """依關鍵字（不分大小寫、子字串比對）篩選期貨表格：**關鍵字為空時顯示
+        全部商品**，輸入關鍵字後只留符合的列。比對字串含契約代碼（TX／CDF）、股票
+        期貨標的代號（2330）與名稱（台積電，見 self._futures_ssf_map），以及大額
+        端點提供的中文契約名（布蘭特原油期貨，見 self._futures_name_map）。"""
         keyword = text.strip().lower()
         for index, (product, _session) in enumerate(self._futures_rows):
-            if keyword:
-                matched = keyword in product.lower()
-            else:
-                matched = product in DEFAULT_FUTURES_PRODUCTS
-            self.futures_table.setRowHidden(index, not matched)
+            if not keyword:
+                self.futures_table.setRowHidden(index, False)
+                continue
+            haystack = product.lower()
+            ssf = self._futures_ssf_map.get(product)
+            if ssf:
+                haystack += f" {ssf['stock_code'] or ''} {(ssf['stock_name'] or '').lower()}"
+            name = self._futures_name_map.get(product)
+            if name:
+                haystack += f" {name.lower()}"
+            self.futures_table.setRowHidden(index, keyword not in haystack)
 
     # ---------- AI 助理頁 ----------
 
@@ -3029,7 +3515,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addSpacing(20)
 
         self.auto_check_box = QtWidgets.QCheckBox(
-            "每次啟動自動檢測（TWSE 歷史資料有缺口時自動補齊）"
+            "每次啟動自動檢測（TWSE 股價、期貨大額交易人未沖銷部位歷史有缺口時自動補齊）"
         )
         self.auto_check_box.setChecked(self.settings.get("auto_check_continuity", True))
         self.auto_check_box.toggled.connect(self._on_auto_check_toggle)
@@ -3041,7 +3527,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addSpacing(10)
 
         backfill_days_row = QtWidgets.QHBoxLayout()
-        backfill_days_row.addWidget(QtWidgets.QLabel("回補天數（上市 TWSE／上櫃 TPEX 共用）"))
+        backfill_days_row.addWidget(
+            QtWidgets.QLabel("回補天數（上市 TWSE／上櫃 TPEX 股價、期貨大額交易人歷史共用）")
+        )
         self.backfill_days_spin = QtWidgets.QSpinBox()
         self.backfill_days_spin.setRange(20, 500)
         self.backfill_days_spin.setSingleStep(10)

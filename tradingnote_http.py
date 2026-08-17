@@ -49,6 +49,35 @@ def http_get_json(url, timeout=10):
         raise PriceFetchError(f"回傳資料格式錯誤：{e}") from e
 
 
+def http_post_text(url, data, encoding="utf-8", timeout=30):
+    """POST 一個 application/x-www-form-urlencoded 表單，回傳解碼後的文字（非 JSON）。
+    給 TAIFEX 網站的歷史 CSV 下載端點（Big5 編碼，需帶 User-Agent 才不會被擋）用；
+    例外包裝跟 http_get_json 一致，讓呼叫端統一接 PriceFetchError。data 可以是已
+    urlencode 的字串或 bytes。"""
+    body = data.encode("ascii") if isinstance(data, str) else data
+    try:
+        req = Request(
+            url,
+            data=body,
+            headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"},
+        )
+        with urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            if resp.headers.get("Content-Encoding") == "gzip":
+                raw = gzip.decompress(raw)
+            return raw.decode(encoding, "ignore")
+    except HTTPError as e:
+        raise PriceFetchError(f"連線失敗（HTTP {e.code}）：{e}") from e
+    except URLError as e:
+        raise PriceFetchError(f"連線失敗：{e}") from e
+    except TimeoutError as e:
+        raise PriceFetchError(f"連線逾時：{e}") from e
+    except http.client.HTTPException as e:
+        raise PriceFetchError(f"連線失敗（回應中斷）：{e}") from e
+    except OSError as e:
+        raise PriceFetchError(f"回傳資料格式錯誤：{e}") from e
+
+
 def to_float(value):
     if value in (None, "", "-", "NULL"):
         return None
