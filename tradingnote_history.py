@@ -5,6 +5,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -66,6 +67,24 @@ def _change_pct(price):
     if not prev_close:
         return None
     return price.change / prev_close * 100
+
+
+def _snapshot_today(snapshot):
+    """回傳 snapshot 裡最多股票共用的交易日（多數 PriceInfo.date 會是同一天，用眾數
+    避免少數個股資料延遲／異常日期影響判斷；同 tradingnote_gui._snapshot_date，但
+    這裡是核心模組不能 import GUI，故獨立宣告一份）。
+
+    下面幾個「近 N 日流向」計算函式都要用這個當歷史資料查詢的分界，不能用
+    date.today()——snapshot 是 TWSE/TPEX 目前實際發布的最新收盤，不一定等於今天的
+    日曆日期（一早、假日、或對方資料延遲發布時，snapshot 可能還停在前一個交易日）。
+    誤用 date.today() 當分界，遇到 snapshot 落後、且 avg_days 很小（例如「近2日」）
+    時，算出來的「N 個交易日前」基準日會剛好撞到 snapshot 本身那天，變成同一天的
+    收盤價互相比較，結果近似 0%，看起來就像「完全沒有漲跌」——這是泡泡圖選「近2日」
+    偶爾看起來沒有股價漲幅的實際成因。snapshot 是空的就回退用 date.today()。"""
+    dates = [p.date for p in snapshot.values() if p.date]
+    if not dates:
+        return date.today().isoformat()
+    return Counter(dates).most_common(1)[0][0]
 
 
 # ---------- DB ----------
@@ -742,24 +761,34 @@ def compute_industry_flow(db_path, snapshot, avg_days=5):
             continue
         g = groups.setdefault(
             industry,
-            {"trading_value": 0.0, "ticker_prices": {}, "ticker_volumes": {}, "ticker_values": {}},
+            {
+                "trading_value": 0.0,
+                "ticker_prices": {},
+                "ticker_volumes": {},
+                "ticker_values": {},
+                "ticker_dates": {},
+            },
         )
         g["trading_value"] += price.trading_value
         g["ticker_prices"][price.ticker] = price.close
         g["ticker_volumes"][price.ticker] = price.volume or 0
         g["ticker_values"][price.ticker] = price.trading_value
+        g["ticker_dates"][price.ticker] = price.date
 
     min_history_days = max(2, avg_days // 2)
-    cutoff = (date.today() - timedelta(days=avg_days * 3)).isoformat()
+    snapshot_today = _snapshot_today(snapshot)
+    cutoff = (date.fromisoformat(snapshot_today) - timedelta(days=avg_days * 3)).isoformat()
     conn = _connect(db_path)
     try:
         # LIFO：以 date DESC 為主要存取順序，讓每檔股票的區間內紀錄天然由新到舊排列，
         # 下面直接取前 avg_days 筆即為「近 avg_days 日」，不需要再用 Python 額外排序；
-        # 該切片的最後一筆（最舊）即為「avg_days 個交易日前」的收盤價基準。
+        # 該切片的最後一筆（最舊）即為「avg_days 個交易日前」的收盤價基準。分界用
+        # snapshot_today（snapshot 實際代表的交易日）而非 date.today()，理由見
+        # _snapshot_today docstring。
         history_rows = conn.execute(
             """SELECT ticker, date, close, volume FROM daily_prices
                WHERE date < ? AND date >= ? ORDER BY date DESC""",
-            (date.today().isoformat(), cutoff),
+            (snapshot_today, cutoff),
         ).fetchall()
     finally:
         conn.close()
@@ -780,7 +809,13 @@ def compute_industry_flow(db_path, snapshot, avg_days=5):
         weighted_change, change_weight = 0.0, 0.0
         today_volume, baseline_volume = 0.0, 0.0
         for ticker, today_close in g["ticker_prices"].items():
-            days = ticker_history.get(ticker, [])[:avg_days]
+            # 個股自己的 snapshot 日期可能比多數股票（snapshot_today 眾數）更舊
+            # （少數個股資料延遲發布），這裡逐檔用該股自己的日期過濾歷史列，避免
+            # 「今天」跟「N 天前」不小心撞到同一天，見 _snapshot_today docstring。
+            ticker_date = g["ticker_dates"][ticker]
+            days = [
+                row for row in ticker_history.get(ticker, []) if row[0] < ticker_date
+            ][:avg_days]
             if len(days) < min_history_days:
                 continue
             baseline_close = days[-1][1]
@@ -865,15 +900,20 @@ def compute_valuation_flow(db_path, snapshot, short_days=5, long_days=20, metric
         industry = industry_map.get(price.ticker)
         if not industry:
             continue
-        g = groups.setdefault(industry, {"trading_value": 0.0, "ticker_values": {}})
+        g = groups.setdefault(
+            industry, {"trading_value": 0.0, "ticker_values": {}, "ticker_dates": {}}
+        )
         g["trading_value"] += price.trading_value
         g["ticker_values"][price.ticker] = price.trading_value
+        g["ticker_dates"][price.ticker] = price.date
 
     total_market_value = sum(g["trading_value"] for g in groups.values())
 
     min_history_days = max(short_days, long_days // 2)
-    cutoff = (date.today() - timedelta(days=long_days * 3)).isoformat()
-    today_iso = date.today().isoformat()
+    # 分界用 snapshot_today（snapshot 實際代表的交易日）而非 date.today()，理由見
+    # _snapshot_today docstring。
+    today_iso = _snapshot_today(snapshot)
+    cutoff = (date.fromisoformat(today_iso) - timedelta(days=long_days * 3)).isoformat()
 
     conn = _connect(db_path)
     try:
@@ -891,8 +931,8 @@ def compute_valuation_flow(db_path, snapshot, short_days=5, long_days=20, metric
         conn.close()
 
     ticker_value_history = {}
-    for ticker, _day, tv in value_rows:
-        ticker_value_history.setdefault(ticker, []).append(tv or 0.0)
+    for ticker, day, tv in value_rows:
+        ticker_value_history.setdefault(ticker, []).append((day, tv or 0.0))
 
     # valuation_rows 已經是 date DESC，同一檔股票第一次出現的即為目前最新一筆
     # （若今天已經跑過 record_valuation_snapshot，這筆就是今天的資料）。
@@ -913,7 +953,15 @@ def compute_valuation_flow(db_path, snapshot, short_days=5, long_days=20, metric
             latest_valuation = ticker_latest_valuation.get(ticker)
             if latest_valuation is None:
                 continue
-            days = ticker_value_history.get(ticker, [])
+            # 個股自己的 snapshot 日期可能比多數股票（today_iso 眾數）更舊（少數個股
+            # 資料延遲發布），這裡逐檔用該股自己的日期過濾歷史列，避免「今天」跟
+            # 「N 天前」不小心撞到同一天，見 _snapshot_today docstring。
+            ticker_date = g["ticker_dates"][ticker]
+            days = [
+                tv
+                for day, tv in ticker_value_history.get(ticker, [])
+                if day < ticker_date
+            ]
             if len(days) < min_history_days:
                 continue
 
@@ -989,8 +1037,10 @@ def get_industry_top_stocks_range(db_path, snapshot, industry, days, top_n=30, v
         return []
 
     tickers = list(today_by_ticker)
-    today_iso = date.today().isoformat()
-    cutoff = (date.today() - timedelta(days=max(days, volume_avg_days, 1) * 3)).isoformat()
+    # 分界用 snapshot_today（snapshot 實際代表的交易日）而非 date.today()，理由見
+    # _snapshot_today docstring。
+    today_iso = _snapshot_today(snapshot)
+    cutoff = (date.fromisoformat(today_iso) - timedelta(days=max(days, volume_avg_days, 1) * 3)).isoformat()
     conn = _connect(db_path)
     try:
         placeholders = ",".join("?" * len(tickers))
@@ -1024,7 +1074,10 @@ def get_industry_top_stocks_range(db_path, snapshot, industry, days, top_n=30, v
 
     results = []
     for ticker, price in today_by_ticker.items():
-        full_history = ticker_history.get(ticker, [])
+        # 個股自己的 snapshot 日期可能比多數股票（today_iso 眾數）更舊（少數個股
+        # 資料延遲發布），這裡逐檔用該股自己的日期過濾歷史列，避免「今天」跟
+        # 「N 天前」不小心撞到同一天，見 _snapshot_today docstring。
+        full_history = [row for row in ticker_history.get(ticker, []) if row[0] < price.date]
         history = full_history[: max(days - 1, 0)]
         total_trading_value = price.trading_value + sum(v for _, _, v, _ in history)
         baseline_close = history[-1][1] if history else price.close
@@ -1091,7 +1144,10 @@ def compute_volume_ratio_outliers(db_path, snapshot, avg_days=5, min_ratio=1.5):
     industry_map 裡有分類的股票，藉此排除權證、ETF 等非個股商品。"""
     industry_map = get_industry_map(db_path)
     min_history_days = max(2, avg_days // 2)
-    cutoff = (date.today() - timedelta(days=avg_days * 3)).isoformat()
+    # 分界用 snapshot_today（snapshot 實際代表的交易日）而非 date.today()，理由見
+    # _snapshot_today docstring。
+    snapshot_today = _snapshot_today(snapshot)
+    cutoff = (date.fromisoformat(snapshot_today) - timedelta(days=avg_days * 3)).isoformat()
 
     tickers_today = {}
     for price in snapshot.values():
@@ -1112,18 +1168,25 @@ def compute_volume_ratio_outliers(db_path, snapshot, avg_days=5, min_ratio=1.5):
             f"""SELECT ticker, date, volume FROM daily_prices
                WHERE ticker IN ({placeholders}) AND date < ? AND date >= ?
                ORDER BY date DESC""",
-            (*tickers, date.today().isoformat(), cutoff),
+            (*tickers, snapshot_today, cutoff),
         ).fetchall()
     finally:
         conn.close()
 
     ticker_history = {}
-    for ticker, _day, volume in rows:
-        ticker_history.setdefault(ticker, []).append(volume or 0)
+    for ticker, day, volume in rows:
+        ticker_history.setdefault(ticker, []).append((day, volume or 0))
 
     results = []
     for ticker, price in tickers_today.items():
-        days = ticker_history.get(ticker, [])[:avg_days]
+        # 個股自己的 snapshot 日期可能比多數股票更舊（少數個股資料延遲發布），這裡
+        # 逐檔用該股自己的日期過濾歷史列，避免「今天」跟「N 天前」不小心撞到同一天，
+        # 見 _snapshot_today docstring。
+        days = [
+            volume
+            for day, volume in ticker_history.get(ticker, [])
+            if day < price.date
+        ][:avg_days]
         if len(days) < min_history_days:
             continue
         avg_volume = sum(days) / len(days)
