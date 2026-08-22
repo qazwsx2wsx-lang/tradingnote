@@ -872,6 +872,7 @@ class StockDetailDialog(QtWidgets.QDialog):
             chart.showGrid(x=True, y=True, alpha=0.15)
             chart.setMinimumHeight(320)
             chart.addLegend()
+        _setup_price_chart_click(self.full_detail_price_chart)
 
         self.full_detail_tabs = QtWidgets.QTabWidget()
         self.full_detail_tabs.addTab(self.full_detail_price_chart, "歷史股價")
@@ -995,7 +996,7 @@ class IndustryTopStocksDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 12)
 
-        table = QtWidgets.QTableWidget(len(top_stocks), 8)
+        table = QtWidgets.QTableWidget(len(top_stocks), 9)
         table.setHorizontalHeaderLabels(
             [
                 "代號",
@@ -1006,6 +1007,7 @@ class IndustryTopStocksDialog(QtWidgets.QDialog):
                 "近日量(張)",
                 "均量(張)",
                 "本益比",
+                "EPS",
             ]
         )
         table.verticalHeader().setVisible(False)
@@ -1018,6 +1020,7 @@ class IndustryTopStocksDialog(QtWidgets.QDialog):
             color = COLOR_GAIN if (change_pct or 0) >= 0 else COLOR_LOSS
             avg_volume = stock["avg_volume"]
             per = stock["per"]
+            eps = stock["close"] / per if per else None
             values = [
                 stock["ticker"],
                 stock["name"] or "-",
@@ -1027,10 +1030,11 @@ class IndustryTopStocksDialog(QtWidgets.QDialog):
                 f"{stock['today_volume'] / 1000:,.0f}" if stock["today_volume"] is not None else "-",
                 f"{avg_volume / 1000:,.0f}" if avg_volume is not None else "-",
                 f"{per:.2f}" if per is not None else "N/A",
+                f"{eps:.2f}" if eps is not None else "N/A",
             ]
             for col, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
-                if col in (0, 2, 3, 4, 5, 6, 7):
+                if col in (0, 2, 3, 4, 5, 6, 7, 8):
                     item.setTextAlignment(QtCore.Qt.AlignCenter)
                 if col == 3 and change_pct is not None:
                     item.setForeground(QtGui.QColor(color))
@@ -1546,11 +1550,18 @@ def _populate_price_chart(chart, price_history):
     收盤價（使用者要的是「歷史股價資訊圖」，不是另外疊漲跌%／成交量，避免跟
     其他幾張圖一樣的軸混在一起）。"""
     chart.clear()
+    # chart.clear() 會把先前點擊留下的標記線／文字一併清掉，這裡順便重置追蹤
+    # 用的屬性，避免 _on_price_chart_click 之後 removeItem 到已經不存在的物件。
+    chart._click_marker_items = []
+    chart._price_dates = None
+    chart._price_closes = None
     if not price_history:
         return
 
     dates = [row["date"] for row in price_history]
     closes = [row["close"] for row in price_history]
+    chart._price_dates = dates
+    chart._price_closes = closes
     x = list(range(len(dates)))
     step = max(1, len(dates) // 8)
     chart.getPlotItem().getAxis("bottom").setTicks(
@@ -1568,6 +1579,43 @@ def _populate_price_chart(chart, price_history):
     y_pad = max((y_hi - y_lo) * 0.1, 1.0)
     chart.setXRange(min(x), max(x), padding=0.02)
     chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
+
+
+def _setup_price_chart_click(chart):
+    """幫「歷史股價」圖加上滑鼠點擊查看該日股價的功能：點圖上任一位置，找出
+    最接近的交易日，畫一條垂直虛線＋文字標出「日期｜收盤價」。只在 PlotWidget
+    建立時呼叫一次——scene 的訊號連線是永久的，不會因為 _populate_price_chart
+    之後的 chart.clear() 而消失；_populate_price_chart 每次重繪時把最新的
+    dates／closes 存到 chart 物件上（見該函式），這裡的 handler 讀取當下存的
+    那份，不用另外傳參數，重新整理／切換股票後點擊仍然對得上目前顯示的資料。"""
+    vb = chart.getPlotItem().getViewBox()
+
+    def on_click(event):
+        dates = getattr(chart, "_price_dates", None)
+        closes = getattr(chart, "_price_closes", None)
+        if not dates:
+            return
+        if not chart.getPlotItem().sceneBoundingRect().contains(event.scenePos()):
+            return
+        point = vb.mapSceneToView(event.scenePos())
+        idx = round(point.x())
+        idx = max(0, min(len(dates) - 1, idx))
+
+        for item in getattr(chart, "_click_marker_items", []):
+            chart.removeItem(item)
+
+        marker_line = pg.InfiniteLine(
+            pos=idx, angle=90, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1)
+        )
+        label = pg.TextItem(
+            f"{dates[idx]}｜{closes[idx]:.2f}", color=COLOR_TEXT, anchor=(0.5, 1)
+        )
+        label.setPos(idx, closes[idx])
+        chart.addItem(marker_line)
+        chart.addItem(label)
+        chart._click_marker_items = [marker_line, label]
+
+    chart.scene().sigMouseClicked.connect(on_click)
 
 
 def _populate_flow_chart(chart, history):
@@ -2605,6 +2653,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             chart.showGrid(x=True, y=True, alpha=0.15)
             chart.setMinimumHeight(320)
             chart.addLegend()
+        _setup_price_chart_click(self.position_price_chart)
 
         position_detail_tabs = QtWidgets.QTabWidget()
         position_detail_tabs.addTab(self.position_price_chart, "歷史股價")
