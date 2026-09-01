@@ -53,6 +53,12 @@ from tradingnote_history import (
     upsert_daily_prices,
 )
 from tradingnote_http import PriceFetchError, http_get_json
+from tradingnote_technical import (
+    build_price_history,
+    calculate_indicators,
+    calculate_vpt_mfi_history,
+    normalize_price_rows,
+)
 
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 
@@ -311,46 +317,7 @@ def fetch_vpt_mfi_history(ticker, token, lookback_days=150, mfi_period=14):
     會被裁掉，讓 dates／vpt／mfi 三個陣列長度一致、都對得上同一段可畫的日期。
     回傳 {"dates":, "vpt":, "mfi":}；資料不足 mfi_period+1 天則回傳 None。"""
     rows = _fetch_dataset("TaiwanStockPrice", ticker, token, lookback_days)
-    rows = sorted(
-        (
-            r
-            for r in rows
-            if r.get("close") is not None
-            and r.get("max") is not None
-            and r.get("min") is not None
-        ),
-        key=lambda r: r["date"],
-    )
-    if len(rows) <= mfi_period:
-        return None
-
-    dates_all = [r["date"] for r in rows]
-    closes = [r["close"] for r in rows]
-    volumes = [r.get("Trading_Volume") or 0 for r in rows]
-    typical = [(r["max"] + r["min"] + r["close"]) / 3 for r in rows]
-
-    vpt = [0.0]
-    for t in range(1, len(rows)):
-        prev_close = closes[t - 1]
-        change = (closes[t] - prev_close) / prev_close if prev_close else 0.0
-        vpt.append(vpt[-1] + volumes[t] * change)
-
-    raw_flow = [typical[t] * volumes[t] for t in range(len(rows))]
-    mfi = [None] * len(rows)
-    for t in range(mfi_period, len(rows)):
-        pos_flow = neg_flow = 0.0
-        for i in range(t - mfi_period + 1, t + 1):
-            if typical[i] > typical[i - 1]:
-                pos_flow += raw_flow[i]
-            elif typical[i] < typical[i - 1]:
-                neg_flow += raw_flow[i]
-        mfi[t] = 100.0 if neg_flow == 0 else 100 - 100 / (1 + pos_flow / neg_flow)
-
-    return {
-        "dates": dates_all[mfi_period:],
-        "vpt": vpt[mfi_period:],
-        "mfi": mfi[mfi_period:],
-    }
+    return calculate_vpt_mfi_history(normalize_price_rows(rows), mfi_period=mfi_period)
 
 
 def fetch_foreign_shareholding(ticker, token, lookback_days=10):
@@ -523,7 +490,7 @@ def fetch_institutional_investors_detailed_history(ticker, token, lookback_days=
     return {"dates": dates, "series": series}
 
 
-# ---------- 「部位紀錄」頁個股詳細資訊：一次抓齊六項＋永久存檔 ----------
+# ---------- 「部位紀錄」頁個股詳細資訊：一次抓齊十二項＋永久存檔 ----------
 
 # fetch_position_detail() 回傳 dict 的固定欄位順序，跟 GUI 顯示順序一致；
 # 用 dict（key 存取）取代原本的 6 元組定位取值，是因為這份結果現在還要
@@ -539,31 +506,30 @@ POSITION_DETAIL_FIELDS = (
     "lending",
     "suspension",
     "vpt_mfi_history",
+    "technical_indicators",
     "sbl_short_balance",
     "margin_cost_estimate",
 )
 
 
 def fetch_position_detail(ticker, token, market=None):
-    """一次抓齊「部位紀錄」頁個股詳細資訊區塊要顯示的十一項資料（本益比／殖利率／
+    """一次抓齊「部位紀錄」頁個股詳細資訊區塊要顯示的十二項資料（本益比／殖利率／
     股價淨值比、歷史股價、三大法人120日趨勢、法人分別（五細項）120日趨勢、
     融資融券120日趨勢、外資持股比例、借券成交、停資停券公告、VPT／MFI量價
-    指標、借券賣出餘額、融資成本估算），回傳 dict（key 見
+    指標、KD／MACD／均線／RSI、借券賣出餘額、融資成本估算），回傳 dict（key 見
     POSITION_DETAIL_FIELDS）。每項各自沿用原本的 _dataset_cache（30分鐘行程內
     快取，擋短時間內重複查詢），呼叫端（tradingnote_gui._load_position_detail）
     另外會把整份結果存進 position_detail_cache.json 永久保存（見
     save_position_detail_cache），跟 _dataset_cache 是兩層不同用途：一層擋重複
     打 API，一層讓資料重開程式也不會消失。
 
-    price_history 沿用既有的 fetch_stock_price_history()（原本是給 TPEX 歷史
-    回補用），這裡拿來畫「歷史股價」趨勢圖；lookback_days=120 跟三大法人／
-    融資融券兩張趨勢圖用同一個窗口（日曆天），三張圖時間軸大致對得上，方便
-    互相比對。margin_cost_estimate 的 lookback_days 故意跟 margin_history／
-    vpt_mfi_history 用同一預設值（120／150），命中同一份 _fetch_dataset 快取，
-    不會為了新增這兩項多打 API（見 fetch_margin_cost_estimate docstring）。"""
+    price_history、VPT／MFI 與技術指標共用一次 150 日 TaiwanStockPrice 查詢；
+    margin_cost_estimate 的價格查詢也命中同一份 _fetch_dataset 快取，新增技術
+    指標不會再增加價格 API 存取次數。"""
+    technical = fetch_technical_history(ticker, token, lookback_days=150)
     return {
         "valuation": fetch_valuation(ticker, token, market=market),
-        "price_history": fetch_stock_price_history(ticker, token, lookback_days=120),
+        "price_history": technical["price_history"],
         "institutional_history": fetch_institutional_investors_history(
             ticker, token, lookback_days=120
         ),
@@ -574,7 +540,8 @@ def fetch_position_detail(ticker, token, market=None):
         "foreign_shareholding": fetch_foreign_shareholding(ticker, token),
         "lending": fetch_securities_lending_summary(ticker, token),
         "suspension": fetch_margin_short_sale_suspension(ticker, token),
-        "vpt_mfi_history": fetch_vpt_mfi_history(ticker, token),
+        "vpt_mfi_history": technical["vpt_mfi_history"],
+        "technical_indicators": technical["technical_indicators"],
         "sbl_short_balance": fetch_short_sale_balance(ticker, token),
         "margin_cost_estimate": fetch_margin_cost_estimate(ticker, token),
     }
@@ -594,6 +561,17 @@ def save_position_detail_cache(cache_path, ticker, data):
     自動補上 fetched_at），永久保存、不會過期，也不會動到其他 ticker 已存的
     記錄。"""
     save_keyed_entry(cache_path, ticker, data)
+
+
+def fetch_technical_history(ticker, token, lookback_days=150, mfi_period=14):
+    """一次取得個股 OHLCV，供所有本地技術指標與價格圖共用。"""
+    rows = _fetch_dataset("TaiwanStockPrice", ticker, token, lookback_days)
+    bars = normalize_price_rows(rows)
+    return {
+        "price_history": build_price_history(rows),
+        "technical_indicators": calculate_indicators(rows),
+        "vpt_mfi_history": calculate_vpt_mfi_history(bars, mfi_period=mfi_period),
+    }
 
 
 # ---------- TPEX 歷史回補（FinMind 補上官方端點沒有的缺口） ----------

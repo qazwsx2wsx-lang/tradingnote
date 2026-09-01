@@ -12,9 +12,39 @@ tradingnote_taifex.py（get_cached_daily_futures_report 的 futures_cache.json�
 """
 
 import json
+import os
 import time
+import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
+
+
+_FILE_LOCKS = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def _file_lock(path):
+    key = str(Path(path).resolve())
+    with _FILE_LOCKS_GUARD:
+        return _FILE_LOCKS.setdefault(key, threading.RLock())
+
+
+def _atomic_json_write(path, payload):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    temporary = p.with_name(f".{p.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, p)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def load_fresh_file_cache(cache_path, ttl_seconds):
@@ -24,9 +54,14 @@ def load_fresh_file_cache(cache_path, ttl_seconds):
     p = Path(cache_path)
     if not p.exists():
         return None
-    with p.open("r", encoding="utf-8") as f:
-        cached = json.load(f)
-    fetched_at = datetime.fromisoformat(cached["fetched_at"])
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            cached = json.load(f)
+        if not isinstance(cached, dict):
+            return None
+        fetched_at = datetime.fromisoformat(cached["fetched_at"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
     if (datetime.now() - fetched_at).total_seconds() < ttl_seconds:
         return cached
     return None
@@ -38,21 +73,22 @@ def load_stale_file_cache(cache_path):
     p = Path(cache_path)
     if not p.exists():
         return None
-    with p.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            cached = json.load(f)
+        return cached if isinstance(cached, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def write_file_cache(cache_path, payload):
     """payload 是除了 fetched_at 以外要存的內容（例如 {"prices": {...}} 或
     {"rows": [...]}），寫入時自動補上目前時間當 fetched_at。"""
     p = Path(cache_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(
+    with _file_lock(p):
+        _atomic_json_write(
+            p,
             {"fetched_at": datetime.now().isoformat(), **payload},
-            f,
-            ensure_ascii=False,
-            indent=2,
         )
 
 
@@ -64,8 +100,12 @@ def load_keyed_store(store_path):
     p = Path(store_path)
     if not p.exists():
         return {}
-    with p.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            store = json.load(f)
+        return store if isinstance(store, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def save_keyed_entry(store_path, key, payload):
@@ -73,12 +113,11 @@ def save_keyed_entry(store_path, key, payload):
     不會被覆寫掉），payload 是要存的內容，自動補上目前時間當 fetched_at。
     每次呼叫都整份讀回、改一筆、整份寫回；呼叫頻率低（例如使用者選取某筆
     部位才查一次）不需要更精細的鎖定或部分寫入機制。"""
-    store = load_keyed_store(store_path)
-    store[key] = {"fetched_at": datetime.now().isoformat(), **payload}
     p = Path(store_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(store, f, ensure_ascii=False, indent=2)
+    with _file_lock(p):
+        store = load_keyed_store(p)
+        store[key] = {"fetched_at": datetime.now().isoformat(), **payload}
+        _atomic_json_write(p, store)
 
 
 class TTLCache:
@@ -86,19 +125,52 @@ class TTLCache:
     情境固定用 None 當 key，例如整份市場一起快取的資料；需要依查詢條件分開
     快取的情境用 tuple 之類的複合 key，例如 (dataset, ticker, lookback_days)）。
     get_or_fetch 命中未過期快取就直接回傳；否則呼叫 fetch_fn() 取得新值、存入
-    快取後回傳。fetch_fn() 拋出例外時不會被快取，例外直接往上拋，下次呼叫
-    照樣重試（只快取成功的結果）。"""
+    快取後回傳；同一個 key 同時只有一個 fetch_fn() 會實際執行。每次存取也會
+    清理已過期項目，避免長時間執行時舊快取無限累積。fetch_fn() 拋出例外時不會
+    被快取，例外直接往上拋，下次呼叫照樣重試（只快取成功的結果）。"""
 
     def __init__(self, ttl_seconds):
         self.ttl_seconds = ttl_seconds
         self._store = {}
+        self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
+        self._inflight = set()
+
+    def _remove_expired_locked(self, now):
+        """刪除已過期項目；呼叫端必須持有 self._lock。"""
+        expired_keys = [
+            key
+            for key, (fetched_at, _value) in self._store.items()
+            if now - fetched_at >= self.ttl_seconds
+        ]
+        for key in expired_keys:
+            self._store.pop(key, None)
 
     def get_or_fetch(self, key, fetch_fn):
-        cached = self._store.get(key)
-        if cached is not None:
-            fetched_at, value = cached
-            if time.time() - fetched_at < self.ttl_seconds:
-                return value
-        value = fetch_fn()
-        self._store[key] = (time.time(), value)
+        # 同一個 key 若已經有背景查詢進行中，等待它完成後重試命中快取，
+        # 避免使用者連點同一檔股票時重複消耗 API 額度。
+        while True:
+            with self._condition:
+                now = time.monotonic()
+                self._remove_expired_locked(now)
+                cached = self._store.get(key)
+                if cached is not None:
+                    return cached[1]
+                if key not in self._inflight:
+                    self._inflight.add(key)
+                    break
+                self._condition.wait()
+
+        try:
+            value = fetch_fn()
+        except Exception:
+            with self._condition:
+                self._inflight.discard(key)
+                self._condition.notify_all()
+            raise
+
+        with self._condition:
+            self._store[key] = (time.monotonic(), value)
+            self._inflight.discard(key)
+            self._condition.notify_all()
         return value

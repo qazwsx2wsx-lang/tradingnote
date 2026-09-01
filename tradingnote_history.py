@@ -53,6 +53,10 @@ class IndustryFlow:
     total_trading_value: float
     capital_share_pct: float
     stock_count: int
+    popularity_score: float | None = None
+    momentum_score: float | None = None
+    volume_score: float | None = None
+    composite_score: float | None = None
 
 
 def industry_name(code):
@@ -85,6 +89,23 @@ def _snapshot_today(snapshot):
     if not dates:
         return date.today().isoformat()
     return Counter(dates).most_common(1)[0][0]
+
+
+def _cross_sectional_percentile(value, values):
+    """把同一批產業中的原始值轉成 0～100 百分位分數。
+
+    使用平均名次處理同值，避免 min-max 被單一極端值拉扯；分數只表示當日／
+    當次查詢的相對位置，不宣稱跨日期具有固定絕對意義。只有一個有效值時回傳
+    中間分數 50，避免把孤立資料誤標成滿分。
+    """
+    if value is None or not values:
+        return None
+    if len(values) == 1:
+        return 50.0
+    lower_count = sum(other < value for other in values)
+    equal_count = sum(other == value for other in values)
+    average_rank = lower_count + (equal_count + 1) / 2
+    return (average_rank - 1) / (len(values) - 1) * 100
 
 
 # ---------- DB ----------
@@ -847,6 +868,29 @@ def compute_industry_flow(db_path, snapshot, avg_days=5):
             )
         )
 
+    # 三個原始指標的單位不同（百分比、倍數、資金比重），先各自在產業橫斷面
+    # 轉成 0～100 百分位，再計算綜合熱度，避免任何一個數值尺度主導結果。
+    popularity_values = [r.capital_share_pct for r in results]
+    momentum_values = [r.avg_change_pct for r in results if r.avg_change_pct is not None]
+    volume_values = [r.volume_ratio for r in results if r.volume_ratio is not None]
+    for result in results:
+        result.popularity_score = _cross_sectional_percentile(
+            result.capital_share_pct, popularity_values
+        )
+        result.momentum_score = _cross_sectional_percentile(
+            result.avg_change_pct, momentum_values
+        )
+        result.volume_score = _cross_sectional_percentile(
+            result.volume_ratio, volume_values
+        )
+        scores = (
+            result.popularity_score,
+            result.momentum_score,
+            result.volume_score,
+        )
+        if all(score is not None for score in scores):
+            result.composite_score = sum(scores) / len(scores)
+
     results.sort(key=lambda r: r.total_trading_value, reverse=True)
     return results
 
@@ -1107,6 +1151,142 @@ def get_industry_top_stocks_range(db_path, snapshot, industry, days, top_n=30, v
     return results[:top_n]
 
 
+# ---------- 全市場個股資金流入排行 ----------
+
+@dataclass
+class StockCapitalFlow:
+    """單一股票在指定區間內的資金流向代理指標。
+
+    專案目前沒有逐筆主動買賣資料，因此這裡的「資金流入」以區間累積成交金額
+    代表資金集中程度；不是法人淨買超，也不是全市場真正的資金淨流入。
+    """
+
+    ticker: str
+    name: str
+    market: str
+    industry: str
+    close: float | None
+    change_pct: float | None
+    trading_value: float
+    today_trading_value: float
+    today_volume: int | None
+    avg_volume: float | None
+    volume_ratio: float | None
+    capital_share_pct: float
+
+
+def compute_stock_capital_flow(db_path, snapshot, avg_days=20, top_n=50, volume_avg_days=5):
+    """回傳全市場前 top_n 名個股的區間成交金額排行。
+
+    「資金流入」的實際計算口徑是今日 snapshot 加上前 avg_days-1 個交易日的
+    累積成交金額。這和產業資金流向／產業成分股的成交金額口徑一致，且完全使用
+    本地 snapshot 與 daily_prices，不新增網路 API 呼叫。
+
+    只納入有產業分類的股票，排除 ETF、權證等沒有產業分類的商品。歷史資料不足
+    的個股仍可參加排行，但至少要有 max(1, avg_days // 2) 筆歷史資料；避免只有
+    一兩天資料的股票因為區間較短而誤進排行。avg_days=1 時只使用今日資料。
+    """
+    industry_map = get_industry_map(db_path)
+    avg_days = max(1, int(avg_days))
+    top_n = max(1, int(top_n))
+    volume_avg_days = max(1, int(volume_avg_days))
+
+    today_by_ticker = {}
+    for price in snapshot.values():
+        if price.close is None or price.trading_value is None:
+            continue
+        industry = industry_map.get(price.ticker)
+        if not industry:
+            continue
+        today_by_ticker[price.ticker] = (price, industry)
+
+    if not today_by_ticker:
+        return []
+
+    snapshot_today = _snapshot_today(snapshot)
+    cutoff = (
+        date.fromisoformat(snapshot_today)
+        - timedelta(days=max(avg_days, volume_avg_days, 1) * 3)
+    ).isoformat()
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """SELECT ticker, date, close, trading_value, volume FROM daily_prices
+               WHERE date < ? AND date >= ? ORDER BY date DESC""",
+            (snapshot_today, cutoff),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    ticker_history = {}
+    for ticker, day, close, trading_value, volume in rows:
+        ticker_history.setdefault(ticker, []).append(
+            (day, close, trading_value or 0.0, volume or 0)
+        )
+
+    # 市場比重的分母要包含 snapshot 裡所有有成交金額的商品，不能只加總有產業
+    # 分類的股票；否則 ETF／權證等被排除後，個股的比重會被放大。
+    total_market_value = sum(
+        price.trading_value
+        for price in snapshot.values()
+        if price.trading_value and price.trading_value > 0
+    )
+    min_history_days = max(1, avg_days // 2)
+    results = []
+    for ticker, (price, industry) in today_by_ticker.items():
+        # 個別股票的 snapshot 日期可能比眾數日期舊，必須用該股票自己的日期切分，
+        # 避免把同一天資料誤當成歷史基準。
+        full_history = [
+            row for row in ticker_history.get(ticker, []) if row[0] < price.date
+        ]
+        history = full_history[: max(avg_days - 1, 0)]
+        if avg_days > 1 and len(history) < min_history_days:
+            continue
+
+        baseline_close = history[-1][1] if history and history[-1][1] else None
+        change_pct = (
+            (price.close - baseline_close) / baseline_close * 100
+            if baseline_close
+            else None
+        )
+        trading_value = price.trading_value + sum(
+            value for _day, _close, value, _volume in history
+        )
+        volume_history = [
+            volume for _day, _close, _value, volume in full_history[:volume_avg_days]
+        ]
+        avg_volume = sum(volume_history) / len(volume_history) if volume_history else None
+        volume_ratio = (
+            price.volume / avg_volume
+            if price.volume is not None and avg_volume and avg_volume > 0
+            else None
+        )
+        capital_share_pct = (
+            price.trading_value / total_market_value * 100
+            if total_market_value > 0
+            else 0.0
+        )
+        results.append(
+            StockCapitalFlow(
+                ticker=ticker,
+                name=price.name or "",
+                market=price.market or "",
+                industry=industry,
+                close=price.close,
+                change_pct=change_pct,
+                trading_value=trading_value,
+                today_trading_value=price.trading_value,
+                today_volume=price.volume,
+                avg_volume=avg_volume,
+                volume_ratio=volume_ratio,
+                capital_share_pct=capital_share_pct,
+            )
+        )
+
+    results.sort(key=lambda row: row.trading_value, reverse=True)
+    return results[:top_n]
+
+
 # ---------- 個股量比異常清單 ----------
 
 VOLUME_RATIO_TIERS = ("1.5～2倍", "2～3倍", "3倍以上")
@@ -1116,6 +1296,7 @@ VOLUME_RATIO_TIERS = ("1.5～2倍", "2～3倍", "3倍以上")
 class VolumeRatioOutlier:
     ticker: str
     name: str
+    industry: str
     market: str
     close: float | None
     change_pct: float | None
@@ -1200,6 +1381,7 @@ def compute_volume_ratio_outliers(db_path, snapshot, avg_days=5, min_ratio=1.5):
             VolumeRatioOutlier(
                 ticker=ticker,
                 name=price.name,
+                industry=industry_map.get(ticker, "未分類"),
                 market=price.market,
                 close=price.close,
                 change_pct=_change_pct(price),

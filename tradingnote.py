@@ -3,7 +3,6 @@
 
 import re
 import unicodedata
-from pathlib import Path
 
 from tradingnote_core import (
     add_position,
@@ -25,12 +24,13 @@ from tradingnote_history import (
     record_snapshot,
 )
 from tradingnote_http import PriceFetchError
+from tradingnote_paths import APP_PATHS
 
-DATA_DIR = Path(__file__).parent / "data"
-POSITIONS_PATH = DATA_DIR / "positions.json"
-CACHE_PATH = DATA_DIR / "price_cache.json"
-HISTORY_DB_PATH = DATA_DIR / "history.db"
-SETTINGS_PATH = DATA_DIR / "settings.json"
+DATA_DIR = APP_PATHS.data_dir
+POSITIONS_PATH = APP_PATHS.positions
+CACHE_PATH = APP_PATHS.price_cache
+HISTORY_DB_PATH = APP_PATHS.history_db
+SETTINGS_PATH = APP_PATHS.settings
 
 ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 GREEN = "\033[32m"

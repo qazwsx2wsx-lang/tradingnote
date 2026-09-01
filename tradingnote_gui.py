@@ -2,13 +2,10 @@
 """tradingnote - 圖形介面版本（PySide6 + pyqtgraph）"""
 
 import html
-import queue
 import statistics
 import sys
-import threading
 from collections import Counter
 from datetime import date, datetime
-from pathlib import Path
 
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -36,13 +33,11 @@ from tradingnote_history import (
     backfill_twse_history,
     compute_industry_flow,
     compute_valuation_flow,
-    compute_volume_ratio_outliers,
     default_start_date_for_days,
     get_available_dates,
     get_history_status,
     get_industry_directory,
     get_industry_map,
-    get_industry_top_stocks_range,
     get_large_traders_history_series,
     get_latest_ticker_record,
     record_snapshot,
@@ -75,19 +70,22 @@ from tradingnote_taifex import (
     large_traders_code_for_product,
     list_all_products,
 )
+from tradingnote_flow import FlowAnalysisService, FlowPeriod
 from tradingnote_ai_agent import GEMINI_RPM_HINT, run_agent_turn
 from tradingnote_ai_agent import get_call_count as get_gemini_call_count
 from tradingnote_http import PriceFetchError
+from tradingnote_paths import APP_PATHS
+from tradingnote_tasks import run_background_task
 
-DATA_DIR = Path(__file__).parent / "data"
-POSITIONS_PATH = DATA_DIR / "positions.json"
-CACHE_PATH = DATA_DIR / "price_cache.json"
-FUTURES_CACHE_PATH = DATA_DIR / "futures_cache.json"
-FUTURES_LARGE_TRADERS_CACHE_PATH = DATA_DIR / "futures_large_traders_cache.json"
-FUTURES_SSF_CACHE_PATH = DATA_DIR / "futures_ssf_cache.json"
-POSITION_DETAIL_CACHE_PATH = DATA_DIR / "position_detail_cache.json"
-HISTORY_DB_PATH = DATA_DIR / "history.db"
-SETTINGS_PATH = DATA_DIR / "settings.json"
+DATA_DIR = APP_PATHS.data_dir
+POSITIONS_PATH = APP_PATHS.positions
+CACHE_PATH = APP_PATHS.price_cache
+FUTURES_CACHE_PATH = APP_PATHS.futures_cache
+FUTURES_LARGE_TRADERS_CACHE_PATH = APP_PATHS.futures_large_traders_cache
+FUTURES_SSF_CACHE_PATH = APP_PATHS.futures_ssf_cache
+POSITION_DETAIL_CACHE_PATH = APP_PATHS.position_detail_cache
+HISTORY_DB_PATH = APP_PATHS.history_db
+SETTINGS_PATH = APP_PATHS.settings
 
 # 背景檢查「今天的資料是否已發布」的輪詢間隔。get_market_snapshot 本身有 30 分鐘
 # 快取（tradingnote_core.CACHE_TTL_SECONDS），所以就算這裡設得比 30 分鐘短，實際
@@ -126,6 +124,7 @@ COLOR_HOVER = "#EDEDED"
 # 漲跌（損益）刻意保留紅綠上色——功能性色彩，用來一眼辨識盈虧方向，不算裝飾用色。
 COLOR_GAIN = "#1E7A3E"
 COLOR_LOSS = "#C0392B"
+
 
 # matplotlib 的 tab20 定性配色表（手動內嵌，避免 pyqtgraph 為了取這組色再偷偷依賴 matplotlib）。
 # 黑白主題刻意不套用到這裡——這是資金流向頁唯一需要區分約35個產業類別的地方，改灰階會讓類別難以辨識。
@@ -196,6 +195,15 @@ QPushButton[accent="true"] {{
 }}
 QPushButton[accent="true"]:hover {{
     background: {COLOR_ACCENT_ACTIVE};
+}}
+QPushButton[flowSectionButton="true"] {{
+    padding: 6px 12px;
+    border-radius: 5px;
+}}
+QPushButton[flowSectionButton="true"]:checked {{
+    background: {COLOR_ACCENT};
+    color: {COLOR_ACCENT_TEXT};
+    font-weight: 600;
 }}
 QLineEdit {{
     background: {COLOR_SURFACE};
@@ -358,135 +366,6 @@ def _format_history_status(status):
     return "\n".join(lines)
 
 
-def run_backfill_in_thread(parent, target_days, progress_cb, done_cb, error_cb):
-    """在背景執行緒跑 backfill_twse_history，透過 queue + QTimer 把結果安全地送回 Qt 主執行緒。
-    BackfillDialog（手動回補）與啟動時的自動資料連續性同步共用同一套機制，
-    target_days 由呼叫端傳入（設定頁「回補天數」，未設定則沿用預設 120）。"""
-    q = queue.Queue()
-
-    def worker():
-        try:
-            done = backfill_twse_history(
-                HISTORY_DB_PATH,
-                target_days=target_days,
-                on_progress=lambda d, t: q.put(("progress", d, t)),
-            )
-            q.put(("done", done, None))
-        except Exception as e:  # noqa: BLE001 - surface any failure to the caller
-            q.put(("error", str(e), None))
-
-    timer = QtCore.QTimer(parent)
-
-    def poll():
-        try:
-            while True:
-                kind, a, b = q.get_nowait()
-                if kind == "progress":
-                    progress_cb(a, b)
-                elif kind == "done":
-                    timer.stop()
-                    done_cb(a)
-                    return
-                elif kind == "error":
-                    timer.stop()
-                    error_cb(a)
-                    return
-        except queue.Empty:
-            pass
-
-    timer.timeout.connect(poll)
-    timer.start(150)
-    threading.Thread(target=worker, daemon=True).start()
-    return timer
-
-
-def run_tpex_finmind_backfill_in_thread(parent, token, target_days, progress_cb, done_cb, error_cb):
-    """在背景執行緒跑 backfill_tpex_history_via_finmind，機制跟 run_backfill_in_thread
-    相同（背景執行緒＋queue＋QTimer 輪詢送回 Qt 主執行緒）。跟 TWSE 版不同的是
-    done_cb 收到的是一個 dict（done/total/newly_fetched/stopped_reason），不是單一
-    整數，因為額度可能用完提早停止，呼叫端需要分開處理「跑完」跟「額度用完」兩種
-    情況（見 TpexBackfillDialog._on_done）。"""
-    q = queue.Queue()
-
-    def worker():
-        try:
-            result = backfill_tpex_history_via_finmind(
-                HISTORY_DB_PATH,
-                token,
-                target_days=target_days,
-                on_progress=lambda done, total, ticker: q.put(("progress", done, total, ticker)),
-            )
-            q.put(("done", result, None, None))
-        except Exception as e:  # noqa: BLE001 - surface any failure to the caller
-            q.put(("error", str(e), None, None))
-
-    timer = QtCore.QTimer(parent)
-
-    def poll():
-        try:
-            while True:
-                kind, a, b, c = q.get_nowait()
-                if kind == "progress":
-                    progress_cb(a, b, c)
-                elif kind == "done":
-                    timer.stop()
-                    done_cb(a)
-                    return
-                elif kind == "error":
-                    timer.stop()
-                    error_cb(a)
-                    return
-        except queue.Empty:
-            pass
-
-    timer.timeout.connect(poll)
-    timer.start(150)
-    threading.Thread(target=worker, daemon=True).start()
-    return timer
-
-
-def _format_fetched_at(iso_string):
-    """position_detail_cache.json 存的 fetched_at 是 isoformat 字串，這裡轉成
-    畫面上顯示用的「YYYY-MM-DD HH:MM」，解析失敗（格式意外跑掉）就原字串照印，
-    不要為了美化格式讓整個部位詳細資訊區塊噴錯。"""
-    try:
-        return datetime.fromisoformat(iso_string).strftime("%Y-%m-%d %H:%M")
-    except (TypeError, ValueError):
-        return iso_string
-
-
-def run_task_in_thread(parent, work_fn, on_done, on_error):
-    """跑一個沒有進度回報、只有「完成／失敗」兩種結果的背景工作（例如查一次 FinMind
-    API），機制跟 run_backfill_in_thread 相同（背景執行緒＋queue＋QTimer 輪詢把結果
-    送回 Qt 主執行緒），但不需要 progress_cb，給 StockDetailDialog 這種一次性查詢用。"""
-    q = queue.Queue()
-
-    def worker():
-        try:
-            result = work_fn()
-            q.put(("done", result))
-        except Exception as e:  # noqa: BLE001 - surface any failure to the caller
-            q.put(("error", str(e)))
-
-    timer = QtCore.QTimer(parent)
-
-    def poll():
-        try:
-            kind, payload = q.get_nowait()
-        except queue.Empty:
-            return
-        timer.stop()
-        if kind == "done":
-            on_done(payload)
-        else:
-            on_error(payload)
-
-    timer.timeout.connect(poll)
-    timer.start(150)
-    threading.Thread(target=worker, daemon=True).start()
-    return timer
-
-
 def _record_valuation_snapshot_best_effort():
     """盡力而為記錄今天的本益比／股價淨值比快照（TWSE／TPEX 官方 bulk 端點各打
     一次），供泡泡圖「估值百分位」新模式逐日累積用（見 tradingnote_history.
@@ -504,108 +383,111 @@ def _record_valuation_snapshot_best_effort():
         pass
 
 
+def run_backfill_in_thread(parent, target_days, progress_cb, done_cb, error_cb):
+    def work(_cancel_event, emit):
+        return backfill_twse_history(
+            HISTORY_DB_PATH,
+            target_days=target_days,
+            on_progress=lambda done, total: emit(done, total),
+        )
+
+    return run_background_task(
+        parent,
+        work,
+        done_cb,
+        error_cb,
+        on_progress=progress_cb,
+    )
+
+
+def run_tpex_finmind_backfill_in_thread(
+    parent, token, target_days, progress_cb, done_cb, error_cb
+):
+    def work(_cancel_event, emit):
+        return backfill_tpex_history_via_finmind(
+            HISTORY_DB_PATH,
+            token,
+            target_days=target_days,
+            on_progress=lambda done, total, ticker: emit(done, total, ticker),
+        )
+
+    return run_background_task(
+        parent,
+        work,
+        done_cb,
+        error_cb,
+        on_progress=progress_cb,
+    )
+
+
+def run_task_in_thread(parent, work_fn, on_done, on_error):
+    return run_background_task(
+        parent,
+        lambda _cancel_event, _emit: work_fn(),
+        on_done,
+        on_error,
+    )
+
+
+def _format_fetched_at(iso_string):
+    """把 position_detail_cache.json 的時間戳格式化成畫面可讀的文字。
+
+    舊快取若有異常格式，不應該讓整個部位詳細資訊區塊無法顯示，直接保留
+    原字串作為 fallback。
+    """
+    try:
+        return datetime.fromisoformat(iso_string).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return iso_string
+
+
 def run_refresh_in_thread(parent, progress_cb, done_cb, error_cb):
-    """在背景執行緒重新整理即時報價＋寫入歷史資料庫，機制跟 run_backfill_in_thread／
-    run_task_in_thread 相同（背景執行緒＋queue＋QTimer 輪詢送回 Qt 主執行緒）。
-    progress_cb(done, total, label) 傳數字進度＋階段文字，給「重新整理」彈窗畫進度條用：
-    共 4 個階段（TWSE、TPEX、寫入快取——這 3 個轉發自 get_market_snapshot 的
-    on_progress——再加上寫入歷史資料庫），避免 TWSE/TPEX 網路延遲時整個視窗看起來像當掉。"""
-    q = queue.Queue()
     total_steps = 4
 
-    def worker():
-        try:
-            snapshot = get_market_snapshot(
-                CACHE_PATH,
-                force_refresh=True,
-                on_progress=lambda done, _total, label: q.put(
-                    ("progress", done, total_steps, label)
-                ),
-            )
-            q.put(("progress", 3, total_steps, "正在寫入歷史資料庫..."))
-            record_snapshot(HISTORY_DB_PATH, snapshot)
-            _record_valuation_snapshot_best_effort()
-            q.put(("progress", 4, total_steps, "完成"))
-            q.put(("done", snapshot, None, None))
-        except PriceFetchError as e:  # noqa: BLE001 - surface any failure to the caller
-            q.put(("error", str(e), None, None))
+    def work(_cancel_event, emit):
+        snapshot = get_market_snapshot(
+            CACHE_PATH,
+            force_refresh=True,
+            on_progress=lambda done, _total, label: emit(done, total_steps, label),
+        )
+        emit(3, total_steps, "??????????????..")
+        record_snapshot(HISTORY_DB_PATH, snapshot)
+        _record_valuation_snapshot_best_effort()
+        emit(4, total_steps, "???")
+        return snapshot
 
-    timer = QtCore.QTimer(parent)
-
-    def poll():
-        try:
-            while True:
-                kind, a, b, c = q.get_nowait()
-                if kind == "progress":
-                    progress_cb(a, b, c)
-                elif kind == "done":
-                    timer.stop()
-                    done_cb(a)
-                    return
-                elif kind == "error":
-                    timer.stop()
-                    error_cb(a)
-                    return
-        except queue.Empty:
-            pass
-
-    timer.timeout.connect(poll)
-    timer.start(150)
-    threading.Thread(target=worker, daemon=True).start()
-    return timer
+    return run_background_task(
+        parent,
+        work,
+        done_cb,
+        error_cb,
+        on_progress=progress_cb,
+    )
 
 
 def run_startup_preload_in_thread(parent, progress_cb, done_cb, error_cb):
-    """App 啟動時、TradingNoteWindow 建立前，在背景執行緒抓取即時報價、寫入歷史
-    資料庫、更新產業分類（機制跟 run_refresh_in_thread 相同）。原本這三步是在
-    TradingNoteWindow.__init__ 裡同步做，視窗要等全部做完才 show()，網路慢時
-    畫面會完全沒反應；改成背景執行緒＋StartupProgressDialog 讓使用者看得到進度。
-    多做「更新產業分類」是因為 __init__ 後續的 refresh_flow_tab／refresh_stocks_tab
-    也需要它，先在這裡連網更新好，__init__ 裡才不用再連一次網。"""
-    q = queue.Queue()
     total_steps = 4
 
-    def worker():
-        try:
-            snapshot = get_market_snapshot(
-                CACHE_PATH,
-                on_progress=lambda done, _total, label: q.put(
-                    ("progress", done, total_steps, label)
-                ),
-            )
-            q.put(("progress", 3, total_steps, "正在寫入歷史資料庫..."))
-            record_snapshot(HISTORY_DB_PATH, snapshot)
-            _record_valuation_snapshot_best_effort()
-            q.put(("progress", 3, total_steps, "正在更新產業分類..."))
-            get_industry_map(HISTORY_DB_PATH)
-            q.put(("progress", 4, total_steps, "完成"))
-            q.put(("done", snapshot, None, None))
-        except PriceFetchError as e:  # noqa: BLE001 - surface any failure to the caller
-            q.put(("error", str(e), None, None))
+    def work(_cancel_event, emit):
+        snapshot = get_market_snapshot(
+            CACHE_PATH,
+            on_progress=lambda done, _total, label: emit(done, total_steps, label),
+        )
+        emit(3, total_steps, "??????????????..")
+        record_snapshot(HISTORY_DB_PATH, snapshot)
+        _record_valuation_snapshot_best_effort()
+        emit(3, total_steps, "????????????...")
+        get_industry_map(HISTORY_DB_PATH)
+        emit(4, total_steps, "???")
+        return snapshot
 
-    timer = QtCore.QTimer(parent)
-
-    def poll():
-        try:
-            while True:
-                kind, a, b, c = q.get_nowait()
-                if kind == "progress":
-                    progress_cb(a, b, c)
-                elif kind == "done":
-                    timer.stop()
-                    done_cb(a)
-                    return
-                elif kind == "error":
-                    timer.stop()
-                    error_cb(a)
-                    return
-        except queue.Empty:
-            pass
-
-    timer.timeout.connect(poll)
-    timer.start(150)
-    threading.Thread(target=worker, daemon=True).start()
-    return timer
+    return run_background_task(
+        parent,
+        work,
+        done_cb,
+        error_cb,
+        on_progress=progress_cb,
+    )
 
 
 class StartupProgressDialog(QtWidgets.QDialog):
@@ -765,10 +647,10 @@ class StockDetailDialog(QtWidgets.QDialog):
     股票、以及不分市場的三大法人買賣超，仍查 FinMind。查詢在背景執行緒跑
     （run_task_in_thread），避免網路延遲卡住整個視窗。「顯示完整籌碼面資訊」
     按鈕另外提供跟「部位紀錄」頁選取部位時同一份資料（融資融券／外資持股／
-    借券／停資停券／VPT／MFI，見 _on_show_full_detail），共用同一份
+    借券／停資停券／VPT／MFI／KD／MACD／均線／RSI，見 _on_show_full_detail），共用同一份
     position_detail_cache.json（key 是 ticker，不分是從部位紀錄還是這裡查
-    的）、也共用 _render_detail_block 畫面邏輯；不點按鈕就不會多打那六支
-    FinMind API，避免瀏覽「個股」頁清單時無謂燒額度。"""
+    的）、也共用 _render_detail_block 畫面邏輯；不點按鈕就不會多打完整籌碼查詢，
+    避免瀏覽「個股」頁清單時無謂燒額度。"""
 
     def __init__(self, parent, ticker, name, finmind_token, market=None):
         super().__init__(parent)
@@ -848,7 +730,7 @@ class StockDetailDialog(QtWidgets.QDialog):
     def _build_full_detail_widgets(self):
         """第一次按下「顯示完整籌碼面資訊」時才建立這些 widget，插在按鈕跟
         關閉鈕之間。文字摘要固定顯示在上方，五張圖表改用 QTabWidget（分頁
-        選單在上方切換），一次只顯示一張圖，不用像 QScrollArea 那樣把五張圖
+        選單在上方切換），一次只顯示一張圖，不用像 QScrollArea 那樣把多張圖
         疊起來捲動瀏覽；同時把視窗放大到看得下內容的尺寸（初始只有一行狀態
         文字時不需要這麼大）。"""
         self.full_detail_label = QtWidgets.QLabel("")
@@ -872,6 +754,7 @@ class StockDetailDialog(QtWidgets.QDialog):
             chart.showGrid(x=True, y=True, alpha=0.15)
             chart.setMinimumHeight(320)
             chart.addLegend()
+        _setup_price_chart_click(self.full_detail_price_chart)
 
         self.full_detail_tabs = QtWidgets.QTabWidget()
         self.full_detail_tabs.addTab(self.full_detail_price_chart, "歷史股價")
@@ -880,6 +763,8 @@ class StockDetailDialog(QtWidgets.QDialog):
         self.full_detail_tabs.addTab(self.full_detail_margin_chart, "融資融券")
         self.full_detail_tabs.addTab(self.full_detail_vpt_chart, "VPT")
         self.full_detail_tabs.addTab(self.full_detail_mfi_chart, "MFI")
+        self.full_detail_technical_widget = TechnicalAnalysisWidget()
+        self.full_detail_tabs.addTab(self.full_detail_technical_widget, "技術分析")
 
         insert_at = self._layout.indexOf(self.full_detail_button) + 1
         self._layout.insertWidget(insert_at, self.full_detail_label)
@@ -914,9 +799,11 @@ class StockDetailDialog(QtWidgets.QDialog):
                 header,
                 cached,
                 note,
+                technical_widget=self.full_detail_technical_widget,
             )
         else:
             self.full_detail_label.setText(f"{header}\n\nFinMind 查詢中...")
+            self.full_detail_technical_widget.set_data(None)
 
         def fetch():
             data = fetch_position_detail(self.ticker, self.finmind_token, market=self.market)
@@ -943,6 +830,7 @@ class StockDetailDialog(QtWidgets.QDialog):
             self.full_detail_mfi_chart,
             header,
             data,
+            technical_widget=self.full_detail_technical_widget,
         )
         self._notify_finmind_call()
 
@@ -967,6 +855,7 @@ class StockDetailDialog(QtWidgets.QDialog):
                 header,
                 cached,
                 note,
+                technical_widget=self.full_detail_technical_widget,
             )
         else:
             self.full_detail_button.setText("顯示完整籌碼面資訊（同部位紀錄）")
@@ -982,9 +871,8 @@ class IndustryTopStocksDialog(QtWidgets.QDialog):
     近 days 個交易日累積成交金額前 N 大成分股（市值資料的代理指標，見
     get_industry_top_stocks_range；N 不足時全部顯示），並附上近日成交量／均量／
     本益比。純本地資料（daily_prices／valuation_history 快取），不打任何
-    API，開啟即顯示。泡泡圖跟清單各自有獨立的「資料區間」設定，這裡的 days
-    就是觸發點擊當下那邊的區間天數，讓彈出視窗的口徑跟畫面上看到的一致；均量／
-    本益比則固定用 get_industry_top_stocks_range 內建的天數，不受 days 影響。"""
+    API，開啟即顯示。days 來自資金流向頁最上方的共用期間，讓累積成交金額與
+    近日均量都跟畫面上看到的分析口徑一致；本益比則取既有最新估值快取。"""
 
     def __init__(self, parent, industry, top_stocks, days):
         super().__init__(parent)
@@ -995,7 +883,7 @@ class IndustryTopStocksDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 12)
 
-        table = QtWidgets.QTableWidget(len(top_stocks), 8)
+        table = QtWidgets.QTableWidget(len(top_stocks), 9)
         table.setHorizontalHeaderLabels(
             [
                 "代號",
@@ -1006,6 +894,7 @@ class IndustryTopStocksDialog(QtWidgets.QDialog):
                 "近日量(張)",
                 "均量(張)",
                 "本益比",
+                "EPS",
             ]
         )
         table.verticalHeader().setVisible(False)
@@ -1018,6 +907,7 @@ class IndustryTopStocksDialog(QtWidgets.QDialog):
             color = COLOR_GAIN if (change_pct or 0) >= 0 else COLOR_LOSS
             avg_volume = stock["avg_volume"]
             per = stock["per"]
+            eps = stock["close"] / per if per else None
             values = [
                 stock["ticker"],
                 stock["name"] or "-",
@@ -1027,10 +917,11 @@ class IndustryTopStocksDialog(QtWidgets.QDialog):
                 f"{stock['today_volume'] / 1000:,.0f}" if stock["today_volume"] is not None else "-",
                 f"{avg_volume / 1000:,.0f}" if avg_volume is not None else "-",
                 f"{per:.2f}" if per is not None else "N/A",
+                f"{eps:.2f}" if eps is not None else "N/A",
             ]
             for col, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
-                if col in (0, 2, 3, 4, 5, 6, 7):
+                if col in (0, 2, 3, 4, 5, 6, 7, 8):
                     item.setTextAlignment(QtCore.Qt.AlignCenter)
                 if col == 3 and change_pct is not None:
                     item.setForeground(QtGui.QColor(color))
@@ -1387,30 +1278,42 @@ VALUATION_METRIC_LABELS = {"per": "本益比 PER", "pbr": "股價淨值比 PBR"}
 
 
 def populate_flow_chart(
-    chart, db_path, snapshot, avg_days=5, on_industry_click=None, mode="momentum", valuation_metric="per"
+    chart,
+    db_path,
+    snapshot,
+    avg_days=5,
+    on_industry_click=None,
+    mode="momentum",
+    valuation_metric="per",
+    dashboard=None,
 ):
     """把產業資金流向資料畫進既有的 FlowChartWidget（保留使用者目前的縮放/平移狀態不做）。
     avg_days 決定 X／Y 兩軸的天數（5/10/20 日流向切換），只影響 mode="momentum"；
-    mode="valuation" 有自己固定的 5/20 日資金流入窗口（見下），不吃 avg_days。
+    mode="valuation" 使用 dashboard 提供的共用期間；沒有 dashboard 時才回退到獨立計算。
     on_industry_click 若提供，點擊泡泡時會被呼叫並帶入該產業名稱（例如用來刷新
     下方的成分股面板）。
 
     `mode="momentum"`（預設）：X＝近 avg_days 日累積漲跌%、Y＝今日量比，即原本的
     「產業資金流向」泡泡圖。`mode="valuation"`：X＝valuation_metric（PER 或 PBR）
     最新一筆數值（成交金額加權平均，只需要今天/最近一次的估值快照，不用等歷史
-    百分位）、Y＝資金流入強度（近 5 日均額 ÷ 近 20 日均額），找的是左上角——
+    百分位）、Y＝資金流入強度（短期窗口 ÷ 所選流向區間），找的是左上角——
     估值比其他產業便宜、流入強度高（錢已經在進）的產業，見 compute_valuation_flow。"""
     chart.clear()
     vb = chart.getPlotItem().getViewBox()
 
     if mode == "valuation":
-        valuation_short_days, valuation_long_days = 5, 20
-        flow = compute_valuation_flow(
-            db_path,
-            snapshot,
-            short_days=valuation_short_days,
-            long_days=valuation_long_days,
-            metric=valuation_metric,
+        valuation_short_days = min(5, max(1, avg_days))
+        valuation_long_days = max(valuation_short_days, max(1, avg_days))
+        flow = (
+            dashboard.valuation_flow
+            if dashboard is not None and dashboard.valuation_flow is not None
+            else compute_valuation_flow(
+                db_path,
+                snapshot,
+                short_days=valuation_short_days,
+                long_days=valuation_long_days,
+                metric=valuation_metric,
+            )
         )
         plotted = [
             f for f in flow if f.latest_valuation is not None and f.money_flow_ratio is not None
@@ -1433,7 +1336,11 @@ def populate_flow_chart(
         x_ref_line = statistics.median(xs_for_ref) if xs_for_ref else 0
         y_ref_line = 1
     else:
-        flow = compute_industry_flow(db_path, snapshot, avg_days=avg_days)
+        flow = (
+            dashboard.industry_flow
+            if dashboard is not None
+            else compute_industry_flow(db_path, snapshot, avg_days=avg_days)
+        )
         plotted = [f for f in flow if f.volume_ratio is not None and f.avg_change_pct is not None]
         xs_of = lambda f: f.avg_change_pct  # noqa: E731
         ys_of = lambda f: f.volume_ratio  # noqa: E731
@@ -1546,11 +1453,18 @@ def _populate_price_chart(chart, price_history):
     收盤價（使用者要的是「歷史股價資訊圖」，不是另外疊漲跌%／成交量，避免跟
     其他幾張圖一樣的軸混在一起）。"""
     chart.clear()
+    # chart.clear() 會把先前點擊留下的標記線／文字一併清掉，這裡順便重置追蹤
+    # 用的屬性，避免 _on_price_chart_click 之後 removeItem 到已經不存在的物件。
+    chart._click_marker_items = []
+    chart._price_dates = None
+    chart._price_closes = None
     if not price_history:
         return
 
     dates = [row["date"] for row in price_history]
     closes = [row["close"] for row in price_history]
+    chart._price_dates = dates
+    chart._price_closes = closes
     x = list(range(len(dates)))
     step = max(1, len(dates) // 8)
     chart.getPlotItem().getAxis("bottom").setTicks(
@@ -1568,6 +1482,43 @@ def _populate_price_chart(chart, price_history):
     y_pad = max((y_hi - y_lo) * 0.1, 1.0)
     chart.setXRange(min(x), max(x), padding=0.02)
     chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
+
+
+def _setup_price_chart_click(chart):
+    """幫「歷史股價」圖加上滑鼠點擊查看該日股價的功能：點圖上任一位置，找出
+    最接近的交易日，畫一條垂直虛線＋文字標出「日期｜收盤價」。只在 PlotWidget
+    建立時呼叫一次——scene 的訊號連線是永久的，不會因為 _populate_price_chart
+    之後的 chart.clear() 而消失；_populate_price_chart 每次重繪時把最新的
+    dates／closes 存到 chart 物件上（見該函式），這裡的 handler 讀取當下存的
+    那份，不用另外傳參數，重新整理／切換股票後點擊仍然對得上目前顯示的資料。"""
+    vb = chart.getPlotItem().getViewBox()
+
+    def on_click(event):
+        dates = getattr(chart, "_price_dates", None)
+        closes = getattr(chart, "_price_closes", None)
+        if not dates:
+            return
+        if not chart.getPlotItem().sceneBoundingRect().contains(event.scenePos()):
+            return
+        point = vb.mapSceneToView(event.scenePos())
+        idx = round(point.x())
+        idx = max(0, min(len(dates) - 1, idx))
+
+        for item in getattr(chart, "_click_marker_items", []):
+            chart.removeItem(item)
+
+        marker_line = pg.InfiniteLine(
+            pos=idx, angle=90, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1)
+        )
+        label = pg.TextItem(
+            f"{dates[idx]}｜{closes[idx]:.2f}", color=COLOR_TEXT, anchor=(0.5, 1)
+        )
+        label.setPos(idx, closes[idx])
+        chart.addItem(marker_line)
+        chart.addItem(label)
+        chart._click_marker_items = [marker_line, label]
+
+    chart.scene().sigMouseClicked.connect(on_click)
 
 
 def _populate_flow_chart(chart, history):
@@ -1770,6 +1721,142 @@ def _populate_mfi_chart(chart, vpt_mfi_history):
     _mark_latest_value(chart, x, dates, series, "#bcbd22", "{:.1f}")
 
 
+def _plot_technical_series(chart, dates, series, color, name):
+    points = [
+        (index, value)
+        for index, value in enumerate(series or ())
+        if value is not None
+    ]
+    if not points:
+        return []
+    x, y = zip(*points)
+    chart.plot(x, y, pen=pg.mkPen(color, width=2), name=name)
+    return list(y)
+
+
+def _populate_technical_chart(chart, technical_data, mode="kd"):
+    """繪製本地計算的 KD／MACD／均線圖。"""
+    chart.clear()
+    if not technical_data or not technical_data.get("dates"):
+        empty = pg.TextItem("尚無足夠歷史價格資料可計算技術指標", color=COLOR_MUTED)
+        chart.addItem(empty)
+        empty.setPos(0, 0)
+        chart.setTitle("技術分析", color=COLOR_TEXT, size="11pt")
+        return
+
+    dates = technical_data["dates"]
+    x = list(range(len(dates)))
+    values = []
+    if mode == "macd":
+        macd = technical_data.get("macd", {})
+        values += _plot_technical_series(chart, dates, macd.get("macd"), "#1f77b4", "MACD")
+        values += _plot_technical_series(
+            chart, dates, macd.get("signal"), "#d62728", "Signal"
+        )
+        values += _plot_technical_series(
+            chart, dates, macd.get("histogram"), "#7f7f7f", "Histogram"
+        )
+        chart.setLabel("left", "MACD", color=COLOR_TEXT)
+        chart.setTitle("MACD（12／26／9）", color=COLOR_TEXT, size="11pt")
+        chart.addLine(y=0, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine))
+    elif mode == "ma":
+        values += _plot_technical_series(chart, dates, technical_data.get("close"), COLOR_TEXT, "收盤")
+        ma = technical_data.get("ma", {})
+        values += _plot_technical_series(chart, dates, ma.get("ma5"), "#1f77b4", "MA5")
+        values += _plot_technical_series(chart, dates, ma.get("ma20"), "#ff7f0e", "MA20")
+        values += _plot_technical_series(chart, dates, ma.get("ma60"), "#2ca02c", "MA60")
+        chart.setLabel("left", "價格", color=COLOR_TEXT)
+        chart.setTitle("均線（MA5／MA20／MA60）", color=COLOR_TEXT, size="11pt")
+    else:
+        kd = technical_data.get("kd", {})
+        values += _plot_technical_series(chart, dates, kd.get("k"), "#1f77b4", "K")
+        values += _plot_technical_series(chart, dates, kd.get("d"), "#d62728", "D")
+        chart.setLabel("left", "數值", color=COLOR_TEXT)
+        chart.setTitle("KD（9／3／3）", color=COLOR_TEXT, size="11pt")
+        chart.addLine(y=80, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine))
+        chart.addLine(y=20, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine))
+
+    chart.setLabel("bottom", "交易日", color=COLOR_TEXT)
+    if x:
+        chart.setXRange(min(x), max(x), padding=0.02)
+    if mode == "kd":
+        chart.setYRange(0, 100, padding=0.02)
+    elif values:
+        y_lo, y_hi = min(values), max(values)
+        if y_lo == y_hi:
+            pad = max(abs(y_lo) * 0.02, 1.0)
+            y_lo -= pad
+            y_hi += pad
+        chart.setYRange(y_lo, y_hi, padding=0.12)
+
+
+class TechnicalAnalysisWidget(QtWidgets.QWidget):
+    """個股明細共用的技術分析視圖。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QtWidgets.QVBoxLayout(self)
+        controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(QtWidgets.QLabel("指標："))
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.addItem("KD", "kd")
+        self.mode_combo.addItem("MACD", "macd")
+        self.mode_combo.addItem("均線", "ma")
+        self.mode_combo.currentIndexChanged.connect(self._refresh_chart)
+        controls.addWidget(self.mode_combo)
+        self.latest_label = QtWidgets.QLabel("")
+        self.latest_label.setProperty("muted", True)
+        controls.addWidget(self.latest_label)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        self.chart = pg.PlotWidget()
+        self.chart.setBackground(COLOR_BG)
+        self.chart.showGrid(x=True, y=True, alpha=0.15)
+        self.chart.setMinimumHeight(320)
+        self.chart.addLegend()
+        layout.addWidget(self.chart, 1)
+        self._technical_data = None
+
+    def set_data(self, technical_data):
+        self._technical_data = technical_data
+        self._refresh_chart()
+
+    def _refresh_chart(self):
+        mode = self.mode_combo.currentData()
+        _populate_technical_chart(self.chart, self._technical_data, mode)
+        self.latest_label.setText(self._latest_text(mode))
+
+    def _latest_text(self, mode):
+        data = self._technical_data
+        if not data:
+            return "資料不足"
+        if mode == "macd":
+            group = data.get("macd", {})
+            return (
+                f"MACD {self._last(group.get('macd'))}　"
+                f"Signal {self._last(group.get('signal'))}　"
+                f"柱體 {self._last(group.get('histogram'))}"
+            )
+        if mode == "ma":
+            ma = data.get("ma", {})
+            return (
+                f"收盤 {self._last(data.get('close'))}　"
+                f"MA5 {self._last(ma.get('ma5'))}　"
+                f"MA20 {self._last(ma.get('ma20'))}　"
+                f"MA60 {self._last(ma.get('ma60'))}"
+            )
+        kd = data.get("kd", {})
+        return f"K {self._last(kd.get('k'))}　D {self._last(kd.get('d'))}"
+
+    @staticmethod
+    def _last(values):
+        for value in reversed(values or []):
+            if value is not None:
+                return f"{value:.2f}"
+        return "N/A"
+
+
 def _render_detail_block(
     label,
     price_chart,
@@ -1781,8 +1868,9 @@ def _render_detail_block(
     header,
     data,
     note=None,
+    technical_widget=None,
 ):
-    """畫「個股籌碼面詳細資訊」文字摘要＋六張趨勢圖（歷史股價／三大法人／
+    """畫「個股籌碼面詳細資訊」文字摘要＋六張趨勢圖與技術分析（歷史股價／三大法人／
     法人分別／融資融券／VPT／MFI）。data 是 fetch_position_detail() 的回傳值（不管是剛
     查到的，還是 position_detail_cache.json 讀出來的上次結果，shape 都相同，見
     tradingnote_finmind.POSITION_DETAIL_FIELDS）；「部位紀錄」頁跟「個股」頁的
@@ -1885,6 +1973,8 @@ def _render_detail_block(
     _populate_margin_chart(margin_chart, margin_history)
     _populate_vpt_chart(vpt_chart, data.get("vpt_mfi_history"))
     _populate_mfi_chart(mfi_chart, data.get("vpt_mfi_history"))
+    if technical_widget is not None:
+        technical_widget.set_data(data.get("technical_indicators"))
 
 
 class TradingCalendarWidget(QtWidgets.QCalendarWidget):
@@ -1985,6 +2075,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self._ticker_concept_map = build_ticker_concept_map(load_concepts())
         self.snapshot = snapshot
         self.last_error = last_error
+        self.flow_service = FlowAnalysisService(HISTORY_DB_PATH)
         self.staleness_warning = (
             "；".join(snapshot_staleness_warnings(self.snapshot)) if self.snapshot else ""
         )
@@ -2035,6 +2126,14 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self._build_settings_tab()
 
         self.status_bar = QtWidgets.QStatusBar()
+        self.status_bar.setSizeGripEnabled(False)
+        self.status_bar_label = QtWidgets.QLabel()
+        self.status_bar_label.setWordWrap(True)
+        self.status_bar_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.status_bar_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred
+        )
+        self.status_bar.addWidget(self.status_bar_label, 1)
         self.setStatusBar(self.status_bar)
 
         self.refresh_table()
@@ -2120,9 +2219,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
     # ---------- 資金流向分析頁 ----------
 
     def _build_flow_tab(self):
-        # 外層固定包一層 QScrollArea：分頁本體（工具列＋泡泡圖＋資金動向清單）放進
-        # 可捲動的內容區塊，內容高度／寬度超出視窗時改用捲軸瀏覽，而不是被硬擠壓
-        # 變形——加了下方清單後整頁變高，這樣才不會在小視窗下看不到清單。
+        # 外層保留一層 QScrollArea 作為小視窗／高 DPI 的最後防線；主要內容改用
+        # 「分類按鍵＋單一內容頁」呈現，避免泡泡圖、產業清單、個股清單與爆量
+        # 清單同時垂直堆疊，讓資金流向頁不必長距離捲動。
         outer_layout = QtWidgets.QVBoxLayout(self.flow_tab)
         outer_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -2137,8 +2236,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(content)
         layout.setContentsMargins(10, 10, 10, 10)
 
-        self.flow_avg_days = 5
-        self.flow_start_date = default_start_date_for_days(HISTORY_DB_PATH, self.flow_avg_days)
+        self.flow_period = FlowPeriod(
+            default_start_date_for_days(HISTORY_DB_PATH, 5), 5
+        )
 
         toolbar = QtWidgets.QHBoxLayout()
         toolbar.addWidget(QtWidgets.QLabel("流向區間："))
@@ -2165,19 +2265,68 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addLayout(toolbar)
         self._update_flow_date_button()
 
+        section_bar = QtWidgets.QHBoxLayout()
+        section_bar.setSpacing(6)
+        section_bar.addWidget(QtWidgets.QLabel("顯示分類："))
+        self.flow_section_group = QtWidgets.QButtonGroup(self)
+        self.flow_section_group.setExclusive(True)
+        self.flow_section_buttons = []
+
+        self.flow_section_stack = QtWidgets.QStackedWidget()
+        self.flow_section_stack.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+        )
+
+        sections = (
+            ("產業泡泡圖", self._build_flow_chart_section),
+            ("產業熱度排行", self._build_flow_list_section),
+            ("資金流入前 50", self._build_stock_capital_flow_section),
+            ("個股爆量", self._build_volume_outliers_section),
+        )
+        for index, (label, builder) in enumerate(sections):
+            button = QtWidgets.QPushButton(label)
+            button.setCheckable(True)
+            button.setAutoExclusive(True)
+            button.setProperty("flowSectionButton", True)
+            button.clicked.connect(
+                lambda _checked, page_index=index: self.flow_section_stack.setCurrentIndex(
+                    page_index
+                )
+            )
+            self.flow_section_group.addButton(button, index)
+            self.flow_section_buttons.append(button)
+            section_bar.addWidget(button)
+
+            page = QtWidgets.QWidget()
+            page_layout = QtWidgets.QVBoxLayout(page)
+            page_layout.setContentsMargins(0, 8, 0, 0)
+            builder(page_layout)
+            self.flow_section_stack.addWidget(page)
+
+        section_bar.addStretch(1)
+        layout.addLayout(section_bar)
+        layout.addWidget(self.flow_section_stack, 1)
+        self.flow_section_buttons[0].setChecked(True)
+
+    def _build_flow_chart_section(self, layout):
+        header = QtWidgets.QLabel("產業資金流向圖")
+        header.setProperty("header", True)
+        layout.addWidget(header)
+        layout.addSpacing(4)
+        hint = QtWidgets.QLabel(
+            "泡泡大小代表今日資金比重；點擊泡泡可查看該產業的成分股。"
+        )
+        hint.setProperty("muted", True)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        layout.addSpacing(8)
         self.flow_chart = FlowChartWidget()
         self.flow_chart.setMinimumHeight(380)
-        layout.addWidget(self.flow_chart)
-
-        layout.addSpacing(20)
-        self._build_flow_list_section(layout)
-
-        layout.addSpacing(20)
-        self._build_volume_outliers_section(layout)
+        layout.addWidget(self.flow_chart, 1)
 
     def _update_flow_date_button(self):
         self.flow_date_button.setText(
-            f"{self.flow_start_date} 起（近 {self.flow_avg_days} 個交易日）　▾"
+            f"{self.flow_period.start_date} 起（近 {self.flow_period.trading_days} 個交易日）　▾"
         )
 
     def _on_flow_bubble_mode_changed(self, _index):
@@ -2192,44 +2341,51 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         valid_dates = [d for d in get_available_dates(HISTORY_DB_PATH) if d < today_iso]
         dialog = TradingDateDialog(self, valid_dates, "選擇流向區間起始日期")
         if dialog.exec() == QtWidgets.QDialog.Accepted and dialog.selected_date:
-            self.flow_start_date = dialog.selected_date
-            self.flow_avg_days = max(1, trading_days_between(HISTORY_DB_PATH, self.flow_start_date))
+            days = max(1, trading_days_between(HISTORY_DB_PATH, dialog.selected_date))
+            self.flow_period = FlowPeriod(dialog.selected_date, days)
             self._update_flow_date_button()
             self.refresh_flow_tab()
 
     def refresh_flow_tab(self):
+        period = self.flow_period
+        dashboard = self.flow_service.analyze(
+            self.snapshot,
+            period,
+            bubble_mode=self.flow_bubble_mode_combo.currentData(),
+            valuation_metric=self.flow_valuation_metric_combo.currentData(),
+        )
         populate_flow_chart(
             self.flow_chart,
             HISTORY_DB_PATH,
             self.snapshot,
-            avg_days=self.flow_avg_days,
+            avg_days=period.trading_days,
             on_industry_click=self._on_industry_bubble_clicked,
             mode=self.flow_bubble_mode_combo.currentData(),
             valuation_metric=self.flow_valuation_metric_combo.currentData(),
+            dashboard=dashboard,
         )
-        self.refresh_flow_list()
-        self.refresh_volume_outliers_list()
+        self.refresh_flow_list(dashboard)
+        self.refresh_stock_capital_flow_list(dashboard)
+        self.refresh_volume_outliers_list(dashboard)
 
-    def _show_industry_top_stocks(self, industry, days):
-        top_stocks = get_industry_top_stocks_range(
-            HISTORY_DB_PATH, self.snapshot, industry, days, top_n=30
+    def _show_industry_top_stocks(self, industry):
+        period = self.flow_period
+        top_stocks = self.flow_service.get_industry_top_stocks(
+            self.snapshot, period, industry, top_n=30
         )
-        IndustryTopStocksDialog(self, industry, top_stocks, days=days).exec()
+        IndustryTopStocksDialog(self, industry, top_stocks, days=period.trading_days).exec()
 
     def _on_industry_bubble_clicked(self, industry):
-        # 泡泡圖本身就是「近 flow_avg_days 日」流向的視覺化，點擊彈出的成分股
+        # 泡泡圖本身就是共用流向期間的視覺化，點擊彈出的成分股
         # 清單也該用同一個區間的累積成交金額，跟泡泡代表的資料口徑一致。
-        self._show_industry_top_stocks(industry, self.flow_avg_days)
+        self._show_industry_top_stocks(industry)
 
     def _on_flow_list_item_clicked(self, industry):
-        # 跟泡泡圖各自獨立：清單本身有自己的「資料區間」設定
-        # （self.list_avg_days），點清單裡的產業列時，前十大成分股用清單那個
-        # 區間的累積成交金額排序，兩邊口徑才會一致。
-        self._show_industry_top_stocks(industry, self.list_avg_days)
+        # 所有資金流向小分類共用最上方的流向區間，避免泡泡圖、排行與成分股
+        # 彈窗使用不同的日期口徑。
+        self._show_industry_top_stocks(industry)
 
-    # ---------- 資金動向清單（跟泡泡圖同一份 compute_industry_flow，但區間可自由
-    # 輸入天數，且不篩掉歷史資料不足的產業——不足的行直接標「資料不足」，而不是
-    # 悄悄從清單消失，讓使用者看得到資料缺口） ----------
+    # ---------- 資金動向清單（與泡泡圖共用最上方的流向區間） ----------
 
     def _build_flow_list_section(self, layout):
         header = QtWidgets.QLabel("資金動向清單")
@@ -2237,31 +2393,39 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addWidget(header)
         layout.addSpacing(4)
 
-        self.list_avg_days = 20
-        self.list_start_date = default_start_date_for_days(HISTORY_DB_PATH, self.list_avg_days)
-
-        controls = QtWidgets.QHBoxLayout()
-        controls.addWidget(QtWidgets.QLabel("資料區間："))
-        self.list_date_button = QtWidgets.QPushButton()
-        self.list_date_button.clicked.connect(self._open_list_date_picker)
-        controls.addWidget(self.list_date_button)
-        controls.addStretch(1)
-        layout.addLayout(controls)
-        self._update_list_date_button()
-
-        hint = QtWidgets.QLabel("起始日以「今日」往回算，跟泡泡圖的「流向區間」各自獨立。")
+        hint = QtWidgets.QLabel(
+            "資料區間與上方「流向區間」一致。分數為同批產業的"
+            "相對百分位（0～100）：人氣＝今日資金比重、動能＝區間漲跌、量能＝量比；"
+            "綜合熱度為三者平均，清單預設依綜合熱度排序。"
+        )
         hint.setProperty("muted", True)
         hint.setWordWrap(True)
         layout.addWidget(hint)
         layout.addSpacing(8)
 
         self.flow_list = QtWidgets.QTreeWidget()
-        self.flow_list.setColumnCount(5)
-        self.flow_list.setHeaderLabels(["產業", "檔數", "成交金額(億)", "加權漲跌%", "量比"])
+        self.flow_list.setColumnCount(11)
+        self.flow_list.setHeaderLabels(
+            [
+                "熱度排名",
+                "產業",
+                "檔數",
+                "今日成交金額(億)",
+                "今日資金比重%",
+                "加權漲跌%",
+                "量比",
+                "人氣分數",
+                "動能分數",
+                "量能分數",
+                "綜合熱度",
+            ]
+        )
         self.flow_list.setRootIsDecorated(False)
         self.flow_list.setAlternatingRowColors(True)
-        self.flow_list.setSortingEnabled(True)
-        self.flow_list.setMinimumHeight(280)
+        # 由 refresh_flow_list 先排好綜合熱度；避免 Windows Qt 在建立格式化
+        # 數值項目時再次觸發原生排序，這在部分環境會造成程序中止。
+        self.flow_list.setSortingEnabled(False)
+        self.flow_list.setMinimumHeight(240)
         self.flow_list.itemClicked.connect(
             lambda item, _col: self._on_flow_list_item_clicked(
                 item.data(0, QtCore.Qt.UserRole)
@@ -2269,55 +2433,162 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         )
         layout.addWidget(self.flow_list)
 
-    def _update_list_date_button(self):
-        self.list_date_button.setText(
-            f"{self.list_start_date} 起（近 {self.list_avg_days} 個交易日）　▾"
+    def refresh_flow_list(self, dashboard=None):
+        if dashboard is None:
+            dashboard = self.flow_service.analyze(self.snapshot, self.flow_period)
+        flow = dashboard.industry_flow
+        # 進入畫面時直接把最能同時代表人氣／動能／量能的族群排在前面。
+        flow = sorted(
+            flow,
+            key=lambda result: (
+                result.composite_score is not None,
+                result.composite_score if result.composite_score is not None else -1,
+            ),
+            reverse=True,
         )
-
-    def _open_list_date_picker(self):
-        today_iso = date.today().isoformat()
-        valid_dates = [d for d in get_available_dates(HISTORY_DB_PATH) if d < today_iso]
-        dialog = TradingDateDialog(self, valid_dates, "選擇資料區間起始日期")
-        if dialog.exec() == QtWidgets.QDialog.Accepted and dialog.selected_date:
-            self.list_start_date = dialog.selected_date
-            self.list_avg_days = max(1, trading_days_between(HISTORY_DB_PATH, self.list_start_date))
-            self._update_list_date_button()
-            self.refresh_flow_list()
-
-    def refresh_flow_list(self):
-        flow = compute_industry_flow(HISTORY_DB_PATH, self.snapshot, avg_days=self.list_avg_days)
-        self.flow_list.setSortingEnabled(False)
         self.flow_list.clear()
+        ranked_count = 0
         for f in flow:
             if f.avg_change_pct is None:
                 change_text = "資料不足"
             else:
                 change_text = f"{f.avg_change_pct:+.2f}%"
             volume_text = f"{f.volume_ratio:.2f}" if f.volume_ratio is not None else "資料不足"
+            score_texts = [
+                f"{score:.0f}" if score is not None else "資料不足"
+                for score in (
+                    f.popularity_score,
+                    f.momentum_score,
+                    f.volume_score,
+                    f.composite_score,
+                )
+            ]
+            if f.composite_score is not None:
+                ranked_count += 1
+                rank_text = str(ranked_count)
+            else:
+                rank_text = "-"
 
             item = QtWidgets.QTreeWidgetItem(
                 [
+                    rank_text,
                     f.industry,
                     str(f.stock_count),
                     f"{f.total_trading_value / 1e8:,.1f}",
+                    f"{f.capital_share_pct:.2f}%",
                     change_text,
                     volume_text,
+                    *score_texts,
                 ]
             )
             item.setData(0, QtCore.Qt.UserRole, f.industry)
-            for col in (1, 2, 3, 4):
+            for col in (0, 2, 3, 4, 5, 6, 7, 8, 9, 10):
                 item.setTextAlignment(col, QtCore.Qt.AlignCenter)
             if f.avg_change_pct is not None:
                 color = COLOR_GAIN if f.avg_change_pct >= 0 else COLOR_LOSS
-                item.setForeground(3, QtGui.QColor(color))
+                item.setForeground(5, QtGui.QColor(color))
             else:
-                item.setForeground(3, QtGui.QColor(COLOR_MUTED))
-                item.setForeground(4, QtGui.QColor(COLOR_MUTED))
+                item.setForeground(5, QtGui.QColor(COLOR_MUTED))
+                item.setForeground(6, QtGui.QColor(COLOR_MUTED))
+            if f.composite_score is not None:
+                item.setForeground(10, QtGui.QColor(COLOR_ACCENT))
+            else:
+                for col in (7, 8, 9, 10):
+                    item.setForeground(col, QtGui.QColor(COLOR_MUTED))
             self.flow_list.addTopLevelItem(item)
-        self.flow_list.setSortingEnabled(True)
-        self.flow_list.sortByColumn(2, QtCore.Qt.DescendingOrder)
+        # 由 refresh_flow_list 先排好綜合熱度；避免 Windows Qt 在建立格式化
+        # 數值項目時再次觸發原生排序，這在部分環境會造成程序中止。
         for col in range(self.flow_list.columnCount()):
             self.flow_list.resizeColumnToContents(col)
+
+    # ---------- 個股資金流入前50名（以區間累積成交金額估算） ----------
+
+    def _build_stock_capital_flow_section(self, layout):
+        header = QtWidgets.QLabel("個股資金流入前 50 名")
+        header.setProperty("header", True)
+        layout.addWidget(header)
+        layout.addSpacing(4)
+
+        hint = QtWidgets.QLabel(
+            "依上方資金動向清單的資料區間排序；「資金流入」以區間累積成交金額估算，"
+            "不代表法人淨買超。雙擊股票可查看完整個股資訊。"
+        )
+        hint.setProperty("muted", True)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        layout.addSpacing(8)
+
+        self.stock_capital_flow_list = QtWidgets.QTreeWidget()
+        self.stock_capital_flow_list.setColumnCount(9)
+        self.stock_capital_flow_list.setHeaderLabels(
+            [
+                "排名",
+                "代號",
+                "名稱",
+                "產業",
+                "區間成交金額(億)",
+                "今日成交金額(億)",
+                "區間漲跌%",
+                "量比",
+                "全市場比重%",
+            ]
+        )
+        self.stock_capital_flow_list.setRootIsDecorated(False)
+        self.stock_capital_flow_list.setAlternatingRowColors(True)
+        self.stock_capital_flow_list.setSortingEnabled(False)
+        self.stock_capital_flow_list.setMinimumHeight(240)
+        self.stock_capital_flow_list.itemDoubleClicked.connect(
+            self._on_stock_capital_flow_double_clicked
+        )
+        layout.addWidget(self.stock_capital_flow_list)
+
+    def refresh_stock_capital_flow_list(self, dashboard=None):
+        if dashboard is None:
+            dashboard = self.flow_service.analyze(self.snapshot, self.flow_period)
+        stocks = dashboard.stock_capital_flow
+
+        self.stock_capital_flow_list.setSortingEnabled(False)
+        self.stock_capital_flow_list.clear()
+        for rank, stock in enumerate(stocks, start=1):
+            change_text = (
+                f"{stock.change_pct:+.2f}%" if stock.change_pct is not None else "-"
+            )
+            volume_ratio_text = (
+                f"{stock.volume_ratio:.2f}" if stock.volume_ratio is not None else "-"
+            )
+            item = QtWidgets.QTreeWidgetItem(
+                [
+                    str(rank),
+                    stock.ticker,
+                    stock.name or "-",
+                    stock.industry,
+                    f"{stock.trading_value / 1e8:,.2f}",
+                    f"{stock.today_trading_value / 1e8:,.2f}",
+                    change_text,
+                    volume_ratio_text,
+                    f"{stock.capital_share_pct:.2f}%",
+                ]
+            )
+            item.setData(0, QtCore.Qt.UserRole, stock.ticker)
+            item.setData(0, QtCore.Qt.UserRole + 1, stock.market)
+            for col in (0, 1, 3, 4, 5, 6, 7, 8):
+                item.setTextAlignment(col, QtCore.Qt.AlignCenter)
+            if stock.change_pct is not None:
+                color = COLOR_GAIN if stock.change_pct >= 0 else COLOR_LOSS
+                item.setForeground(6, QtGui.QColor(color))
+            self.stock_capital_flow_list.addTopLevelItem(item)
+
+        for col in range(self.stock_capital_flow_list.columnCount()):
+            self.stock_capital_flow_list.resizeColumnToContents(col)
+
+    def _on_stock_capital_flow_double_clicked(self, item, _column):
+        ticker = item.data(0, QtCore.Qt.UserRole)
+        if not ticker:
+            return
+        name = item.text(2)
+        market = item.data(0, QtCore.Qt.UserRole + 1)
+        token = self.settings.get("finmind_token", "")
+        StockDetailDialog(self, ticker, name, token, market=market).exec()
 
     # ---------- 個股量比異常清單（今日量 ÷ 近N日均量，逐檔股票各自比較自己的
     # 歷史均量，抓「個股」層級的爆量，不像資金動向清單是整個產業加總後的量比，
@@ -2330,15 +2601,6 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addSpacing(4)
 
         controls = QtWidgets.QHBoxLayout()
-        controls.addWidget(QtWidgets.QLabel("均量天數："))
-        self.outlier_days_spin = QtWidgets.QSpinBox()
-        self.outlier_days_spin.setRange(2, 60)
-        self.outlier_days_spin.setValue(5)
-        self.outlier_days_spin.setSuffix(" 天")
-        controls.addWidget(self.outlier_days_spin)
-        controls.addWidget(accent_button("套用", self._on_outlier_days_apply))
-
-        controls.addSpacing(16)
         controls.addWidget(QtWidgets.QLabel("級距："))
         self.outlier_tier_combo = QtWidgets.QComboBox()
         self.outlier_tier_combo.addItem("全部", None)
@@ -2350,7 +2612,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addLayout(controls)
 
         hint = QtWidgets.QLabel(
-            "今日成交量 ÷ 近N日均量 ≥ 1.5 倍的個股，依比值分成 1.5～2倍／2～3倍／3倍以上；"
+            "均量天數與上方「流向區間」一致；今日成交量 ÷ 近N日均量 ≥ 1.5 倍的個股，"
+            "依比值分成 1.5～2倍／2～3倍／3倍以上；"
             "雙擊股票查詢本益比／殖利率／三大法人買賣超（同「個股」分頁，走 FinMind）。"
         )
         hint.setProperty("muted", True)
@@ -2358,45 +2621,29 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addWidget(hint)
         layout.addSpacing(8)
 
-        self.outlier_avg_days = self.outlier_days_spin.value()
         self.outlier_tier_filter = None
         self.volume_outliers_list = QtWidgets.QTreeWidget()
-        self.volume_outliers_list.setColumnCount(7)
+        self.volume_outliers_list.setColumnCount(8)
         self.volume_outliers_list.setHeaderLabels(
-            ["級距", "代號", "名稱", "現價", "漲跌%", "量比", "今日量(張)"]
+            ["級距", "代號", "名稱", "族群", "現價", "漲跌%", "量比", "今日量(張)"]
         )
         self.volume_outliers_list.setRootIsDecorated(False)
         self.volume_outliers_list.setAlternatingRowColors(True)
         self.volume_outliers_list.setSortingEnabled(True)
-        self.volume_outliers_list.setMinimumHeight(280)
+        self.volume_outliers_list.setMinimumHeight(240)
         self.volume_outliers_list.itemDoubleClicked.connect(
             self._on_volume_outlier_double_clicked
         )
         layout.addWidget(self.volume_outliers_list)
 
-    def _on_outlier_days_apply(self):
-        requested_days = self.outlier_days_spin.value()
-        status = get_history_status(HISTORY_DB_PATH)
-        available_days = status["overall"]["days"]
-        if available_days and requested_days > available_days:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "資料可能不足",
-                f"選擇的均量天數是 {requested_days} 天，但資料庫目前只有 {available_days} "
-                f"個交易日資料，符合的個股可能會偏少。\n\n"
-                "可至「設定」分頁調整回補天數，或按「回補歷史資料」補齊後再試。",
-            )
-        self.outlier_avg_days = requested_days
-        self.refresh_volume_outliers_list()
-
     def _on_outlier_tier_filter_changed(self, _index):
         self.outlier_tier_filter = self.outlier_tier_combo.currentData()
         self.refresh_volume_outliers_list()
 
-    def refresh_volume_outliers_list(self):
-        outliers = compute_volume_ratio_outliers(
-            HISTORY_DB_PATH, self.snapshot, avg_days=self.outlier_avg_days, min_ratio=1.5
-        )
+    def refresh_volume_outliers_list(self, dashboard=None):
+        if dashboard is None:
+            dashboard = self.flow_service.analyze(self.snapshot, self.flow_period)
+        outliers = dashboard.volume_outliers
         if self.outlier_tier_filter:
             outliers = [o for o in outliers if o.tier == self.outlier_tier_filter]
 
@@ -2415,6 +2662,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
                     o.tier,
                     o.ticker,
                     o.name,
+                    o.industry,
                     f"{o.close:.2f}" if o.close is not None else "-",
                     change_text,
                     f"{o.volume_ratio:.2f}",
@@ -2423,15 +2671,15 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             )
             item.setData(0, QtCore.Qt.UserRole, o.ticker)
             item.setData(0, QtCore.Qt.UserRole + 1, o.market)
-            for col in (1, 2, 3, 4, 5, 6):
+            for col in (1, 2, 3, 4, 5, 6, 7):
                 item.setTextAlignment(col, QtCore.Qt.AlignCenter)
             item.setForeground(0, QtGui.QColor(tier_colors[o.tier]))
             if o.change_pct is not None:
                 color = COLOR_GAIN if o.change_pct >= 0 else COLOR_LOSS
-                item.setForeground(4, QtGui.QColor(color))
+                item.setForeground(5, QtGui.QColor(color))
             self.volume_outliers_list.addTopLevelItem(item)
         self.volume_outliers_list.setSortingEnabled(True)
-        self.volume_outliers_list.sortByColumn(5, QtCore.Qt.DescendingOrder)
+        self.volume_outliers_list.sortByColumn(6, QtCore.Qt.DescendingOrder)
         for col in range(self.volume_outliers_list.columnCount()):
             self.volume_outliers_list.resizeColumnToContents(col)
 
@@ -2577,7 +2825,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         header = QtWidgets.QLabel(
             "個股詳細資訊（選取上方部位查看，含 FinMind 歷史股價、三大法人120日"
             "資金流向、法人分別（五細項）累計買賣超、融資融券餘額、外資持股、"
-            "借券與停資停券、VPT 量價趨勢、MFI 資金流量）"
+            "借券與停資停券、VPT 量價趨勢、MFI 資金流量、KD／MACD／均線／RSI）"
         )
         header.setProperty("header", True)
         outer_layout.addWidget(header)
@@ -2605,6 +2853,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             chart.showGrid(x=True, y=True, alpha=0.15)
             chart.setMinimumHeight(320)
             chart.addLegend()
+        _setup_price_chart_click(self.position_price_chart)
 
         position_detail_tabs = QtWidgets.QTabWidget()
         position_detail_tabs.addTab(self.position_price_chart, "歷史股價")
@@ -2613,6 +2862,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         position_detail_tabs.addTab(self.position_margin_chart, "融資融券")
         position_detail_tabs.addTab(self.position_vpt_chart, "VPT")
         position_detail_tabs.addTab(self.position_mfi_chart, "MFI")
+        self.position_technical_widget = TechnicalAnalysisWidget()
+        position_detail_tabs.addTab(self.position_technical_widget, "技術分析")
         outer_layout.addWidget(position_detail_tabs)
 
         return container
@@ -2694,6 +2945,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self.position_margin_chart.clear()
             self.position_vpt_chart.clear()
             self.position_mfi_chart.clear()
+            self.position_technical_widget.set_data(None)
             return
         pos = find_position(self.positions, position_id)
         if pos is None:
@@ -2725,6 +2977,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self.position_margin_chart.clear()
             self.position_vpt_chart.clear()
             self.position_mfi_chart.clear()
+            self.position_technical_widget.set_data(None)
 
         token = self.settings.get("finmind_token", "")
         market = pos.market
@@ -2751,7 +3004,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.update_finmind_count_label()
 
     def _render_position_detail(self, header, data, note=None):
-        """畫「部位詳細資訊」文字摘要＋五張趨勢圖。實際畫面邏輯是模組層級的
+        """畫「部位詳細資訊」文字摘要＋六張趨勢圖與技術分析。實際畫面邏輯是模組層級的
         _render_detail_block（跟「個股」頁 StockDetailDialog 的「顯示完整籌碼
         面資訊」按鈕共用同一份），這裡只是把部位紀錄頁自己的 label／圖表
         widget 傳進去。"""
@@ -2766,6 +3019,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             header,
             data,
             note,
+            technical_widget=self.position_technical_widget,
         )
 
     def _on_position_detail_error(self, pos, header, message, cached=None):
@@ -2793,6 +3047,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.position_margin_chart.clear()
         self.position_vpt_chart.clear()
         self.position_mfi_chart.clear()
+        self.position_technical_widget.set_data(None)
         self.update_finmind_count_label()
 
     def _update_status_bar(self):
@@ -2812,10 +3067,12 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         large_traders_note = (
             f"　{self.large_traders_note}" if self.large_traders_note else ""
         )
-        self.status_bar.showMessage(
+        status_text = (
             f"{cache_note}　{total_note}{error_note}{staleness_note}"
             f"{continuity_note}{large_traders_note}"
         )
+        self.status_bar_label.setText(status_text)
+        self.status_bar_label.setToolTip(status_text)
 
     def open_add_dialog(self):
         def on_submit(ticker, shares, entry_price, entry_date, note):
