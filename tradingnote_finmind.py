@@ -1,11 +1,9 @@
 """tradingnote - FinMind API 用戶端（本益比／殖利率／三大法人買賣超）。
 
 跟 tradingnote_core.py／tradingnote_history.py 同一套原則：不依賴任何介面，
-CLI／GUI 都可以各自 import。「個股」模組使用者雙擊個股、跟「AI 助理」的工具
-呼叫都會用到，不影響其餘功能（部位查價、產業資金流向）原本用的 TWSE/TPEX
-快取機制。這兩個呼叫點共用同一份行程內資料快取（見 `_dataset_cache`），避免
-同一檔股票在短時間內被重複查詢時（例如「個股」頁連點兩下、或 AI 助理在同一段
-對話裡被問到同一檔股票兩次）白白多打 FinMind API、更快把免費額度用完。
+CLI／GUI 都可以各自 import。「個股」模組使用者雙擊個股時會用到，不影響其餘
+功能原本用的 TWSE/TPEX 快取機制。呼叫共用同一份行程內資料快取（見
+`_dataset_cache`），避免短時間內重複查詢同一檔股票而浪費免費額度。
 
 `fetch_valuation()` 對上櫃（TPEX）股票會改查 tradingnote_core 的 TPEX 官方
 估值端點，不是 FinMind（見該函式 docstring）；三大法人買賣超沒有對應的 TPEX
@@ -108,12 +106,12 @@ INSTITUTIONAL_DETAIL_BUCKETS = [
     ("自營商(避險)", ("Dealer_Hedging",)),
 ]
 
-# 每次打 FinMind API 的時間戳記，給「個股」／「AI 助理」頁顯示用量統計；
+# 每次打 FinMind API 的時間戳記，給「個股」頁顯示用量統計；
 # 只存在記憶體中，重啟程式會歸零，不代表 FinMind 帳號其他來源的真實用量。
 _call_timestamps = []
 
-# key 是 (dataset, ticker, lookback_days)。「個股」雙擊查詢跟「AI 助理」工具
-# 呼叫都走 _fetch_dataset，共用同一份，命中快取時不會被算進 _call_timestamps
+# key 是 (dataset, ticker, lookback_days)。所有互動查詢共用同一份，命中快取時
+# 不會被算進 _call_timestamps
 # （用量統計只反映真的打出去的 API 次數）。只快取成功的結果（包含查無資料的
 # 空陣列，因為 TTLCache.get_or_fetch 只在 fetch_fn 正常回傳時才存入）；連線
 # 失敗的例外會直接往上拋，不快取，下次呼叫照樣重試。
@@ -626,7 +624,7 @@ def backfill_tpex_history_via_finmind(
 
     FinMind 免費額度只有 600 次／小時（見 FINMIND_HOURLY_LIMIT），全市場上櫃約
     800 檔，一次呼叫通常補不完：每打一檔前用 get_call_count() 檢查目前用量
-    （這是行程內的呼叫次數統計，也反映「個股」「部位紀錄」「AI 助理」等其他頁面
+    （這是行程內的呼叫次數統計，也反映「個股」「部位紀錄」等其他頁面
     同時在用的額度，不會互相搶到超過真正的帳號上限），達到上限就提早停止並回傳
     目前進度，不會真的打到 FinMind 回 HTTP 402 才發現。額度是帳號層級、每小時
     滾動重置，之後再次呼叫（例如使用者在「設定」頁重新點一次按鈕）會自動跳過已

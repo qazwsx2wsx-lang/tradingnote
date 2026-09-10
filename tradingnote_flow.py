@@ -9,11 +9,21 @@ from collections import OrderedDict
 from dataclasses import dataclass, replace
 
 from tradingnote_history import (
-    compute_industry_flow,
+    compute_group_flow,
+    compute_group_valuation_flow,
     compute_stock_capital_flow,
-    compute_valuation_flow,
     compute_volume_ratio_outliers,
+    get_group_top_stocks_range,
+    get_industry_map,
     get_industry_top_stocks_range,
+)
+from tradingnote_concepts import (
+    CLASSIFICATION_INDUSTRY,
+    CLASSIFICATION_VALUE_CHAIN_LEAF,
+)
+from tradingnote_institutional import (
+    aggregate_institutional_by_group,
+    load_cached_institutional_snapshot,
 )
 
 
@@ -33,8 +43,13 @@ class FlowPeriod:
 
     @property
     def recent_days(self):
-        """估值模式使用的短期窗口，受同一流向區間限制。"""
+        """估值模式使用的短期窗口。"""
         return min(5, self.trading_days)
+
+    @property
+    def valuation_baseline_days(self):
+        """估值資金熱度至少以 20 日為基準，避免短長窗口相同。"""
+        return max(20, self.trading_days)
 
 
 @dataclass(frozen=True)
@@ -46,16 +61,76 @@ class FlowDashboardData:
     stock_capital_flow: tuple
     volume_outliers: tuple
     valuation_flow: tuple | None = None
+    classification_mode: str = CLASSIFICATION_INDUSTRY
+    classification_scope: str | None = None
+    institutional_flow: tuple = ()
 
 
 class FlowAnalysisService:
     """統一資金流向查詢口徑，並快取最近幾次分析結果。"""
 
-    def __init__(self, db_path, max_cache_entries=4):
+    def __init__(
+        self,
+        db_path,
+        classification_catalog=None,
+        institutional_cache_path=None,
+        max_cache_entries=4,
+    ):
         self.db_path = db_path
+        self.classification_catalog = classification_catalog
         self.max_cache_entries = max(1, int(max_cache_entries))
         self._cache = OrderedDict()
+        self._group_cache = OrderedDict()
         self._valuation_cache = OrderedDict()
+        self.institutional_cache_path = institutional_cache_path
+        self._institutional_group_cache = OrderedDict()
+
+        if classification_catalog is not None:
+            industry_groups = classification_catalog.groups(CLASSIFICATION_INDUSTRY)
+            self._catalog_revision = classification_catalog.revision
+        else:
+            industry_groups = None
+            self._catalog_revision = "industry-map"
+        if not industry_groups:
+            industry_map = get_industry_map(db_path)
+            industry_groups = OrderedDict()
+            for ticker, industry in industry_map.items():
+                industry_groups.setdefault(industry, set()).add(ticker)
+        self._industry_groups = industry_groups
+        self._market_universe = frozenset(
+            ticker for members in industry_groups.values() for ticker in members
+        )
+
+    def _remember(self, cache, key, value):
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > self.max_cache_entries:
+            cache.popitem(last=False)
+
+    def _groups(self, classification_mode, classification_scope=None):
+        if self.classification_catalog is None:
+            if classification_mode != CLASSIFICATION_INDUSTRY:
+                raise ValueError("沒有概念分類目錄，只能使用官方產業")
+            industry_map = get_industry_map(self.db_path)
+            groups = OrderedDict()
+            for ticker, industry in industry_map.items():
+                groups.setdefault(industry, set()).add(ticker)
+            return groups, None
+
+        if classification_mode == CLASSIFICATION_INDUSTRY:
+            return self._industry_groups, None
+        if (
+            classification_mode == CLASSIFICATION_VALUE_CHAIN_LEAF
+            and classification_scope is None
+        ):
+            scopes = self.classification_catalog.value_chain_scopes
+            classification_scope = scopes[0] if scopes else None
+        groups = self.classification_catalog.groups(
+            classification_mode, classification_scope
+        )
+        if not groups:
+            raise ValueError("所選分類沒有可用群組")
+        return groups, classification_scope
 
     @staticmethod
     def _snapshot_key(snapshot):
@@ -75,24 +150,31 @@ class FlowAnalysisService:
         )
         return hash(values)
 
-    def analyze(self, snapshot, period, bubble_mode="momentum", valuation_metric="per"):
+    def analyze(
+        self,
+        snapshot,
+        period,
+        bubble_mode="momentum",
+        valuation_metric="per",
+        classification_mode=CLASSIFICATION_INDUSTRY,
+        classification_scope=None,
+    ):
         """產生資金流向頁完整資料；四個子分類共用同一個 period。"""
         if not isinstance(period, FlowPeriod):
             raise TypeError("period 必須是 FlowPeriod")
         if bubble_mode not in ("momentum", "valuation"):
             raise ValueError("bubble_mode 必須是 momentum 或 valuation")
-        base_key = (self._snapshot_key(snapshot), period)
-        cached = self._cache.get(base_key)
-        if cached is not None:
-            self._cache.move_to_end(base_key)
+        groups, classification_scope = self._groups(
+            classification_mode, classification_scope
+        )
+        market_key = (self._snapshot_key(snapshot), period)
+        market_cached = self._cache.get(market_key)
+        if market_cached is not None:
+            self._cache.move_to_end(market_key)
         else:
             days = period.trading_days
-            cached = FlowDashboardData(
-                period=period,
-                industry_flow=tuple(
-                    compute_industry_flow(self.db_path, snapshot, avg_days=days)
-                ),
-                stock_capital_flow=tuple(
+            market_cached = (
+                tuple(
                     compute_stock_capital_flow(
                         self.db_path,
                         snapshot,
@@ -101,36 +183,87 @@ class FlowAnalysisService:
                         volume_avg_days=days,
                     )
                 ),
-                volume_outliers=tuple(
+                tuple(
                     compute_volume_ratio_outliers(
                         self.db_path, snapshot, avg_days=days, min_ratio=1.5
                     )
                 ),
             )
-            self._cache[base_key] = cached
-            self._cache.move_to_end(base_key)
-            while len(self._cache) > self.max_cache_entries:
-                self._cache.popitem(last=False)
+            self._remember(self._cache, market_key, market_cached)
+
+        group_key = (
+            market_key,
+            self._catalog_revision,
+            classification_mode,
+            classification_scope,
+        )
+        group_flow = self._group_cache.get(group_key)
+        if group_flow is None:
+            group_flow = tuple(
+                compute_group_flow(
+                    self.db_path,
+                    snapshot,
+                    groups,
+                    avg_days=period.trading_days,
+                    market_universe=self._market_universe,
+                )
+            )
+            self._remember(self._group_cache, group_key, group_flow)
+        else:
+            self._group_cache.move_to_end(group_key)
+
+        institutional_flow = ()
+        if self.institutional_cache_path is not None:
+            institutional_rows = load_cached_institutional_snapshot(
+                self.institutional_cache_path
+            )
+            institutional_revision = hash(tuple(institutional_rows))
+            institutional_key = (group_key, institutional_revision)
+            institutional_flow = self._institutional_group_cache.get(
+                institutional_key
+            )
+            if institutional_flow is None:
+                institutional_flow = tuple(
+                    aggregate_institutional_by_group(
+                        institutional_rows, groups, snapshot
+                    )
+                )
+                self._remember(
+                    self._institutional_group_cache,
+                    institutional_key,
+                    institutional_flow,
+                )
+            else:
+                self._institutional_group_cache.move_to_end(institutional_key)
+
+        cached = FlowDashboardData(
+            period=period,
+            industry_flow=group_flow,
+            stock_capital_flow=market_cached[0],
+            volume_outliers=market_cached[1],
+            classification_mode=classification_mode,
+            classification_scope=classification_scope,
+            institutional_flow=institutional_flow,
+        )
 
         if bubble_mode == "momentum":
             return cached
 
-        valuation_key = (base_key, valuation_metric)
+        valuation_key = (group_key, valuation_metric)
         valuation_flow = self._valuation_cache.get(valuation_key)
         if valuation_flow is None:
             valuation_flow = tuple(
-                compute_valuation_flow(
+                compute_group_valuation_flow(
                     self.db_path,
                     snapshot,
+                    groups,
                     short_days=period.recent_days,
-                    long_days=period.trading_days,
+                    long_days=period.valuation_baseline_days,
                     metric=valuation_metric,
+                    market_universe=self._market_universe,
                 )
             )
-            self._valuation_cache[valuation_key] = valuation_flow
-            self._valuation_cache.move_to_end(valuation_key)
-            while len(self._valuation_cache) > self.max_cache_entries:
-                self._valuation_cache.popitem(last=False)
+            self._remember(self._valuation_cache, valuation_key, valuation_flow)
         else:
             self._valuation_cache.move_to_end(valuation_key)
 
@@ -142,6 +275,29 @@ class FlowAnalysisService:
             self.db_path,
             snapshot,
             industry,
+            period.trading_days,
+            top_n=top_n,
+            volume_avg_days=period.trading_days,
+        )
+
+    def get_group_top_stocks(
+        self,
+        snapshot,
+        period,
+        group_name,
+        classification_mode=CLASSIFICATION_INDUSTRY,
+        classification_scope=None,
+        top_n=30,
+    ):
+        """取得目前分類下某個泡泡／排行項目的成分股。"""
+        groups, _scope = self._groups(classification_mode, classification_scope)
+        members = groups.get(group_name)
+        if not members:
+            return []
+        return get_group_top_stocks_range(
+            self.db_path,
+            snapshot,
+            members,
             period.trading_days,
             top_n=top_n,
             volume_avg_days=period.trading_days,

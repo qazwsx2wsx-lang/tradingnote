@@ -54,7 +54,14 @@ from tradingnote_finmind import (
     load_position_detail_cache,
     save_position_detail_cache,
 )
-from tradingnote_concepts import build_ticker_concept_map, load_concepts
+from tradingnote_concepts import (
+    CLASSIFICATION_INDUSTRY,
+    CLASSIFICATION_LABELS,
+    CLASSIFICATION_VALUE_CHAIN_LEAF,
+    build_classification_catalog,
+    build_ticker_concept_map,
+    load_concepts,
+)
 from tradingnote_taifex import (
     DEFAULT_FUTURES_PRODUCTS,
     LARGE_TRADERS_ALL_CONTRACTS_MONTH,
@@ -71,8 +78,7 @@ from tradingnote_taifex import (
     list_all_products,
 )
 from tradingnote_flow import FlowAnalysisService, FlowPeriod
-from tradingnote_ai_agent import GEMINI_RPM_HINT, run_agent_turn
-from tradingnote_ai_agent import get_call_count as get_gemini_call_count
+from tradingnote_institutional import get_cached_institutional_snapshot
 from tradingnote_http import PriceFetchError
 from tradingnote_paths import APP_PATHS
 from tradingnote_tasks import run_background_task
@@ -83,6 +89,7 @@ CACHE_PATH = APP_PATHS.price_cache
 FUTURES_CACHE_PATH = APP_PATHS.futures_cache
 FUTURES_LARGE_TRADERS_CACHE_PATH = APP_PATHS.futures_large_traders_cache
 FUTURES_SSF_CACHE_PATH = APP_PATHS.futures_ssf_cache
+INSTITUTIONAL_CACHE_PATH = APP_PATHS.institutional_cache
 POSITION_DETAIL_CACHE_PATH = APP_PATHS.position_detail_cache
 HISTORY_DB_PATH = APP_PATHS.history_db
 SETTINGS_PATH = APP_PATHS.settings
@@ -110,30 +117,21 @@ COLUMNS = [
     ("updated_at", "更新日期", 90),
 ]
 
-# ---------- 視覺主題（黑白灰極簡風格；漲跌與產業分類色刻意不受此影響，見下方） ----------
-COLOR_BG = "#FFFFFF"
+# ---------- 視覺主題：冷灰底、白色內容、藍色操作重點 ----------
+COLOR_BG = "#F3F6FA"
 COLOR_SURFACE = "#FFFFFF"
-COLOR_TEXT = "#1A1A1A"
-COLOR_MUTED = "#767676"
-COLOR_ACCENT = "#1A1A1A"
-COLOR_ACCENT_ACTIVE = "#000000"
+COLOR_TEXT = "#172B4D"
+COLOR_MUTED = "#617187"
+COLOR_ACCENT = "#2563B0"
+COLOR_ACCENT_ACTIVE = "#174EA6"
 COLOR_ACCENT_TEXT = "#FFFFFF"
-COLOR_BORDER = "#DCDCDC"
-COLOR_ROW_ALT = "#F7F7F7"
-COLOR_HOVER = "#EDEDED"
+COLOR_BORDER = "#DCE3EC"
+COLOR_ROW_ALT = "#F7F9FC"
+COLOR_HOVER = "#EDF3FB"
 # 漲跌（損益）刻意保留紅綠上色——功能性色彩，用來一眼辨識盈虧方向，不算裝飾用色。
 COLOR_GAIN = "#1E7A3E"
 COLOR_LOSS = "#C0392B"
 
-
-# matplotlib 的 tab20 定性配色表（手動內嵌，避免 pyqtgraph 為了取這組色再偷偷依賴 matplotlib）。
-# 黑白主題刻意不套用到這裡——這是資金流向頁唯一需要區分約35個產業類別的地方，改灰階會讓類別難以辨識。
-TAB20_COLORS = [
-    "#1f77b4", "#aec7e8", "#ff7f0e", "#ffbb78", "#2ca02c", "#98df8a",
-    "#d62728", "#ff9896", "#9467bd", "#c5b0d5", "#8c564b", "#c49c94",
-    "#e377c2", "#f7b6d2", "#7f7f7f", "#c7c7c7", "#bcbd22", "#dbdb8d",
-    "#17becf", "#9edae5",
-]
 
 # 依作業系統選擇內建的繁體中文字型：macOS 用 PingFang TC，Windows 用微軟正黑體
 # （Microsoft JhengHei），其他平台留給 Qt 自行 fallback。字型名稱不存在時 Qt 會
@@ -146,123 +144,56 @@ else:
     FONT_FAMILY = "Noto Sans CJK TC"
 
 STYLESHEET = f"""
-QMainWindow, QWidget {{
-    background-color: {COLOR_BG};
-    color: {COLOR_TEXT};
-    font-family: "{FONT_FAMILY}";
-    font-size: 13px;
-}}
-QTabWidget::pane {{
-    border: 1px solid {COLOR_BORDER};
-    background: {COLOR_BG};
-    border-radius: 6px;
-    top: -1px;
-}}
-QTabBar::tab {{
-    background: {COLOR_BORDER};
-    color: {COLOR_TEXT};
-    padding: 9px 18px;
-    margin-right: 3px;
-    border-top-left-radius: 6px;
-    border-top-right-radius: 6px;
-}}
-QTabBar::tab:selected {{
-    background: {COLOR_ACCENT};
-    color: {COLOR_ACCENT_TEXT};
-    font-weight: 600;
-}}
-QTabBar::tab:hover:!selected {{
-    background: {COLOR_HOVER};
-}}
-QPushButton {{
-    background: {COLOR_SURFACE};
-    color: {COLOR_TEXT};
-    border: 1px solid {COLOR_BORDER};
-    border-radius: 6px;
-    padding: 7px 14px;
-}}
-QPushButton:hover {{
-    background: {COLOR_BORDER};
-}}
-QPushButton:disabled {{
-    color: {COLOR_MUTED};
-}}
-QPushButton[accent="true"] {{
-    background: {COLOR_ACCENT};
-    color: {COLOR_ACCENT_TEXT};
-    border: none;
-    font-weight: 600;
-}}
-QPushButton[accent="true"]:hover {{
-    background: {COLOR_ACCENT_ACTIVE};
-}}
-QPushButton[flowSectionButton="true"] {{
-    padding: 6px 12px;
-    border-radius: 5px;
-}}
-QPushButton[flowSectionButton="true"]:checked {{
-    background: {COLOR_ACCENT};
-    color: {COLOR_ACCENT_TEXT};
-    font-weight: 600;
-}}
-QLineEdit {{
-    background: {COLOR_SURFACE};
-    border: 1px solid {COLOR_BORDER};
-    border-radius: 4px;
-    padding: 5px 7px;
-    color: {COLOR_TEXT};
-}}
-QSpinBox {{
-    background: {COLOR_SURFACE};
-    border: 1px solid {COLOR_BORDER};
-    border-radius: 4px;
-    padding: 5px 7px;
-    color: {COLOR_TEXT};
-}}
-QSpinBox::up-button, QSpinBox::down-button {{
-    background: {COLOR_BORDER};
-    border: none;
-    width: 16px;
-}}
-QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
-    background: {COLOR_ACCENT};
-}}
-QLabel {{
-    background: transparent;
-}}
-QLabel[muted="true"] {{
-    color: {COLOR_MUTED};
-    font-size: 12px;
-}}
-QLabel[header="true"] {{
-    font-size: 15px;
-    font-weight: 700;
-}}
-QCheckBox {{
-    spacing: 8px;
-}}
-QTableWidget {{
-    background: {COLOR_SURFACE};
-    alternate-background-color: {COLOR_ROW_ALT};
-    gridline-color: {COLOR_BORDER};
-    border: 1px solid {COLOR_BORDER};
-    border-radius: 6px;
-    selection-background-color: {COLOR_ACCENT};
-    selection-color: {COLOR_ACCENT_TEXT};
-}}
-QHeaderView::section {{
-    background: {COLOR_BORDER};
-    color: {COLOR_TEXT};
-    padding: 6px;
-    border: none;
-    font-weight: 600;
-}}
-QStatusBar {{
-    background: {COLOR_SURFACE};
-    color: {COLOR_MUTED};
-    border-top: 1px solid {COLOR_BORDER};
-    font-size: 12px;
-}}
+QWidget {{ color: {COLOR_TEXT}; font-family: "{FONT_FAMILY}"; font-size: 13px; }}
+QMainWindow, QDialog {{ background: {COLOR_BG}; }}
+QLabel {{ background: transparent; }}
+QLabel[muted="true"] {{ color: {COLOR_MUTED}; font-size: 12px; }}
+QLabel[header="true"] {{ font-size: 16px; font-weight: 600; }}
+QLabel#brandTitle {{ font-size: 23px; font-weight: 700; color: {COLOR_TEXT}; }}
+QFrame[summaryCard="true"] {{ background: #F7F9FC; border: 1px solid {COLOR_BORDER}; border-radius: 8px; }}
+QLabel[metricValue="true"] {{ font-size: 17px; font-weight: 700; }}
+QFrame[stockHero="true"] {{ background: #F7F9FC; border: 1px solid {COLOR_BORDER}; border-radius: 10px; }}
+QTabWidget::pane {{ border: 1px solid {COLOR_BORDER}; background: {COLOR_SURFACE}; border-radius: 8px; }}
+QTabBar::tab {{ background: transparent; color: {COLOR_MUTED}; padding: 11px 18px; margin-right: 4px; border-bottom: 3px solid transparent; }}
+QTabBar::tab:selected {{ color: {COLOR_ACCENT}; border-bottom: 3px solid {COLOR_ACCENT}; font-weight: 700; background: {COLOR_SURFACE}; }}
+QTabBar::tab:hover:!selected {{ background: {COLOR_HOVER}; color: {COLOR_TEXT}; }}
+QPushButton {{ background: {COLOR_SURFACE}; border: 1px solid {COLOR_BORDER}; border-radius: 6px; padding: 7px 13px; min-height: 18px; }}
+QPushButton:hover {{ background: {COLOR_HOVER}; border-color: #A9BED9; }}
+QPushButton:pressed {{ background: #DFEAF8; }}
+QPushButton:focus {{ border: 1px solid {COLOR_ACCENT}; }}
+QPushButton:disabled {{ background: #F0F3F7; color: #8793A4; border-color: {COLOR_BORDER}; }}
+QPushButton[accent="true"] {{ background: {COLOR_ACCENT}; color: white; border: 1px solid {COLOR_ACCENT}; font-weight: 600; }}
+QPushButton[accent="true"]:hover {{ background: {COLOR_ACCENT_ACTIVE}; }}
+QPushButton[accent="true"]:disabled {{ background: #A3B8D3; border-color: #A3B8D3; color: white; }}
+QPushButton[flowSectionButton="true"] {{ padding: 7px 14px; border-radius: 6px; }}
+QPushButton[flowSectionButton="true"]:checked {{ background: #E7F0FC; color: #174EA6; border-color: #B7CEEC; font-weight: 600; }}
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QDateEdit {{ background: white; border: 1px solid {COLOR_BORDER}; border-radius: 5px; padding: 6px 8px; min-height: 18px; selection-background-color: {COLOR_ACCENT}; }}
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus, QDateEdit:focus {{ border-color: {COLOR_ACCENT}; }}
+QComboBox {{ padding-right: 24px; }}
+QComboBox::drop-down {{ width: 22px; border: none; }}
+QComboBox::down-arrow {{ image: url("{(APP_PATHS.root / 'assets' / 'chevron-down.svg').as_posix()}"); width: 14px; height: 14px; }}
+QSpinBox::up-button {{ subcontrol-origin: border; subcontrol-position: top right; width: 20px; border: none; }}
+QSpinBox::down-button {{ subcontrol-origin: border; subcontrol-position: bottom right; width: 20px; border: none; }}
+QSpinBox::up-arrow {{ image: url("{(APP_PATHS.root / 'assets' / 'chevron-up.svg').as_posix()}"); width: 12px; height: 12px; }}
+QSpinBox::down-arrow {{ image: url("{(APP_PATHS.root / 'assets' / 'chevron-down.svg').as_posix()}"); width: 12px; height: 12px; }}
+QComboBox QAbstractItemView {{ background: white; selection-background-color: #E7F0FC; selection-color: {COLOR_TEXT}; border: 1px solid {COLOR_BORDER}; }}
+QTextEdit, QPlainTextEdit {{ background: white; border: 1px solid {COLOR_BORDER}; border-radius: 7px; padding: 8px; }}
+QTableWidget, QTreeWidget {{ background: white; alternate-background-color: {COLOR_ROW_ALT}; gridline-color: #EDF1F6; border: 1px solid {COLOR_BORDER}; border-radius: 7px; selection-background-color: #DEEBFC; selection-color: #172B4D; outline: none; }}
+QTableWidget::item, QTreeWidget::item {{ padding: 5px 7px; }}
+QTableWidget::item:hover, QTreeWidget::item:hover {{ background: #EDF3FB; }}
+QHeaderView::section {{ background: #EDF2F8; color: #455873; padding: 9px 7px; border: none; border-bottom: 1px solid {COLOR_BORDER}; font-weight: 600; }}
+QTableCornerButton::section {{ background: #EDF2F8; border: none; }}
+QScrollArea {{ border: none; background: transparent; }}
+QScrollArea > QWidget > QWidget {{ background: white; }}
+QCheckBox {{ spacing: 8px; }}
+QGroupBox {{ border: 1px solid {COLOR_BORDER}; border-radius: 8px; margin-top: 16px; padding: 14px; font-weight: 600; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 5px; }}
+QSplitter::handle {{ background: {COLOR_BORDER}; }}
+QStatusBar {{ background: {COLOR_BG}; color: {COLOR_MUTED}; border-top: 1px solid {COLOR_BORDER}; font-size: 12px; padding: 4px 8px; }}
+QStatusBar::item {{ border: none; }}
+QProgressBar {{ border: 1px solid {COLOR_BORDER}; border-radius: 5px; background: white; text-align: center; min-height: 18px; }}
+QProgressBar::chunk {{ background: #94B8E7; border-radius: 4px; }}
+QToolTip {{ background: #172B4D; color: white; border: none; padding: 6px; }}
 """
 
 
@@ -272,6 +203,13 @@ def accent_button(text, slot=None):
     if slot is not None:
         btn.clicked.connect(slot)
     return btn
+
+
+def _compact_money(value):
+    """把金額縮成適合摘要卡與提示框閱讀的億元格式。"""
+    if value is None:
+        return "—"
+    return f"{value / 1e8:+,.1f} 億"
 
 
 def _screen_fit_size(widget, preferred_width=None, preferred_height=None, ratio=0.85):
@@ -442,7 +380,7 @@ def _format_fetched_at(iso_string):
 
 
 def run_refresh_in_thread(parent, progress_cb, done_cb, error_cb):
-    total_steps = 4
+    total_steps = 5
 
     def work(_cancel_event, emit):
         snapshot = get_market_snapshot(
@@ -450,10 +388,17 @@ def run_refresh_in_thread(parent, progress_cb, done_cb, error_cb):
             force_refresh=True,
             on_progress=lambda done, _total, label: emit(done, total_steps, label),
         )
-        emit(3, total_steps, "??????????????..")
+        emit(3, total_steps, "正在取得三大法人方向...")
+        try:
+            get_cached_institutional_snapshot(
+                INSTITUTIONAL_CACHE_PATH, force_refresh=True
+            )
+        except PriceFetchError:
+            pass
+        emit(4, total_steps, "正在寫入歷史資料庫...")
         record_snapshot(HISTORY_DB_PATH, snapshot)
         _record_valuation_snapshot_best_effort()
-        emit(4, total_steps, "???")
+        emit(5, total_steps, "重新整理完成。")
         return snapshot
 
     return run_background_task(
@@ -466,19 +411,24 @@ def run_refresh_in_thread(parent, progress_cb, done_cb, error_cb):
 
 
 def run_startup_preload_in_thread(parent, progress_cb, done_cb, error_cb):
-    total_steps = 4
+    total_steps = 5
 
     def work(_cancel_event, emit):
         snapshot = get_market_snapshot(
             CACHE_PATH,
             on_progress=lambda done, _total, label: emit(done, total_steps, label),
         )
-        emit(3, total_steps, "??????????????..")
+        emit(3, total_steps, "正在取得三大法人方向...")
+        try:
+            get_cached_institutional_snapshot(INSTITUTIONAL_CACHE_PATH)
+        except PriceFetchError:
+            pass
+        emit(4, total_steps, "正在寫入歷史資料庫...")
         record_snapshot(HISTORY_DB_PATH, snapshot)
         _record_valuation_snapshot_best_effort()
-        emit(3, total_steps, "????????????...")
+        emit(4, total_steps, "正在更新產業分類...")
         get_industry_map(HISTORY_DB_PATH)
-        emit(4, total_steps, "???")
+        emit(5, total_steps, "啟動準備完成。")
         return snapshot
 
     return run_background_task(
@@ -662,11 +612,44 @@ class StockDetailDialog(QtWidgets.QDialog):
         self.setWindowTitle(f"{ticker} {name}")
         self.setMinimumWidth(360)
 
+        self.hero = QtWidgets.QFrame()
+        self.hero.setProperty("stockHero", True)
+        hero_layout = QtWidgets.QHBoxLayout(self.hero)
+        hero_layout.setContentsMargins(16, 12, 16, 12)
+        identity_layout = QtWidgets.QVBoxLayout()
+        title = QtWidgets.QLabel(f"{name}　{ticker}")
+        title.setProperty("header", True)
+        market_label = QtWidgets.QLabel(market or "市場未明")
+        market_label.setProperty("muted", True)
+        identity_layout.addWidget(title)
+        identity_layout.addWidget(market_label)
+        hero_layout.addLayout(identity_layout)
+        hero_layout.addStretch(1)
+        price = getattr(parent, "snapshot", {}).get(ticker)
+        price_layout = QtWidgets.QVBoxLayout()
+        self.hero_price_label = QtWidgets.QLabel(
+            f"{price.close:,.2f}" if price is not None and price.close is not None else "—"
+        )
+        self.hero_price_label.setProperty("metricValue", True)
+        change_pct = _change_pct(price) if price is not None else None
+        self.hero_change_label = QtWidgets.QLabel(
+            f"{change_pct:+.2f}%" if change_pct is not None else "今日漲跌 —"
+        )
+        if change_pct is not None:
+            self.hero_change_label.setStyleSheet(
+                f"color: {COLOR_GAIN if change_pct >= 0 else COLOR_LOSS};"
+            )
+        price_layout.addWidget(self.hero_price_label, alignment=QtCore.Qt.AlignRight)
+        price_layout.addWidget(self.hero_change_label, alignment=QtCore.Qt.AlignRight)
+        hero_layout.addLayout(price_layout)
+
         self.status_label = QtWidgets.QLabel("查詢中...")
         self.status_label.setWordWrap(True)
+        self.status_label.setTextFormat(QtCore.Qt.RichText)
 
         self._layout = QtWidgets.QVBoxLayout(self)
         self._layout.setContentsMargins(20, 20, 20, 16)
+        self._layout.addWidget(self.hero)
         self._layout.addWidget(self.status_label)
 
         self.full_detail_button = QtWidgets.QPushButton("顯示完整籌碼面資訊（同部位紀錄）")
@@ -688,30 +671,44 @@ class StockDetailDialog(QtWidgets.QDialog):
 
     def _on_done(self, result):
         valuation, institutional = result
-        lines = []
-
+        metrics = []
         if valuation is None:
-            lines.append("本益比／殖利率：查無資料")
+            valuation_date = "估值資料不足"
+            metrics.extend((("PER", "—"), ("PBR", "—"), ("殖利率", "—")))
         else:
             per = valuation["per"]
             pbr = valuation["pbr"]
             yield_pct = valuation["dividend_yield"]
-            lines.append(f"日期：{valuation['date']}")
-            lines.append(
-                f"本益比 PER：{per if per is not None else 'N/A'}　"
-                f"股價淨值比 PBR：{pbr if pbr is not None else 'N/A'}"
+            valuation_date = f"估值日期 {valuation['date']}"
+            metrics.extend(
+                (
+                    ("PER", f"{per:.2f}" if per is not None else "—"),
+                    ("PBR", f"{pbr:.2f}" if pbr is not None else "—"),
+                    ("殖利率", f"{yield_pct:.2f}%" if yield_pct is not None else "—"),
+                )
             )
-            lines.append(f"殖利率：{yield_pct if yield_pct is not None else 'N/A'}%")
-
-        lines.append("")
+        metric_html = "".join(
+            f"<td width='150'><span style='color:{COLOR_MUTED}'>{label}</span><br>"
+            f"<span style='font-size:18px;font-weight:600'>{value}</span></td>"
+            for label, value in metrics
+        )
         if institutional is None:
-            lines.append("三大法人買賣超：查無資料")
+            institution_html = "三大法人買賣超：資料不足"
         else:
-            lines.append(f"三大法人買賣超（{institutional['date']}，單位：股）")
+            items = []
             for row in institutional["breakdown"]:
-                lines.append(f"　{row['label']}：淨買超 {row['net']:+,}")
-
-        self.status_label.setText("\n".join(lines))
+                color = COLOR_GAIN if row["net"] >= 0 else COLOR_LOSS
+                items.append(
+                    f"<span style='color:{color}'>{row['label']} {row['net']:+,}</span>"
+                )
+            institution_html = (
+                f"三大法人淨買賣（{institutional['date']}，股）　" + "　".join(items)
+            )
+        self.status_label.setText(
+            f"<table cellspacing='4'><tr>{metric_html}</tr></table>"
+            f"<div style='color:{COLOR_MUTED};margin-top:4px'>{valuation_date}</div>"
+            f"<div style='margin-top:10px'>{institution_html}</div>"
+        )
         self._notify_finmind_call()
 
     def _on_error(self, message):
@@ -735,6 +732,9 @@ class StockDetailDialog(QtWidgets.QDialog):
         文字時不需要這麼大）。"""
         self.full_detail_label = QtWidgets.QLabel("")
         self.full_detail_label.setWordWrap(True)
+        self.full_detail_label.setMaximumHeight(170)
+        # 完整摘要已包含基本估值與法人資訊，展開後收起上方簡版以免重複並節省高度。
+        self.status_label.setVisible(False)
 
         self.full_detail_price_chart = pg.PlotWidget()
         self.full_detail_flow_chart = pg.PlotWidget()
@@ -750,8 +750,8 @@ class StockDetailDialog(QtWidgets.QDialog):
             self.full_detail_vpt_chart,
             self.full_detail_mfi_chart,
         ):
-            chart.setBackground(COLOR_BG)
-            chart.showGrid(x=True, y=True, alpha=0.15)
+            chart.setBackground(COLOR_SURFACE)
+            chart.showGrid(x=True, y=True, alpha=0.08)
             chart.setMinimumHeight(320)
             chart.addLegend()
         _setup_price_chart_click(self.full_detail_price_chart)
@@ -781,7 +781,8 @@ class StockDetailDialog(QtWidgets.QDialog):
 
         self.full_detail_button.setEnabled(False)
         self.full_detail_button.setText("查詢中...")
-        header = f"{self.ticker} {self.name or ''}"
+        # 股票身分與即時價格已在上方 hero 區呈現，詳細摘要不再重複一次標題。
+        header = ""
 
         # 跟「部位紀錄」頁 _load_position_detail 同一招：先顯示上次永久存下來
         # 的結果（有的話），背景照樣重打一次 FinMind 拿最新資料。
@@ -867,17 +868,19 @@ class StockDetailDialog(QtWidgets.QDialog):
 
 
 class IndustryTopStocksDialog(QtWidgets.QDialog):
-    """點擊「資金流向分析」頁的產業泡泡／資金動向清單時彈出的小視窗，顯示該產業
+    """點擊「資金流向分析」頁的族群泡泡／熱度清單時彈出的小視窗，顯示該群組
     近 days 個交易日累積成交金額前 N 大成分股（市值資料的代理指標，見
     get_industry_top_stocks_range；N 不足時全部顯示），並附上近日成交量／均量／
     本益比。純本地資料（daily_prices／valuation_history 快取），不打任何
     API，開啟即顯示。days 來自資金流向頁最上方的共用期間，讓累積成交金額與
     近日均量都跟畫面上看到的分析口徑一致；本益比則取既有最新估值快取。"""
 
-    def __init__(self, parent, industry, top_stocks, days):
+    def __init__(self, parent, group_name, top_stocks, days):
         super().__init__(parent)
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowMaximizeButtonHint)
-        self.setWindowTitle(f"{industry}　近 {days} 日成交金額前 {len(top_stocks)} 大成分股")
+        self.setWindowTitle(
+            f"{group_name}　近 {days} 日成交金額前 {len(top_stocks)} 大成分股"
+        )
         self.setMinimumWidth(420)
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -1251,8 +1254,8 @@ class FlowChartWidget(pg.PlotWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setBackground(COLOR_BG)
-        self.showGrid(x=True, y=True, alpha=0.15)
+        self.setBackground(COLOR_SURFACE)
+        self.showGrid(x=True, y=True, alpha=0.08)
         self.getPlotItem().getViewBox().setMouseMode(pg.ViewBox.RectMode)
         # RectMode 讓滑鼠左鍵拖曳做框選縮放；平移改用滾輪縮放 + 觸控板手勢，
         # 保留右鍵拖曳可平移（pyqtgraph 預設行為）。
@@ -1277,6 +1280,127 @@ class FlowChartWidget(pg.PlotWidget):
 VALUATION_METRIC_LABELS = {"per": "本益比 PER", "pbr": "股價淨值比 PBR"}
 
 
+def _flow_quadrant_specs(mode):
+    """回傳象限名稱、解讀與底色；鍵值依序是 X／Y 是否高於參考線。"""
+    if mode == "valuation":
+        return {
+            (False, True): ("便宜吸金", "估值較低・資金升溫", "#E9F6EF"),
+            (True, True): ("強勢追價", "估值較高・資金升溫", "#FFF4DE"),
+            (False, False): ("低估觀望", "估值較低・資金降溫", "#EDF3FA"),
+            (True, False): ("高估降溫", "估值較高・資金降溫", "#FBECEC"),
+        }
+    return {
+        (False, True): ("放量承壓", "區間下跌・今日放量", "#FBECEC"),
+        (True, True): ("強勢吸金", "區間上漲・今日放量", "#E9F6EF"),
+        (False, False): ("弱勢觀望", "區間下跌・量能不足", "#EFF2F6"),
+        (True, False): ("量縮走強", "區間上漲・量能待確認", "#FFF4DE"),
+    }
+
+
+def _add_flow_quadrants(chart, bounds, x_ref, y_ref, mode):
+    """以固定八個圖元畫四象限底色與名稱，不隨泡泡數增加繪圖成本。"""
+    x_low, x_high, y_low, y_high = bounds
+    x_span = max(x_high - x_low, 1e-9)
+    y_span = max(y_high - y_low, 1e-9)
+    specs = _flow_quadrant_specs(mode)
+    areas = {
+        # 上方標籤以頂緣為錨點向下展開；下方反之，避免文字被圖框裁掉。
+        (False, True): (x_low, x_ref, y_ref, y_high, (0, 0)),
+        (True, True): (x_ref, x_high, y_ref, y_high, (1, 0)),
+        (False, False): (x_low, x_ref, y_low, y_ref, (0, 1)),
+        (True, False): (x_ref, x_high, y_low, y_ref, (1, 1)),
+    }
+    for quadrant, (left, right, bottom, top, anchor) in areas.items():
+        name, detail, color = specs[quadrant]
+        region = QtWidgets.QGraphicsRectItem(
+            QtCore.QRectF(left, bottom, max(right - left, 0), max(top - bottom, 0))
+        )
+        region.setBrush(pg.mkBrush(QtGui.QColor(color)))
+        region.setPen(pg.mkPen(None))
+        region.setZValue(-20)
+        region._flow_quadrant_region = True
+        chart.addItem(region)
+
+        x = (left + 0.035 * x_span) if anchor[0] == 0 else (right - 0.035 * x_span)
+        y = (top - 0.055 * y_span) if anchor[1] == 0 else (bottom + 0.055 * y_span)
+        label = pg.TextItem(
+            html=(
+                f'<div style="color:#344054; font-size:11pt; font-weight:600;">{name}</div>'
+                f'<div style="color:#667085; font-size:8pt;">{detail}</div>'
+            ),
+            anchor=anchor,
+        )
+        label.setPos(x, y)
+        label.setZValue(-10)
+        label._flow_quadrant_label = True
+        chart.addItem(label)
+    return specs
+
+
+def _populate_institutional_direction_chart(chart, rows, value_attr, title):
+    """畫單一法人的族群淨買賣左右發散圖；右買超、左賣超。"""
+    chart.clear()
+    plot = chart.getPlotItem()
+    plot.hideButtons()
+    plot.setMouseEnabled(x=True, y=False)
+    ranked = sorted(
+        (row for row in rows if getattr(row, value_attr, 0)),
+        key=lambda row: abs(getattr(row, value_attr)),
+        reverse=True,
+    )[:8]
+    if not ranked:
+        empty = pg.TextItem("尚無法人資料", color=COLOR_MUTED, anchor=(0.5, 0.5))
+        empty.setPos(0, 0)
+        chart.addItem(empty)
+        chart.setTitle(title, color=COLOR_TEXT, size="11pt")
+        return
+
+    ranked.reverse()
+    values = [getattr(row, value_attr) / 100_000_000 for row in ranked]
+    positions = list(range(len(ranked)))
+    positive_y = [y for y, value in zip(positions, values) if value >= 0]
+    positive_x = [value for value in values if value >= 0]
+    negative_y = [y for y, value in zip(positions, values) if value < 0]
+    negative_x = [value for value in values if value < 0]
+    if positive_x:
+        chart.addItem(
+            pg.BarGraphItem(
+                y=positive_y,
+                height=0.64,
+                x0=0,
+                x1=positive_x,
+                brush=pg.mkBrush(46, 155, 101, 205),
+                pen=pg.mkPen("#247E53"),
+            )
+        )
+    if negative_x:
+        chart.addItem(
+            pg.BarGraphItem(
+                y=negative_y,
+                height=0.64,
+                x0=0,
+                x1=negative_x,
+                brush=pg.mkBrush(217, 88, 82, 205),
+                pen=pg.mkPen("#B94743"),
+            )
+        )
+    chart.addLine(x=0, pen=pg.mkPen(COLOR_MUTED, width=1))
+    plot.getAxis("left").setTicks(
+        [[(index, row.group) for index, row in enumerate(ranked)]]
+    )
+    plot.setYRange(-0.7, len(ranked) - 0.3, padding=0)
+    max_abs = max(abs(value) for value in values) or 1
+    plot.setXRange(-max_abs * 1.15, max_abs * 1.15, padding=0)
+    total = sum(getattr(row, value_attr) for row in rows)
+    direction = "買超" if total > 0 else "賣超" if total < 0 else "持平"
+    chart.setTitle(
+        f"{title}｜整體{direction} {abs(total) / 100_000_000:,.1f} 億",
+        color=COLOR_TEXT,
+        size="11pt",
+    )
+    chart.setLabel("bottom", "← 賣超　估算淨額（億）　買超 →", color=COLOR_MUTED)
+
+
 def populate_flow_chart(
     chart,
     db_path,
@@ -1286,11 +1410,14 @@ def populate_flow_chart(
     mode="momentum",
     valuation_metric="per",
     dashboard=None,
+    classification_label="官方產業",
+    overlapping_groups=False,
 ):
-    """把產業資金流向資料畫進既有的 FlowChartWidget（保留使用者目前的縮放/平移狀態不做）。
+    """把族群資金流向資料畫進既有的 FlowChartWidget。
     avg_days 決定 X／Y 兩軸的天數（5/10/20 日流向切換），只影響 mode="momentum"；
-    mode="valuation" 使用 dashboard 提供的共用期間；沒有 dashboard 時才回退到獨立計算。
-    on_industry_click 若提供，點擊泡泡時會被呼叫並帶入該產業名稱（例如用來刷新
+    mode="valuation" 的短期窗口最多 5 日、長期基準至少 20 日，避免預設 5 日區間
+    造成分子分母相同、所有泡泡都落在 Y=1；沒有 dashboard 時才回退到獨立計算。
+    on_industry_click 若提供，點擊泡泡時會被呼叫並帶入該群組名稱（例如用來刷新
     下方的成分股面板）。
 
     `mode="momentum"`（預設）：X＝近 avg_days 日累積漲跌%、Y＝今日量比，即原本的
@@ -1303,7 +1430,7 @@ def populate_flow_chart(
 
     if mode == "valuation":
         valuation_short_days = min(5, max(1, avg_days))
-        valuation_long_days = max(valuation_short_days, max(1, avg_days))
+        valuation_long_days = max(20, max(1, avg_days))
         flow = (
             dashboard.valuation_flow
             if dashboard is not None and dashboard.valuation_flow is not None
@@ -1322,11 +1449,11 @@ def populate_flow_chart(
         ys_of = lambda f: f.money_flow_ratio  # noqa: E731
         metric_label = VALUATION_METRIC_LABELS[valuation_metric]
         empty_hint = "尚無估值資料可繪製（等待下一次「重新整理」或啟動時的估值快照）"
-        empty_title = "產業估值 vs 資金流向"
+        empty_title = f"{classification_label}估值 vs 資金流向"
         x_label = f"最新 {metric_label}（成交金額加權中位數）"
         y_label = f"資金流入強度（近{valuation_short_days}日均額 / 近{valuation_long_days}日均額）"
         title_prefix = (
-            f"產業估值 vs 資金流向｜最新{metric_label} × "
+            f"{classification_label}估值 vs 資金流向｜最新{metric_label} × "
             f"{valuation_short_days}/{valuation_long_days}日資金流入強度"
         )
         # X 沒有像百分位那樣天然的 0～100 參考值，改用「所有產業目前值的中位數」當
@@ -1345,10 +1472,10 @@ def populate_flow_chart(
         xs_of = lambda f: f.avg_change_pct  # noqa: E731
         ys_of = lambda f: f.volume_ratio  # noqa: E731
         empty_hint = "尚無足夠歷史資料可繪製（請先執行「回補歷史資料」，\n或等待逐日累積達到最小天數）"
-        empty_title = "產業資金流向"
+        empty_title = f"{classification_label}資金流向"
         x_label = f"近{avg_days}日成交金額加權平均累積漲跌 %"
         y_label = f"今日成交量 / 近{avg_days}日均量"
-        title_prefix = f"產業資金流向｜{avg_days}日"
+        title_prefix = f"{classification_label}資金流向｜{avg_days}日"
         x_ref_line, y_ref_line = 0, 1
 
     skipped = len(flow) - len(plotted)
@@ -1361,70 +1488,122 @@ def populate_flow_chart(
         vb.setLimits(xMin=None, xMax=None, yMin=None, yMax=None)
         return
 
-    # 泡泡大小用「資金比重(%)」（該產業成交金額 ÷ 全市場今日總成交金額）而非絕對金額，
+    # 泡泡大小用「資金比重(%)」（該群組成交金額 ÷ 全市場今日總成交金額）而非絕對金額，
     # 讓數字換算成跟當日大盤規模脫鉤的相對占比，不再是每天隨大盤總量起伏的絕對值。
-    max_share = max(f.capital_share_pct for f in plotted)
-
-    for i, f in enumerate(plotted):
-        x, y = xs_of(f), ys_of(f)
-        size = max(14.0, (f.capital_share_pct / max_share) ** 0.5 * 55.0)
-        color = QtGui.QColor(TAB20_COLORS[i % len(TAB20_COLORS)])
-        scatter = pg.ScatterPlotItem(
-            x=[x],
-            y=[y],
-            size=size,
-            brush=pg.mkBrush(color.red(), color.green(), color.blue(), 190),
-            pen=pg.mkPen(COLOR_TEXT, width=0.6),
-        )
-        if on_industry_click is not None:
-            # sigClicked.emit(self, points, ev) 帶 3 個位置參數，lambda 必須先吃滿這 3 個
-            # 才能讓 industry=f.industry 這個預設值不被 ev 位置覆蓋掉（曾經因為少寫一個
-            # 參數，導致每次點擊收到的都是 ev 而非產業名稱，已用 headless 測試抓出來）。
-            scatter.sigClicked.connect(
-                lambda _plot, _pts, _ev, industry=f.industry: on_industry_click(industry)
-            )
-        chart.addItem(scatter)
-        label = pg.TextItem(
-            f"{f.industry}\n{f.capital_share_pct:.1f}%", color=COLOR_TEXT, anchor=(0.5, 0.5)
-        )
-        label.setPos(x, y)
-        chart.addItem(label)
-
-    chart.addLine(x=x_ref_line, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
-    chart.addLine(y=y_ref_line, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
-    if mode == "valuation":
-        # 使用者要找的目標象限：左上角＝估值百分位低（便宜）＋資金流入強度高
-        # （錢已經在進），用一個角落註記標出來，不用使用者自己對兩條參考線。
-        xs_all = [xs_of(f) for f in plotted]
-        ys_all = [ys_of(f) for f in plotted]
-        corner = pg.TextItem(
-            "◤ 資金流入、估值仍便宜",
-            color=COLOR_GAIN,
-            anchor=(0, 1),
-        )
-        corner.setPos(min(xs_all + [x_ref_line]), max(ys_all + [y_ref_line]))
-        chart.addItem(corner)
-    chart.setLabel("bottom", x_label, color=COLOR_TEXT)
-    chart.setLabel("left", y_label, color=COLOR_TEXT)
-    title = f"{title_prefix}（泡泡大小＝資金比重%，點擊可查看成分股）"
-    if skipped:
-        title += f"　（另有 {skipped} 個產業因歷史資料不足未顯示）"
-    chart.setTitle(title, color=COLOR_TEXT, size="13pt")
-
-    # 限制縮小（滾輪／觸控板捏合）的下限，最多縮到剛好看見全部泡泡為止，避免
-    # 縮出一大片空白；邊界抓資料範圍的 15% 當緩衝，讓泡泡本身（半徑）與旁邊的
-    # 產業名稱標籤不會被邊緣裁到。上限（放大）不受影響，仍可無限拉近。
+    max_share = max(max(f.capital_share_pct for f in plotted), 0.0001)
     xs = [xs_of(f) for f in plotted]
     ys = [ys_of(f) for f in plotted]
     x_min, x_max = min(xs), max(xs)
     y_min, y_max = min(ys), max(ys)
     x_pad = max((x_max - x_min) * 0.15, 1.0)
     y_pad = max((y_max - y_min) * 0.15, 0.2)
+    view_bounds = (x_min - x_pad, x_max + x_pad, y_min - y_pad, y_max + y_pad)
+    quadrant_specs = _add_flow_quadrants(
+        chart, view_bounds, x_ref_line, y_ref_line, mode
+    )
+
+    # 當日方向來自同一批 dashboard 的動能資料。估值模式也沿用這份方向，讓使用者
+    # 切換模式後仍看到一致的紅綠語意，不需要再查一次資料庫。
+    direction_source = dashboard.industry_flow if dashboard is not None else flow
+    direction_by_group = {
+        f.industry: (
+            getattr(f, "daily_change_pct", None),
+            getattr(f, "turnover_ratio", None),
+            getattr(f, "directional_flow_value", None),
+        )
+        for f in direction_source
+    }
+    prominent = {
+        f.industry
+        for f in sorted(plotted, key=lambda f: f.capital_share_pct, reverse=True)[:5]
+    }
+    spots = []
+    for f in plotted:
+        x, y = xs_of(f), ys_of(f)
+        quadrant_name, quadrant_detail, _quadrant_color = quadrant_specs[
+            (x >= x_ref_line, y >= y_ref_line)
+        ]
+        size = max(14.0, (f.capital_share_pct / max_share) ** 0.5 * 55.0)
+        daily_change, turnover_ratio, directional_value = direction_by_group.get(
+            f.industry, (None, None, None)
+        )
+        if daily_change is None or abs(daily_change) < 0.05:
+            color = QtGui.QColor("#8290A3")
+            direction_text = "中性"
+        elif daily_change > 0:
+            color = QtGui.QColor("#2E9B65")
+            direction_text = "偏流入"
+        else:
+            color = QtGui.QColor("#D95852")
+            direction_text = "偏流出"
+        tip = (
+            f"{f.industry}｜當日{direction_text}\n"
+            f"方向推估：{_compact_money(directional_value)}　"
+            f"當日漲跌：{daily_change:+.2f}%\n" if daily_change is not None else
+            f"{f.industry}｜當日方向資料不足\n"
+        )
+        tip += (
+            f"成交活躍度：{turnover_ratio:.2f} 倍\n"
+            if turnover_ratio is not None else "成交活躍度：—\n"
+        )
+        tip += (
+            f"所在象限：{quadrant_name}（{quadrant_detail}）\n"
+            f"成交佔比：{f.capital_share_pct:.1f}%\n"
+            f"{x_label}：{x:.2f}\n{y_label}：{y:.2f}\n點擊查看成分股"
+        )
+        spots.append(
+            {
+                "pos": (x, y),
+                "size": size,
+                "data": {"industry": f.industry, "tip": tip},
+                "brush": pg.mkBrush(color.red(), color.green(), color.blue(), 185),
+                "pen": pg.mkPen(color.darker(125), width=1),
+            }
+        )
+        if f.industry not in prominent:
+            continue
+        display_name = f.industry if len(f.industry) <= 18 else f"{f.industry[:17]}…"
+        label = pg.TextItem(
+            f"{display_name}\n{f.capital_share_pct:.1f}%",
+            color=COLOR_TEXT,
+            anchor=(0.5, 1.3),
+        )
+        label.setPos(x, y)
+        chart.addItem(label)
+
+    # 所有泡泡共用單一 ScatterPlotItem，避免每次更新建立數十個 GraphicsObject。
+    # 點擊仍可由 point.data() 找回群組，因此效能改善不犧牲互動。
+    scatter = pg.ScatterPlotItem(
+        spots=spots,
+        hoverable=True,
+        tip=lambda _x, _y, data: data["tip"],
+        hoverPen=pg.mkPen(COLOR_ACCENT, width=2),
+    )
+    if on_industry_click is not None:
+        scatter.sigClicked.connect(
+            lambda _plot, points, _ev: points
+            and on_industry_click(points[0].data()["industry"])
+        )
+    chart.addItem(scatter)
+
+    chart.addLine(x=x_ref_line, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
+    chart.addLine(y=y_ref_line, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
+    chart.setLabel("bottom", x_label, color=COLOR_TEXT)
+    chart.setLabel("left", y_label, color=COLOR_TEXT)
+    share_label = "成交涵蓋率%" if overlapping_groups else "資金比重%"
+    title = f"{title_prefix}（泡泡大小＝{share_label}，點擊可查看成分股）"
+    if skipped:
+        title += f"　（另有 {skipped} 個群組因歷史資料不足未顯示）"
+    chart.setTitle(title, color=COLOR_TEXT, size="13pt")
+
+    # 限制縮小（滾輪／觸控板捏合）的下限，最多縮到剛好看見全部泡泡為止，避免
+    # 縮出一大片空白；邊界抓資料範圍的 15% 當緩衝，讓泡泡本身（半徑）與旁邊的
+    # 產業名稱標籤不會被邊緣裁到。上限（放大）不受影響，仍可無限拉近。
     vb.setLimits(
-        xMin=x_min - x_pad,
-        xMax=x_max + x_pad,
-        yMin=y_min - y_pad,
-        yMax=y_max + y_pad,
+        xMin=view_bounds[0],
+        xMax=view_bounds[1],
+        yMin=view_bounds[2],
+        yMax=view_bounds[3],
     )
 
     chart.enableAutoRange()
@@ -1811,8 +1990,8 @@ class TechnicalAnalysisWidget(QtWidgets.QWidget):
         layout.addLayout(controls)
 
         self.chart = pg.PlotWidget()
-        self.chart.setBackground(COLOR_BG)
-        self.chart.showGrid(x=True, y=True, alpha=0.15)
+        self.chart.setBackground(COLOR_SURFACE)
+        self.chart.showGrid(x=True, y=True, alpha=0.08)
         self.chart.setMinimumHeight(320)
         self.chart.addLegend()
         layout.addWidget(self.chart, 1)
@@ -1884,7 +2063,7 @@ def _render_detail_block(
     lending = data["lending"]
     suspension = data["suspension"]
 
-    lines = [header]
+    lines = [header] if header else []
     if note:
         lines.append(note)
     lines.append("")
@@ -1964,7 +2143,25 @@ def _render_detail_block(
                 f"原因：{event['reason'] or '未提供'}"
             )
 
-    label.setText("\n".join(lines))
+    # QLabel 的簡單 Rich Text 可增加段落層級，又不需要額外建立大量 widget。
+    # 這個摘要在「部位紀錄」與個股彈窗共用，因此保留原有內容，只改善掃讀性。
+    html_lines = []
+    for index, line in enumerate(lines):
+        if not line:
+            continue
+        safe = html.escape(line).replace("　", "&nbsp;&nbsp;")
+        if index == 0 and header:
+            html_lines.append(f"<div style='font-weight:600'>{safe}</div>")
+        elif note and line == note:
+            html_lines.append(f"<div style='color:{COLOR_MUTED};margin:3px 0 7px'>{safe}</div>")
+        elif line.startswith("　"):
+            html_lines.append(f"<div style='margin-left:14px'>{safe}</div>")
+        elif line.startswith("⚠"):
+            html_lines.append(f"<div style='color:{COLOR_LOSS};margin-top:5px'>{safe}</div>")
+        else:
+            html_lines.append(f"<div style='margin-top:4px'>{safe}</div>")
+    label.setTextFormat(QtCore.Qt.RichText)
+    label.setText("".join(html_lines))
     _populate_price_chart(price_chart, data.get("price_history"))
     _populate_flow_chart(flow_chart, history)
     _populate_institutional_detail_chart(
@@ -2070,12 +2267,18 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
         self.settings = load_settings(SETTINGS_PATH)
         self.positions = load_positions(POSITIONS_PATH)
-        # 概念股清單只在啟動時讀一次（跟 concepts.json 一樣是人工維護的靜態檔案，
-        # 改完要重開程式才生效，見 tradingnote_concepts.py docstring）。
-        self._ticker_concept_map = build_ticker_concept_map(load_concepts())
+        # 概念目錄在啟動時讀入一次；重建 concepts.json 後需重開程式，
+        # 才會讓持股概念標籤與資金流向分類同時更新。
+        self._concepts = load_concepts()
+        self._ticker_concept_map = build_ticker_concept_map(self._concepts)
+        self._classification_catalog = build_classification_catalog(self._concepts)
         self.snapshot = snapshot
         self.last_error = last_error
-        self.flow_service = FlowAnalysisService(HISTORY_DB_PATH)
+        self.flow_service = FlowAnalysisService(
+            HISTORY_DB_PATH,
+            classification_catalog=self._classification_catalog,
+            institutional_cache_path=INSTITUTIONAL_CACHE_PATH,
+        )
         self.staleness_warning = (
             "；".join(snapshot_staleness_warnings(self.snapshot)) if self.snapshot else ""
         )
@@ -2096,8 +2299,18 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
         central = QtWidgets.QWidget()
         central_layout = QtWidgets.QVBoxLayout(central)
-        central_layout.setContentsMargins(0, 0, 0, 0)
-        central_layout.setSpacing(0)
+        central_layout.setContentsMargins(18, 14, 18, 8)
+        central_layout.setSpacing(12)
+        heading = QtWidgets.QHBoxLayout()
+        brand = QtWidgets.QLabel("TradingNote")
+        brand.setObjectName("brandTitle")
+        heading.addWidget(brand)
+        subtitle = QtWidgets.QLabel("市場觀察 / 部位管理")
+        subtitle.setProperty("muted", True)
+        heading.addSpacing(12)
+        heading.addWidget(subtitle)
+        heading.addStretch()
+        central_layout.addLayout(heading)
         self._build_new_data_banner(central_layout)
 
         self.tabs = QtWidgets.QTabWidget()
@@ -2108,21 +2321,18 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.positions_tab = QtWidgets.QWidget()
         self.stocks_tab = QtWidgets.QWidget()
         self.futures_tab = QtWidgets.QWidget()
-        self.ai_agent_tab = QtWidgets.QWidget()
         self.settings_tab = QtWidgets.QWidget()
-        # 資金流向分析先加入，成為預設頁；部位紀錄、個股、期貨、AI 助理、設定依序是第二～六個分頁。
+        # 資金流向分析先加入，成為預設頁；其餘依序是部位紀錄、個股、期貨、設定。
         self.tabs.addTab(self.flow_tab, "資金流向分析")
         self.tabs.addTab(self.positions_tab, "部位紀錄")
         self.tabs.addTab(self.stocks_tab, "個股")
         self.tabs.addTab(self.futures_tab, "期貨")
-        self.tabs.addTab(self.ai_agent_tab, "AI 助理")
         self.tabs.addTab(self.settings_tab, "設定")
 
         self._build_flow_tab()
         self._build_positions_tab()
         self._build_stocks_tab()
         self._build_futures_tab()
-        self._build_ai_agent_tab()
         self._build_settings_tab()
 
         self.status_bar = QtWidgets.QStatusBar()
@@ -2247,10 +2457,40 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         toolbar.addWidget(self.flow_date_button)
 
         toolbar.addSpacing(16)
+        toolbar.addWidget(QtWidgets.QLabel("分類方式："))
+        self.flow_classification_combo = QtWidgets.QComboBox()
+        for classification_mode, label in CLASSIFICATION_LABELS.items():
+            if classification_mode == CLASSIFICATION_VALUE_CHAIN_LEAF:
+                available = bool(self._classification_catalog.value_chain_scopes)
+            else:
+                available = bool(
+                    self._classification_catalog.groups(classification_mode)
+                )
+            if classification_mode != CLASSIFICATION_INDUSTRY and not available:
+                continue
+            self.flow_classification_combo.addItem(label, classification_mode)
+        self.flow_classification_combo.currentIndexChanged.connect(
+            self._on_flow_classification_changed
+        )
+        toolbar.addWidget(self.flow_classification_combo)
+
+        self.flow_classification_scope_label = QtWidgets.QLabel("主鏈：")
+        self.flow_classification_scope_combo = QtWidgets.QComboBox()
+        for scope in self._classification_catalog.value_chain_scopes:
+            self.flow_classification_scope_combo.addItem(scope, scope)
+        self.flow_classification_scope_combo.currentIndexChanged.connect(
+            lambda _: self.refresh_flow_tab()
+        )
+        self.flow_classification_scope_label.setVisible(False)
+        self.flow_classification_scope_combo.setVisible(False)
+        toolbar.addWidget(self.flow_classification_scope_label)
+        toolbar.addWidget(self.flow_classification_scope_combo)
+
+        toolbar.addSpacing(16)
         toolbar.addWidget(QtWidgets.QLabel("泡泡圖模式："))
         self.flow_bubble_mode_combo = QtWidgets.QComboBox()
-        self.flow_bubble_mode_combo.addItem("動能（漲跌% × 量比）", "momentum")
-        self.flow_bubble_mode_combo.addItem("估值（PER/PBR 百分位 × 資金流入強度）", "valuation")
+        self.flow_bubble_mode_combo.addItem("動能象限（漲跌% × 量比）", "momentum")
+        self.flow_bubble_mode_combo.addItem("估值象限（PER/PBR × 資金熱度）", "valuation")
         self.flow_bubble_mode_combo.currentIndexChanged.connect(self._on_flow_bubble_mode_changed)
         toolbar.addWidget(self.flow_bubble_mode_combo)
 
@@ -2278,8 +2518,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         )
 
         sections = (
-            ("產業泡泡圖", self._build_flow_chart_section),
-            ("產業熱度排行", self._build_flow_list_section),
+            ("族群泡泡圖", self._build_flow_chart_section),
+            ("法人方向", self._build_institutional_direction_section),
+            ("族群熱度排行", self._build_flow_list_section),
             ("資金流入前 50", self._build_stock_capital_flow_section),
             ("個股爆量", self._build_volume_outliers_section),
         )
@@ -2308,17 +2549,83 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.flow_section_stack, 1)
         self.flow_section_buttons[0].setChecked(True)
 
-    def _build_flow_chart_section(self, layout):
-        header = QtWidgets.QLabel("產業資金流向圖")
+    def _build_institutional_direction_section(self, layout):
+        header_row = QtWidgets.QHBoxLayout()
+        header = QtWidgets.QLabel("三大法人族群調整方向")
         header.setProperty("header", True)
-        layout.addWidget(header)
-        layout.addSpacing(4)
+        self.institutional_direction_date_label = QtWidgets.QLabel("資料尚未載入")
+        self.institutional_direction_date_label.setProperty("muted", True)
+        header_row.addWidget(header)
+        header_row.addStretch(1)
+        header_row.addWidget(self.institutional_direction_date_label)
+        layout.addLayout(header_row)
+
         hint = QtWidgets.QLabel(
-            "泡泡大小代表今日資金比重；點擊泡泡可查看該產業的成分股。"
+            "每張圖獨立顯示該法人的前八大族群：右側為買超、左側為賣超。"
+            "方向採交易所實際淨買賣股數，淨額以當日收盤價估算。"
         )
         hint.setProperty("muted", True)
         hint.setWordWrap(True)
         layout.addWidget(hint)
+
+        chart_row = QtWidgets.QHBoxLayout()
+        chart_row.setSpacing(8)
+        self.institutional_direction_charts = []
+        for _title in ("外資", "投信", "自營商"):
+            chart = pg.PlotWidget()
+            chart.setBackground(COLOR_SURFACE)
+            chart.showGrid(x=True, y=False, alpha=0.08)
+            chart.setMinimumSize(260, 370)
+            chart_row.addWidget(chart, 1)
+            self.institutional_direction_charts.append(chart)
+        layout.addLayout(chart_row, 1)
+
+    def _refresh_institutional_direction(self, dashboard):
+        rows = dashboard.institutional_flow
+        data_date = max((row.date for row in rows if row.date), default="—")
+        covered = max((row.covered_stocks for row in rows), default=0)
+        self.institutional_direction_date_label.setText(
+            f"資料日 {data_date}・單一族群最多涵蓋 {covered} 檔"
+        )
+        for chart, (value_attr, title) in zip(
+            self.institutional_direction_charts,
+            (
+                ("foreign_value", "外資"),
+                ("trust_value", "投信"),
+                ("dealer_value", "自營商"),
+            ),
+        ):
+            _populate_institutional_direction_chart(chart, rows, value_attr, title)
+
+    def _build_flow_chart_section(self, layout):
+        self.flow_chart_header = QtWidgets.QLabel("官方產業資金流向圖")
+        self.flow_chart_header.setProperty("header", True)
+        layout.addWidget(self.flow_chart_header)
+        summary_row = QtWidgets.QHBoxLayout()
+        summary_row.setSpacing(8)
+        self.flow_summary_labels = []
+        for title in ("今日偏流入", "今日偏流出", "成交最活躍"):
+            card = QtWidgets.QFrame()
+            card.setProperty("summaryCard", True)
+            card_layout = QtWidgets.QVBoxLayout(card)
+            card_layout.setContentsMargins(12, 8, 12, 8)
+            caption = QtWidgets.QLabel(title)
+            caption.setProperty("muted", True)
+            value = QtWidgets.QLabel("—")
+            value.setProperty("metricValue", True)
+            card_layout.addWidget(caption)
+            card_layout.addWidget(value)
+            summary_row.addWidget(card, 1)
+            self.flow_summary_labels.append(value)
+        layout.addLayout(summary_row)
+        layout.addSpacing(4)
+        self.flow_chart_hint = QtWidgets.QLabel(
+            "綠色＝當日量價偏流入，紅色＝偏流出，灰色＝中性；"
+            "標示成交佔比前五大族群，滑鼠移至泡泡查看數值。"
+        )
+        self.flow_chart_hint.setProperty("muted", True)
+        self.flow_chart_hint.setWordWrap(True)
+        layout.addWidget(self.flow_chart_hint)
         layout.addSpacing(8)
         self.flow_chart = FlowChartWidget()
         self.flow_chart.setMinimumHeight(380)
@@ -2326,12 +2633,26 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
     def _update_flow_date_button(self):
         self.flow_date_button.setText(
-            f"{self.flow_period.start_date} 起（近 {self.flow_period.trading_days} 個交易日）　▾"
+            f"{self.flow_period.start_date} 起（近 {self.flow_period.trading_days} 個交易日） · 選日期"
         )
 
     def _on_flow_bubble_mode_changed(self, _index):
         is_valuation = self.flow_bubble_mode_combo.currentData() == "valuation"
         self.flow_valuation_metric_combo.setVisible(is_valuation)
+        self.refresh_flow_tab()
+
+    def _flow_classification_mode(self):
+        return self.flow_classification_combo.currentData() or CLASSIFICATION_INDUSTRY
+
+    def _flow_classification_scope(self):
+        if self._flow_classification_mode() != CLASSIFICATION_VALUE_CHAIN_LEAF:
+            return None
+        return self.flow_classification_scope_combo.currentData()
+
+    def _on_flow_classification_changed(self, _index):
+        show_scope = self._flow_classification_mode() == CLASSIFICATION_VALUE_CHAIN_LEAF
+        self.flow_classification_scope_label.setVisible(show_scope)
+        self.flow_classification_scope_combo.setVisible(show_scope)
         self.refresh_flow_tab()
 
     def _open_flow_date_picker(self):
@@ -2348,12 +2669,32 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
     def refresh_flow_tab(self):
         period = self.flow_period
+        classification_mode = self._flow_classification_mode()
+        classification_scope = self._flow_classification_scope()
+        classification_label = CLASSIFICATION_LABELS[classification_mode]
+        overlapping_groups = classification_mode != CLASSIFICATION_INDUSTRY
         dashboard = self.flow_service.analyze(
             self.snapshot,
             period,
             bubble_mode=self.flow_bubble_mode_combo.currentData(),
             valuation_metric=self.flow_valuation_metric_combo.currentData(),
+            classification_mode=classification_mode,
+            classification_scope=classification_scope,
         )
+        data_date = _snapshot_date(self.snapshot) or "資料日期未明"
+        self.flow_chart_header.setText(
+            f"{classification_label}資金流向圖　·　{data_date}"
+        )
+        if overlapping_groups:
+            self.flow_chart_hint.setText(
+                "先看淡色象限判斷區間狀態，再看泡泡大小與當日紅綠。概念可重疊；"
+                "泡泡大小為成交涵蓋率，各群組合計可能超過 100%。"
+            )
+        else:
+            self.flow_chart_hint.setText(
+                "先看淡色象限判斷區間狀態，再看泡泡大小（成交佔比）與當日紅綠；"
+                "滑鼠移至泡泡可看完整數值與象限解讀。"
+            )
         populate_flow_chart(
             self.flow_chart,
             HISTORY_DB_PATH,
@@ -2363,15 +2704,49 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             mode=self.flow_bubble_mode_combo.currentData(),
             valuation_metric=self.flow_valuation_metric_combo.currentData(),
             dashboard=dashboard,
+            classification_label=classification_label,
+            overlapping_groups=overlapping_groups,
         )
+        self._refresh_flow_summary(dashboard)
+        self._refresh_institutional_direction(dashboard)
         self.refresh_flow_list(dashboard)
         self.refresh_stock_capital_flow_list(dashboard)
         self.refresh_volume_outliers_list(dashboard)
 
+    def _refresh_flow_summary(self, dashboard):
+        """用既有 dashboard 更新三張摘要卡，不觸發額外 DB 或網路工作。"""
+        rows = [
+            row
+            for row in dashboard.industry_flow
+            if row.daily_change_pct is not None
+        ]
+        inflow = [row for row in rows if row.daily_change_pct >= 0.05]
+        outflow = [row for row in rows if row.daily_change_pct <= -0.05]
+        active = max(
+            (row for row in rows if row.turnover_ratio is not None),
+            key=lambda row: row.turnover_ratio,
+            default=None,
+        )
+        self.flow_summary_labels[0].setText(f"{len(inflow)} 個族群")
+        self.flow_summary_labels[0].setStyleSheet(f"color: {COLOR_GAIN};")
+        self.flow_summary_labels[1].setText(f"{len(outflow)} 個族群")
+        self.flow_summary_labels[1].setStyleSheet(f"color: {COLOR_LOSS};")
+        if active is None:
+            self.flow_summary_labels[2].setText("—")
+        else:
+            self.flow_summary_labels[2].setText(
+                f"{active.industry}　{active.turnover_ratio:.2f}×"
+            )
+
     def _show_industry_top_stocks(self, industry):
         period = self.flow_period
-        top_stocks = self.flow_service.get_industry_top_stocks(
-            self.snapshot, period, industry, top_n=30
+        top_stocks = self.flow_service.get_group_top_stocks(
+            self.snapshot,
+            period,
+            industry,
+            classification_mode=self._flow_classification_mode(),
+            classification_scope=self._flow_classification_scope(),
+            top_n=30,
         )
         IndustryTopStocksDialog(self, industry, top_stocks, days=period.trading_days).exec()
 
@@ -2393,14 +2768,14 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addWidget(header)
         layout.addSpacing(4)
 
-        hint = QtWidgets.QLabel(
+        self.flow_list_hint = QtWidgets.QLabel(
             "資料區間與上方「流向區間」一致。分數為同批產業的"
             "相對百分位（0～100）：人氣＝今日資金比重、動能＝區間漲跌、量能＝量比；"
             "綜合熱度為三者平均，清單預設依綜合熱度排序。"
         )
-        hint.setProperty("muted", True)
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        self.flow_list_hint.setProperty("muted", True)
+        self.flow_list_hint.setWordWrap(True)
+        layout.addWidget(self.flow_list_hint)
         layout.addSpacing(8)
 
         self.flow_list = QtWidgets.QTreeWidget()
@@ -2408,7 +2783,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.flow_list.setHeaderLabels(
             [
                 "熱度排名",
-                "產業",
+                "分類",
                 "檔數",
                 "今日成交金額(億)",
                 "今日資金比重%",
@@ -2437,6 +2812,22 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         if dashboard is None:
             dashboard = self.flow_service.analyze(self.snapshot, self.flow_period)
         flow = dashboard.industry_flow
+        overlapping_groups = dashboard.classification_mode != CLASSIFICATION_INDUSTRY
+        classification_label = CLASSIFICATION_LABELS[dashboard.classification_mode]
+        share_name = "成交涵蓋率" if overlapping_groups else "今日資金比重"
+        self.flow_list.headerItem().setText(1, classification_label)
+        self.flow_list.headerItem().setText(4, f"{share_name}%")
+        overlap_note = (
+            "概念可重疊，各群組涵蓋率合計可能超過 100%。"
+            if overlapping_groups
+            else ""
+        )
+        self.flow_list_hint.setText(
+            f"資料區間與上方「流向區間」一致。{overlap_note}"
+            f"分數為同批{classification_label}的相對百分位（0～100）："
+            f"人氣＝{share_name}、動能＝區間漲跌、量能＝量比；"
+            "綜合熱度為三者平均，清單預設依綜合熱度排序。"
+        )
         # 進入畫面時直接把最能同時代表人氣／動能／量能的族群排在前面。
         flow = sorted(
             flow,
@@ -2822,11 +3213,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         outer_layout = QtWidgets.QVBoxLayout(container)
         outer_layout.setContentsMargins(0, 10, 0, 0)
 
-        header = QtWidgets.QLabel(
-            "個股詳細資訊（選取上方部位查看，含 FinMind 歷史股價、三大法人120日"
-            "資金流向、法人分別（五細項）累計買賣超、融資融券餘額、外資持股、"
-            "借券與停資停券、VPT 量價趨勢、MFI 資金流量、KD／MACD／均線／RSI）"
-        )
+        header = QtWidgets.QLabel("個股詳細資訊")
+        header.setToolTip("選取上方部位，查看歷史股價、法人、融資融券及技術指標。")
         header.setProperty("header", True)
         outer_layout.addWidget(header)
         outer_layout.addSpacing(4)
@@ -2849,8 +3237,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self.position_vpt_chart,
             self.position_mfi_chart,
         ):
-            chart.setBackground(COLOR_BG)
-            chart.showGrid(x=True, y=True, alpha=0.15)
+            chart.setBackground(COLOR_SURFACE)
+            chart.showGrid(x=True, y=True, alpha=0.08)
             chart.setMinimumHeight(320)
             chart.addLegend()
         _setup_price_chart_click(self.position_price_chart)
@@ -3057,9 +3445,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
             with CACHE_PATH.open("r", encoding="utf-8") as f:
                 fetched_at = _json.load(f).get("fetched_at", "")
-            cache_note = f"價格更新時間：{fetched_at}"
+            cache_note = f"價格更新：{_format_fetched_at(fetched_at)}"
         total_note = (
-            f"總損益：{self._total_pnl:+.0f}" if self._total_pnl is not None else "總損益：N/A"
+            f"總損益：{self._total_pnl:+,.0f}" if self._total_pnl is not None else "總損益：N/A"
         )
         error_note = f"　⚠ {self.last_error}" if self.last_error else ""
         staleness_note = f"　⚠ {self.staleness_warning}" if self.staleness_warning else ""
@@ -3158,8 +3546,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         toolbar = QtWidgets.QHBoxLayout()
         toolbar.addWidget(QtWidgets.QLabel("搜尋"))
         self.stock_search_edit = QtWidgets.QLineEdit()
-        self.stock_search_edit.setPlaceholderText("輸入代號或名稱")
-        self.stock_search_edit.setMaximumWidth(200)
+        self.stock_search_edit.setPlaceholderText("搜尋股票代號或名稱")
+        self.stock_search_edit.setMinimumWidth(210)
+        self.stock_search_edit.setMaximumWidth(320)
         self.stock_search_edit.textChanged.connect(self._filter_stocks_tree)
         toolbar.addWidget(self.stock_search_edit)
 
@@ -3184,7 +3573,38 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.stocks_tree.setColumnWidth(1, 80)
         self.stocks_tree.setColumnWidth(2, 90)
         self.stocks_tree.itemDoubleClicked.connect(self._on_stock_double_clicked)
-        layout.addWidget(self.stocks_tree)
+        self.stocks_tree.currentItemChanged.connect(self._on_stock_selected)
+
+        self.stock_preview = QtWidgets.QFrame()
+        self.stock_preview.setProperty("stockHero", True)
+        preview_layout = QtWidgets.QVBoxLayout(self.stock_preview)
+        preview_layout.setContentsMargins(18, 18, 18, 18)
+        preview_caption = QtWidgets.QLabel("個股摘要")
+        preview_caption.setProperty("muted", True)
+        self.stock_preview_title = QtWidgets.QLabel("選取股票查看摘要")
+        self.stock_preview_title.setProperty("header", True)
+        self.stock_preview_price = QtWidgets.QLabel("—")
+        self.stock_preview_price.setProperty("metricValue", True)
+        self.stock_preview_meta = QtWidgets.QLabel("雙擊股票可開啟完整估值與法人資訊。")
+        self.stock_preview_meta.setProperty("muted", True)
+        self.stock_preview_meta.setWordWrap(True)
+        self.stock_preview_button = accent_button("查看完整分析", self._open_selected_stock_detail)
+        self.stock_preview_button.setEnabled(False)
+        preview_layout.addWidget(preview_caption)
+        preview_layout.addWidget(self.stock_preview_title)
+        preview_layout.addSpacing(8)
+        preview_layout.addWidget(self.stock_preview_price)
+        preview_layout.addWidget(self.stock_preview_meta)
+        preview_layout.addStretch(1)
+        preview_layout.addWidget(self.stock_preview_button)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter.addWidget(self.stocks_tree)
+        splitter.addWidget(self.stock_preview)
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([850, 260])
+        layout.addWidget(splitter, 1)
 
     def refresh_stocks_tab(self):
         try:
@@ -3227,6 +3647,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
                 # UserRole + 1 存市場別（TWSE／TPEX），雙擊查詢時用來決定本益比／
                 # 殖利率要查 FinMind 還是 TPEX 官方端點（見 StockDetailDialog）。
                 child.setData(0, QtCore.Qt.UserRole + 1, info["market"])
+                child.setData(0, QtCore.Qt.UserRole + 2, industry)
                 industry_item.addChild(child)
 
         self._filter_stocks_tree(self.stock_search_edit.text())
@@ -3254,7 +3675,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
                 industry_item.setExpanded(visible_count > 0)
 
     def update_finmind_count_label(self):
-        """更新「個股」／「AI 助理」頁共用的 FinMind 用量提醒；免費額度是
+        """更新「個股」頁的 FinMind 用量提醒；免費額度是
         600 次／小時，接近或超過時把文字變色提醒，避免使用者查到一半才發現被 FinMind 擋掉。"""
         count = get_call_count()
         text = f"FinMind API 過去 1 小時：{count} / {FINMIND_HOURLY_LIMIT} 次"
@@ -3267,43 +3688,56 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         else:
             color = COLOR_MUTED
 
-        for label_name in (
-            "finmind_count_label",
-            "ai_agent_finmind_count_label",
-        ):
-            label = getattr(self, label_name, None)
-            if label is not None:
-                label.setText(text)
-                label.setStyleSheet(f"color: {color};")
-
-    def update_gemini_count_label(self):
-        """更新「AI 助理」頁的 Gemini API 用量提醒；GEMINI_RPM_HINT 只是粗略
-        參考值（Google 不保證固定，依帳號層級／模型調整），接近或超過時把文字
-        變色提醒，避免使用者連續發問到一半才發現被 Gemini 擋掉（429）。"""
-        label = getattr(self, "ai_agent_gemini_count_label", None)
-        if label is None:
-            return
-        count = get_gemini_call_count()
-        text = f"Gemini API 過去 1 分鐘：{count} / 約 {GEMINI_RPM_HINT} 次"
-        if count >= GEMINI_RPM_HINT:
-            text += "　可能已達每分鐘額度上限，稍等再試"
-            color = COLOR_LOSS
-        elif count >= GEMINI_RPM_HINT * 0.8:
-            text += "　接近上限，請留意"
-            color = COLOR_ACCENT
-        else:
-            color = COLOR_MUTED
-        label.setText(text)
-        label.setStyleSheet(f"color: {color};")
+        label = getattr(self, "finmind_count_label", None)
+        if label is not None:
+            label.setText(text)
+            label.setStyleSheet(f"color: {color};")
 
     def _on_stock_double_clicked(self, item, _column):
         ticker = item.data(0, QtCore.Qt.UserRole)
         if not ticker:
             return  # 點到的是產業分組列，不是個股
-        name = item.text(1)
+        name = item.text(0)
         market = item.data(0, QtCore.Qt.UserRole + 1)
         token = self.settings.get("finmind_token", "")
         StockDetailDialog(self, ticker, name, token, market=market).exec()
+
+    def _on_stock_selected(self, item, _previous=None):
+        ticker = item.data(0, QtCore.Qt.UserRole) if item is not None else None
+        if not ticker:
+            self.stock_preview_title.setText("選取股票查看摘要")
+            self.stock_preview_price.setText("—")
+            self.stock_preview_price.setStyleSheet("")
+            self.stock_preview_meta.setText("雙擊股票可開啟完整估值與法人資訊。")
+            self.stock_preview_button.setEnabled(False)
+            return
+        price = self.snapshot.get(ticker)
+        name = item.text(0)
+        market = item.data(0, QtCore.Qt.UserRole + 1) or "—"
+        industry = item.data(0, QtCore.Qt.UserRole + 2) or "未分類"
+        self.stock_preview_title.setText(f"{name}　{ticker}")
+        if price is not None and price.close is not None:
+            change_pct = _change_pct(price)
+            change_text = f"{change_pct:+.2f}%" if change_pct is not None else "—"
+            self.stock_preview_price.setText(f"{price.close:,.2f}　{change_text}")
+            if change_pct is not None:
+                self.stock_preview_price.setStyleSheet(
+                    f"color: {COLOR_GAIN if change_pct >= 0 else COLOR_LOSS};"
+                )
+            volume_text = f"{(price.volume or 0) / 1000:,.0f} 張"
+            self.stock_preview_meta.setText(
+                f"{market} · {industry}\n成交量 {volume_text}\n資料日期 {price.date or '—'}"
+            )
+        else:
+            self.stock_preview_price.setText("暫無行情")
+            self.stock_preview_price.setStyleSheet("")
+            self.stock_preview_meta.setText(f"{market} · {industry}")
+        self.stock_preview_button.setEnabled(True)
+
+    def _open_selected_stock_detail(self):
+        item = self.stocks_tree.currentItem()
+        if item is not None:
+            self._on_stock_double_clicked(item, 0)
 
     # ---------- 期貨頁（TAIFEX 官方盤後行情） ----------
     # 原本串接 Fugle 的 data-futopt 即時行情，但查證 developer.fugle.tw 定價文件
@@ -3328,18 +3762,14 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         toolbar.addWidget(QtWidgets.QLabel("搜尋"))
         self.futures_search_edit = QtWidgets.QLineEdit()
         self.futures_search_edit.setPlaceholderText("輸入代號／名稱，如 TX／台積電／2330／布蘭特")
-        self.futures_search_edit.setMaximumWidth(260)
+        self.futures_search_edit.setMinimumWidth(240)
+        self.futures_search_edit.setMaximumWidth(320)
         self.futures_search_edit.textChanged.connect(self._filter_futures_table)
         toolbar.addWidget(self.futures_search_edit)
 
-        hint = QtWidgets.QLabel(
-            "預設列出 TAIFEX 全部期貨商品盤後行情，輸入關鍵字即篩出符合的商品——可用契約"
-            "代碼（TX／CDF）、股票期貨標的代號（2330）或名稱（台積電、布蘭特）搜尋。「大額前10…」"
-            "欄是該商品近月「所有交易人」前10大未沖銷部位摘要；點選某列，下方面板會顯示該商品"
-            "完整的大額交易人未沖銷部位（各到期月份 × 所有交易人／特定法人），雙擊則開較大的彈窗。"
-            "資料來自 TAIFEX 官方免金鑰端點、每交易日更新一次、非即時報價（「一般」＝日盤、"
-            "「盤後」＝夜盤彙總），跟其他資料一起在「設定」分頁按「重新整理所有資料」更新。"
-        )
+        hint = QtWidgets.QLabel("盤後行情 · 點選商品查看大額交易人部位，雙擊查看完整明細。")
+        hint.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        hint.setToolTip("可搜尋契約代碼、股票代號或名稱。大額前10欄位為近月所有交易人部位；一般為日盤，盤後為夜盤。資料每日更新，可至設定重新整理。")
         hint.setProperty("muted", True)
         hint.setWordWrap(True)
         toolbar.addWidget(hint)
@@ -3407,8 +3837,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         # 趨勢圖：選取商品的前10大買/賣方未沖銷部位逐日走勢（歷史由背景回補累積，
         # 見 _sync_large_traders_history）。放在明細表右邊，用 QSplitter 可調寬度。
         self.futures_lt_trend_chart = pg.PlotWidget()
-        self.futures_lt_trend_chart.setBackground(COLOR_BG)
-        self.futures_lt_trend_chart.showGrid(x=True, y=True, alpha=0.15)
+        self.futures_lt_trend_chart.setBackground(COLOR_SURFACE)
+        self.futures_lt_trend_chart.showGrid(x=True, y=True, alpha=0.08)
         self.futures_lt_trend_chart.addLegend()
         self.futures_lt_trend_chart.setMinimumHeight(200)
 
@@ -3629,122 +4059,17 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
                 haystack += f" {name.lower()}"
             self.futures_table.setRowHidden(index, keyword not in haystack)
 
-    # ---------- AI 助理頁 ----------
-
-    def _build_ai_agent_tab(self):
-        """真正串接 Gemini API 的自然語言問答（google-genai 自動函式呼叫）：模型自行
-        判斷要不要呼叫 search_ticker／get_price／get_valuation／
-        get_institutional_investors 這幾個工具，底層查詢跟其他分頁共用同一批
-        FinMind／歷史資料庫函式。跟「AI 查詢」（純關鍵字規則比對）不同，這裡
-        每次對話都會打 Gemini API，需要在設定頁填入 Gemini API Key，超過免費額度會產生費用。"""
-        layout = QtWidgets.QVBoxLayout(self.ai_agent_tab)
-        layout.setContentsMargins(20, 20, 20, 20)
-
-        header_row = QtWidgets.QHBoxLayout()
-        header = QtWidgets.QLabel("AI 助理")
-        header.setProperty("header", True)
-        header_row.addWidget(header)
-        header_row.addStretch(1)
-        self.ai_agent_finmind_count_label = QtWidgets.QLabel()
-        self.ai_agent_finmind_count_label.setProperty("muted", True)
-        header_row.addWidget(self.ai_agent_finmind_count_label)
-        self.ai_agent_gemini_count_label = QtWidgets.QLabel()
-        self.ai_agent_gemini_count_label.setProperty("muted", True)
-        header_row.addWidget(self.ai_agent_gemini_count_label)
-        layout.addLayout(header_row)
-
-        hint = QtWidgets.QLabel(
-            "用自然語言提問，例如「台積電最近的本益比和法人買賣超」，"
-            "由 Gemini 自行判斷要查什麼資料。需先在「設定」分頁填入 Gemini API Key，"
-            "每次對話會呼叫 Gemini API（超過免費額度會產生費用）。"
-        )
-        hint.setProperty("muted", True)
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        layout.addSpacing(10)
-
-        self.ai_agent_chat = QtWidgets.QTextEdit()
-        self.ai_agent_chat.setReadOnly(True)
-        layout.addWidget(self.ai_agent_chat, stretch=1)
-
-        self.ai_agent_status_label = QtWidgets.QLabel()
-        self.ai_agent_status_label.setProperty("muted", True)
-        layout.addWidget(self.ai_agent_status_label)
-
-        input_row = QtWidgets.QHBoxLayout()
-        self.ai_agent_input = QtWidgets.QLineEdit()
-        self.ai_agent_input.setPlaceholderText("輸入問題...")
-        self.ai_agent_input.returnPressed.connect(self._send_ai_agent_message)
-        input_row.addWidget(self.ai_agent_input)
-        input_row.addWidget(accent_button("送出", self._send_ai_agent_message))
-        input_row.addWidget(
-            QtWidgets.QPushButton("清除對話", clicked=self._clear_ai_agent_chat)
-        )
-        layout.addLayout(input_row)
-
-        self.ai_agent_history = None
-        self.update_finmind_count_label()
-        self.update_gemini_count_label()
-
-    def _append_ai_agent_chat(self, speaker, text):
-        safe_text = html.escape(text).replace("\n", "<br>")
-        self.ai_agent_chat.append(f"<b>{html.escape(speaker)}：</b>{safe_text}<br>")
-
-    def _clear_ai_agent_chat(self):
-        self.ai_agent_history = None
-        self.ai_agent_chat.clear()
-        self.ai_agent_status_label.setText("")
-
-    def _send_ai_agent_message(self):
-        text = self.ai_agent_input.text().strip()
-        if not text:
-            return
-        self.ai_agent_input.clear()
-        self._append_ai_agent_chat("你", text)
-
-        try:
-            directory = get_industry_directory(HISTORY_DB_PATH)
-        except PriceFetchError as e:
-            self._append_ai_agent_chat("系統", f"無法取得股票名冊：{e}")
-            return
-
-        api_key = self.settings.get("gemini_api_key", "")
-        finmind_token = self.settings.get("finmind_token", "")
-        history_snapshot = self.ai_agent_history
-
-        self.ai_agent_status_label.setText("查詢中...")
-        self.ai_agent_input.setEnabled(False)
-
-        def work():
-            return run_agent_turn(
-                api_key, history_snapshot, text, directory, HISTORY_DB_PATH, finmind_token
-            )
-
-        self._ai_agent_timer = run_task_in_thread(
-            self, work, self._on_ai_agent_done, self._on_ai_agent_error
-        )
-
-    def _on_ai_agent_done(self, result):
-        reply, new_history = result
-        self.ai_agent_history = new_history
-        self._append_ai_agent_chat("助理", reply)
-        self.ai_agent_status_label.setText("")
-        self.ai_agent_input.setEnabled(True)
-        self.ai_agent_input.setFocus()
-        self.update_finmind_count_label()
-        self.update_gemini_count_label()
-
-    def _on_ai_agent_error(self, message):
-        self._append_ai_agent_chat("系統", f"發生錯誤：{message}")
-        self.ai_agent_status_label.setText("")
-        self.ai_agent_input.setEnabled(True)
-        self.update_finmind_count_label()
-        self.update_gemini_count_label()
-
     # ---------- 設定頁 ----------
 
     def _build_settings_tab(self):
-        layout = QtWidgets.QVBoxLayout(self.settings_tab)
+        outer = QtWidgets.QVBoxLayout(self.settings_tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QtWidgets.QWidget()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+        layout = QtWidgets.QVBoxLayout(content)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setAlignment(QtCore.Qt.AlignTop)
 
@@ -3843,40 +4168,6 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.history_status_label)
         self._refresh_history_status()
 
-        layout.addSpacing(20)
-        gemini_header = QtWidgets.QLabel("Gemini API Key")
-        gemini_header.setProperty("header", True)
-        layout.addWidget(gemini_header)
-        layout.addSpacing(4)
-
-        gemini_hint = QtWidgets.QLabel(
-            "「AI 助理」分頁用自然語言問答時使用（呼叫 Gemini API，超過免費額度會產生費用）。"
-            "至 aistudio.google.com/apikey 建立 API key；留空則該分頁無法使用。"
-        )
-        gemini_hint.setProperty("muted", True)
-        gemini_hint.setWordWrap(True)
-        layout.addWidget(gemini_hint)
-
-        gemini_row = QtWidgets.QHBoxLayout()
-        gemini_row.addWidget(QtWidgets.QLabel("API Key"))
-        self.gemini_key_edit = QtWidgets.QLineEdit(
-            self.settings.get("gemini_api_key", "")
-        )
-        self.gemini_key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
-        self.gemini_key_edit.setMinimumWidth(320)
-        self.gemini_key_edit.editingFinished.connect(self._on_gemini_key_changed)
-        gemini_row.addWidget(self.gemini_key_edit)
-
-        self.gemini_key_show = QtWidgets.QCheckBox("顯示")
-        self.gemini_key_show.toggled.connect(
-            lambda checked: self.gemini_key_edit.setEchoMode(
-                QtWidgets.QLineEdit.Normal if checked else QtWidgets.QLineEdit.Password
-            )
-        )
-        gemini_row.addWidget(self.gemini_key_show)
-        gemini_row.addStretch(1)
-        layout.addLayout(gemini_row)
-
     def _on_auto_check_toggle(self, checked):
         self.settings["auto_check_continuity"] = checked
         save_settings(SETTINGS_PATH, self.settings)
@@ -3904,15 +4195,11 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         status = get_history_status(HISTORY_DB_PATH)
         self.history_status_label.setText(_format_history_status(status))
 
-    def _on_gemini_key_changed(self):
-        self.settings["gemini_api_key"] = self.gemini_key_edit.text().strip()
-        save_settings(SETTINGS_PATH, self.settings)
-
-
 def main():
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    app.setStyle("Fusion")
     app.setStyleSheet(STYLESHEET)
-    pg.setConfigOptions(antialias=True, background=COLOR_BG, foreground=COLOR_TEXT)
+    pg.setConfigOptions(antialias=True, background=COLOR_SURFACE, foreground=COLOR_TEXT)
 
     splash = StartupProgressDialog()
     splash.show()

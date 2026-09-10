@@ -16,6 +16,7 @@ class AppPaths:
     futures_cache: Path
     futures_large_traders_cache: Path
     futures_ssf_cache: Path
+    institutional_cache: Path
     position_detail_cache: Path
     history_db: Path
     settings: Path
@@ -35,6 +36,7 @@ def get_app_paths(root=None):
         futures_cache=data_dir / "futures_cache.json",
         futures_large_traders_cache=data_dir / "futures_large_traders_cache.json",
         futures_ssf_cache=data_dir / "futures_ssf_cache.json",
+        institutional_cache=data_dir / "institutional_cache.json",
         position_detail_cache=data_dir / "position_detail_cache.json",
         history_db=data_dir / "history.db",
         settings=data_dir / "settings.json",

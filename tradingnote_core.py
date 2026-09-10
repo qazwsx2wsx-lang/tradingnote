@@ -35,9 +35,6 @@ DEFAULT_SETTINGS = {
     # FinMind（finmindtrade.com）API token，用於「個股」模組查詢本益比／法人買賣，
     # 留空仍可打 API 但額度極低、部分資料集查不到。CLI／GUI 共用同一份 settings.json。
     "finmind_token": "",
-    # Gemini（Google AI）API key，用於「AI 助理」分頁的自然語言問答（Gemini
-    # 自動函式呼叫，呼叫 FinMind／歷史資料庫查詢函式）；留空則該分頁無法使用。
-    "gemini_api_key": "",
 }
 
 

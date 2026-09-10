@@ -3,12 +3,16 @@
 ## 必讀簡介
 新 session 開頭只需要讀這一段（原則上不超過 20 行）；下面「詳細內容」是備查用，需要細節才展開讀，省 token。**每次交接前，把最新、最需要注意的事更新到這一段，並保持精簡**——細節寫進下方對應章節，不要塞在這裡。
 
-- **這是什麼**：台股部位紀錄＋產業資金流向＋個股基本面查詢＋期貨盤後行情＋AI 問答的桌面程式（PySide6 + pyqtgraph）。位置：`/Users/zhengyufan/Claude/tradingnote`，跟同層 `trade-journal` 無關。
+- **這是什麼**：台股部位紀錄＋產業資金流向＋個股基本面查詢＋期貨盤後行情的桌面程式（PySide6 + pyqtgraph）。位置：`/Users/zhengyufan/Claude/tradingnote`，跟同層 `trade-journal` 無關。
+- **2026-09-10 移除 AI 助理**：GUI 已移除 AI 助理分頁與 Gemini API Key 設定，刪除 `tradingnote_ai_agent.py`，`requirements.txt` 不再依賴 `google-genai`。
+- **2026-09-10 GUI／泡泡圖更新**：泡泡以綠／紅／灰表達當日量價推估的偏流入／偏流出／中性，加入流入流出族群數與成交活躍摘要；35 個泡泡合併成單一 `ScatterPlotItem`，本機 headless 測得約 11 ms／次重畫。個股頁改為清單＋行情摘要側欄，完整明細視窗加入行情抬頭與估值／法人資訊層級。
+- **2026-09-10 象限／法人方向更新**：動能與估值泡泡圖加入四象限淡色底、直接名稱與 hover 解讀；新增「法人方向」頁，從 TWSE T86、TPEx `tpex_3insti_daily_trading` 一次取得全市場真實淨買賣股數，依族群聚合後以三張左右發散圖分別顯示外資／投信／自營商。方向是真實買賣超，淨額為股數 × 收盤價估算；大型 JSON 有一次中斷重試與 30 分鐘／舊檔回退快取。
 - **Git 狀態**：`main` branch（目前在 Windows 環境）。已 push 到 `origin/main`（HEAD `838ebf3`：泡泡圖「近N日」漲跌%算錯 bug 修正）。git 身分本機設為 `Evan Cheng <qazwsx2wsx@gmail.com>`（repo-local）。**尚未 commit 的異動**：產業流向新增人氣／動能／量能／綜合熱度分數與個股資金流入前50名（`tradingnote_history.py`、`tradingnote_gui.py`），另包含先前 EPS 與歷史股價點擊功能異動。remote `origin` → `https://github.com/qazwsx2wsx-lang/tradingnote.git`。
 - **本次改動（2026-08-21）：「產業成分股」彈窗表格新增 EPS 欄位**——`IndustryTopStocksDialog`（泡泡圖點擊／資金動向清單共用同一彈窗）表格本益比欄後新增 EPS 欄，用 `close/per` 純本地換算、無新 API 呼叫。已過語法檢查；**未實機開 GUI 目視驗證**。詳見下方「變更歷史 → 2026-08-21」。
 - **近期改動摘要**（詳見「變更歷史」對應日期條目）：2026-08-26 產業流向新增人氣／動能／量能／綜合熱度百分位排行與個股資金流入前50名；2026-08-19 歷史股價趨勢圖加點擊查價；2026-08-18 修正泡泡圖近N日漲跌%算錯 bug；2026-08-17 個股新增借券賣出餘額／融資成本估算、視窗自動符合螢幕大小、對話框加放大鈕、VPT/MFI圖加最新值標註；2026-08-14 期貨新增大額交易人未沖銷部位＋趨勢、個股新增法人分別五細項圖；2026-08-13 產業成分股彈窗加量/均量/本益比；2026-08-12 泡泡圖估值模式改成最新PER/PBR。
 - **已知缺口**：「設定」頁無 FinMind Token 輸入欄，`finmind_token` 只能手動編輯 `data/settings.json`。
 - **技術分析新功能（已完成驗證）**：個股明細／部位紀錄已加入技術分析頁，使用一次 FinMind `TaiwanStockPrice` 150 日 OHLCV 計算 KD、MACD、均線與 RSI，並與 VPT／MFI 共用價格資料；已完成語法、指標、GUI 與 API 快取測試。
+- **啟動進度亂碼修正（2026-09-01）**：修正 `tradingnote_gui.py` 啟動／重新整理背景流程中被破壞的進度文字，恢復「正在寫入歷史資料庫」「正在更新產業分類」「啟動準備完成」等正常中文訊息。
 - **只是要接著開發新功能**：讀到這裡就夠了。要動到 GUI 分頁結構、期貨模組、概念股清單、或想知道更早的變更緣由，才需要往下展開「詳細內容」。
 
 ---
@@ -19,7 +23,7 @@
 `/Users/zhengyufan/Claude/tradingnote`（獨立新專案，與同層的 `/Users/zhengyufan/Claude/trade-journal` 完全無關、無資料共用）。已初始化 git，remote 是 `origin` → `https://github.com/qazwsx2wsx-lang/tradingnote.git`。
 
 ### 這是什麼
-台股部位紀錄＋產業資金流向＋個股基本面查詢＋期貨盤後行情＋AI 問答的桌面程式，架構參考 `/Users/zhengyufan/Claude/GG/ARCHITECTURE.md`（數獨小遊戲）的「核心邏輯與介面分離」原則：核心模組不依賴任何 UI，CLI 與 GUI 各自 import。**`ARCHITECTURE.md` 目前已經落後於程式碼**（沒有「期貨」「AI 助理」分頁、`tradingnote_ai_agent.py`、`tradingnote_taifex.py`、`tradingnote_http.py` 的說明），下次有空建議一併補上；這份 HANDOFF 是目前實際狀態的快速摘要，發現兩者衝突時以程式碼實際行為為準。
+台股部位紀錄＋產業資金流向＋個股基本面查詢＋期貨盤後行情的桌面程式，架構參考 `/Users/zhengyufan/Claude/GG/ARCHITECTURE.md`（數獨小遊戲）的「核心邏輯與介面分離」原則：核心模組不依賴任何 UI，CLI 與 GUI 各自 import。**`ARCHITECTURE.md` 目前已經落後於程式碼**（沒有期貨與近期資金流向功能的說明），下次有空建議一併補上；這份 HANDOFF 是目前實際狀態的快速摘要，發現兩者衝突時以程式碼實際行為為準。
 
 ```
 tradingnote/
@@ -31,17 +35,16 @@ tradingnote/
 ├── tradingnote_concepts.py   # 核心：概念股分類（讀 concepts.json，人工維護、非API資料），僅 GUI「部位紀錄」頁使用
 ├── concepts.json              # 人工維護的概念股清單，跟 trade-journal/themes.json 無關、不共用
 ├── tradingnote_taifex.py     # 核心：TAIFEX 官方期貨每日交易行情（盤後，免金鑰），僅 GUI「期貨」分頁使用
-├── tradingnote_ai_agent.py   # 核心：Gemini API 自動函式呼叫問答，僅 GUI「AI 助理」分頁使用
 ├── tradingnote_http.py       # 核心：共用 HTTP／數值解析工具（新，見上方「未 commit 的異動」）
 ├── tradingnote_cache.py      # 核心：共用檔案／記憶體 TTL 快取工具（新，見上方「未 commit 的異動」）
-├── tradingnote.py             # CLI（無「個股」「期貨」「AI 助理」模組對應指令）
+├── tradingnote.py             # CLI（無「個股」「期貨」模組對應指令）
 ├── tradingnote_gui.py         # GUI：PySide6 + pyqtgraph（原本是 Tkinter + matplotlib，已整個換掉）
 ├── 啟動TradingNote.command    # 雙擊啟動 GUI，固定用 /opt/homebrew/bin/python3.12
 ├── ARCHITECTURE.md             # 本專案架構文件（已過時，見上方說明）
 └── data/                       # 執行時自動建立，git 已忽略（.gitignore）
     ├── positions.json          # 使用者紀錄的部位
     ├── price_cache.json        # 全市場收盤價快取（30分鐘 TTL）
-    ├── settings.json           # auto_check_continuity、finmind_token、gemini_api_key（GUI「設定」分頁寫入）
+    ├── settings.json           # auto_check_continuity、finmind_token 等本機設定
     └── history.db              # SQLite：120日歷史價格 + 產業分類快取
 ```
 
@@ -50,8 +53,7 @@ tradingnote/
 2. **部位紀錄**：`QTableWidget`（含族群／概念股欄位，本地資料即時顯示），新增/刪除/查價/重新整理；表格下方是 `QSplitter` 分隔的詳細資訊區塊，選取某筆部位時背景查 FinMind 顯示本益比/殖利率/股價淨值比，以及三大法人（外資/投信/自營商）近120個交易日累計買賣超趨勢圖（`pg.PlotWidget`，三條線）。概念股清單來自專案根目錄 `concepts.json`（人工維護，見 `tradingnote_concepts.py`）。
 3. **個股**：`QTreeWidget` 依產業族群列出全市場約1700檔股票（現價/漲跌%，資料來自本地快取），雙擊某檔叫 FinMind API 查最新本益比/殖利率/股價淨值比/三大法人買賣超（`StockDetailDialog`，「個股量比異常清單」雙擊也共用同一個對話框）。彈窗內有「顯示完整籌碼面資訊（同部位紀錄）」按鈕，點下去才另外查跟「部位紀錄」頁選取部位時相同的詳細資料＋七個分頁（歷史股價／三大法人／融資融券／VPT／MFI／技術分析，用上方分頁選單切換、不用捲動），技術分析內可切換 KD／MACD／均線，不點不會多打完整籌碼查詢。
 4. **期貨**：**預設列出 TAIFEX 全部期貨商品**盤後行情（約 404 列＝商品 × 有資料時段），搜尋框輸入才篩掉不符的。資料來自 TAIFEX 官方免金鑰端點，一天更新一次、非即時。表格「標的」欄：股票期貨顯示標的股票「簡稱 代號」（CDF→台積電 2330，用 `SSFLists` 端點對照）、指數／商品期貨顯示中文契約名（BRF→布蘭特原油期貨，用大額端點 `ContractName`）；搜尋可用契約代碼（TX／CDF）、股票代號（2330）或中文名（台積電／布蘭特）。「大額前10買／賣/淨/買佔比」四欄是該商品**近月「所有交易人」前10大未沖銷部位摘要**（大額交易人資料＝`OpenInterestOfLargeTradersFutures`）。**點選某列**，表格下方常駐面板顯示該商品完整大額未沖銷部位（各到期月份 × 所有交易人／特定法人：前5／前10大買賣、前10大淨、佔全市場比重）＋**右側趨勢圖**（前10大買/賣方未沖銷部位逐日走勢，歷史由背景自動回補累積）；**雙擊**開較大的彈窗（`FuturesLargeTradersDialog`，同明細內容）。大額**歷史**由 `_sync_large_traders_history` 於啟動時背景自動回補（TAIFEX 網站 CSV，綁定「設定」頁回補天數、受「每次啟動自動檢測」開關控制，存 `history.db` 的 `large_traders_history` 表）。注意大額（即時）端點只涵蓋部分主要契約（346 個 vs 日盤 374 個）、股票期貨在大額端點代碼去尾 F（CDF→CD）、MTX 併入 TX 不單獨列——沒有大額資料的商品，面板／雙擊/趨勢會顯示說明訊息。詳見下方「變更歷史 → 2026-08-14」四則。
-5. **AI 助理**：Gemini API（`gemini-flash-lite-latest`）自然語言問答，模型自動判斷呼叫股票查詢/本益比/法人買賣等工具，需要「設定」分頁填入 Gemini API Key。
-6. **設定**：自動檢測開關、回補天數（TWSE／TPEX 共用，僅供**價格**歷史回補用）、「回補歷史資料」（TWSE 官方端點）／「使用 FinMind 補上櫃缺口」（TPEX，見下方「變更歷史 → 2026-08-09」）兩個回補按鈕、Gemini API Key（密碼遮罩＋顯示切換、`editingFinished` 自動存檔）。泡泡圖「估值」模式**沒有對應的回補設定**——只看最新一筆 PER/PBR，靠既有的「重新整理」／啟動時自動快照即可，見下方「變更歷史 → 2026-08-12」。**注意**：目前沒有 FinMind API Token 的輸入欄位——`finmind_token` 只能手動編輯 `data/settings.json`，這是既有缺口（見上方「必讀簡介 → 已知缺口」），不是這次改動造成的。
+5. **設定**：自動檢測開關、回補天數（TWSE／TPEX 共用，僅供**價格**歷史回補用）、「回補歷史資料」（TWSE 官方端點）／「使用 FinMind 補上櫃缺口」（TPEX）兩個回補按鈕。泡泡圖「估值」模式只看最新一筆 PER/PBR，不需要另外回補估值歷史。**注意**：目前沒有 FinMind API Token 的輸入欄位，`finmind_token` 只能手動編輯 `data/settings.json`。
 
 ### 變更歷史
 
@@ -246,11 +248,11 @@ tradingnote/
   - `tradingnote_history.py` 新增兩個共用函式：`upsert_daily_prices(db_path, rows)`（把 `record_snapshot` 既有的 INSERT OR REPLACE 寫入邏輯抽成獨立函式，供新的 FinMind 寫入路徑重用，沒有動 `record_snapshot`／`backfill_twse_history` 本身）、`get_ticker_history_day_counts(db_path, tickers, market=None)`（一次查詢批次取得多檔股票各自的交易日數，取代逐檔查詢）。
   - `tradingnote_finmind.py` 新增 `fetch_stock_price_history(ticker, token, lookback_days)`（FinMind `TaiwanStockPrice` 資料集，上市櫃通用，一次呼叫回傳整段日期範圍，不像 TWSE 官方端點得逐日各打一次；欄位對應已用真實 API 對上櫃股 4130 驗證：`Trading_Volume`→volume、`Trading_money`→trading_value、`spread`→算 change_pct）跟 `backfill_tpex_history_via_finmind(db_path, token, target_days, delay_seconds, on_progress)`（主要邏輯）。
   - **冪等／續跑設計**：跟 `backfill_twse_history`「已存在的日期會跳過」同一個原則，但判斷單位是「檔」不是「天」——用 `get_ticker_history_day_counts` 檢查每檔上櫃股票在 `daily_prices` 裡已有的交易日數，達到 `target_days` 就跳過不重打 API。**刻意不另外做進度檔**：完成度直接看 `daily_prices` 本身即可推導，不需要記錄「補到第幾檔」，中斷後重跑自然會跳過已達標的股票、只處理剩下的。
-  - **額度控管**：每打一檔前呼叫既有的 `get_call_count()` 檢查目前用量（這是行程內共用的呼叫次數統計，包含「個股」「部位紀錄」「AI 助理」等其他功能同時在用的額度，不是另開一份獨立計數），達到 `FINMIND_HOURLY_LIMIT`（600）就提早停止並回傳 `stopped_reason="quota_exhausted"`，不會真的打到 FinMind 回 HTTP 402 才發現；全市場上櫃約 800 檔，一次呼叫通常補不完，這是預期中會發生、不是錯誤。
+  - **額度控管**：每打一檔前呼叫既有的 `get_call_count()` 檢查目前用量（這是行程內共用的呼叫次數統計，包含「個股」「部位紀錄」等功能同時在用的額度），達到 `FINMIND_HOURLY_LIMIT`（600）就提早停止並回傳 `stopped_reason="quota_exhausted"`，不會真的打到 FinMind 回 HTTP 402 才發現；全市場上櫃約 800 檔，一次呼叫通常補不完，這是預期中會發生、不是錯誤。
   - `tradingnote_gui.py`：import 新函式；新增 `run_tpex_finmind_backfill_in_thread`（背景執行緒＋queue＋QTimer 輪詢，機制跟既有 `run_backfill_in_thread` 相同，但 `done_cb` 收到的是 dict 不是單一整數）；新增 `TpexBackfillDialog`（進度視窗，跟既有 `BackfillDialog` 風格一致，但完成文案分兩種：真的補完 vs. 額度用完提早停止——後者文案特別強調「不是失敗，之後再按一次會自動接續」，避免使用者誤以為出錯）；新增 `open_tpex_backfill_dialog`（沒有 `finmind_token` 時彈提示訊息，不會靜默失敗）；「設定」分頁「回補天數」spinbox 改標成「TWSE／TPEX 共用」（兩邊都讀同一個 `backfill_target_days`），旁邊新增「使用 FinMind 補上櫃缺口」按鈕，跟既有「回補歷史資料」（TWSE）並排。
 - **驗證**：`python3 -m py_compile`（用專案實際跑的 `/opt/homebrew/bin/python3.12`，系統內建 `python3` 是 3.9，語法版本不夠新會直接報錯，讀取 `啟動TradingNote.command` 才發現要指定這個路徑）三個改動檔案全過；用真實 FinMind token＋真實 `data/history.db`，把 `get_industry_directory` 暫時 monkeypatch 成只回傳 2 檔上櫃股票（4130／1240，避免整個測試跑掉太多額度）呼叫 `backfill_tpex_history_via_finmind`：首次呼叫兩檔都正確補進 `daily_prices`（分別 117／131 個交易日，`market='TPEX'`）；重複呼叫 `newly_fetched=0`、沒有消耗任何 FinMind 呼叫次數，證實跳過已完成股票的邏輯正確；手動把 `_call_timestamps` 灌到額度上限後呼叫，正確回傳 `stopped_reason='quota_exhausted'`、`newly_fetched=0`，沒有真的打 API。GUI 模組本身用 `python3.12 -c "import tradingnote_gui"` 確認新增的類別／函式都存在且沒有 circular import；**沒有**做完整的 headless GUI 視窗建置驗證——嘗試時發現使用者當下有另一個 TradingNote 執行中（`ps aux` 確認，啟動於當天 01:12），第二個 headless 實例讀 `data/price_cache.json` 時撞到即時寫入造成暫時性 JSON 解析錯誤（不是這次改動的 bug，是兩個行程同時讀寫同一份非 SQLite 快取檔案的既有風險，`daily_prices` 那邊因為本來就走 WAL 模式沒有這個問題），為了不干擾使用者當下在跑的視窗就沒有繼續往這個方向測。**使用者需要重啟 TradingNote 才會套用這次改動**（Python 不會自動重載已執行的程式）。
-- **順便發現但沒動的既有缺口**：「設定」分頁沒有 FinMind API Token 輸入欄位（`_build_settings_tab` 通篇搜尋沒有對應的 `QLineEdit`，只有 Gemini API Key 有），但 `finmind_token` 確實被 `self.settings.get("finmind_token", "")` 在多處讀取使用，目前只能手動編輯 `data/settings.json` 才能設定——這次新按鈕的沒有 token 提示文字已經避開「請在下方填入」這種誤導字眼，但 UI 缺口本身留給使用者決定要不要另外補。
-- **刻意留白／已知限制**：①TPEX 回補沒有獨立的「回補天數」設定，共用既有 `backfill_target_days`（原本只給 TWSE 用），如果使用者想要兩邊天數不同需要另外拆欄位，這次沒做；②沒有把 TPEX 回補掛進啟動時的 `_sync_history_continuity` 自動同步（TWSE 有），是刻意的——FinMind 額度是跟「個股」「部位紀錄」「AI 助理」共用的稀缺資源，自動在每次啟動就搶用可能悄悄佔掉使用者當下想用在互動查詢上的額度，改成只能手動按鈕觸發，讓使用者自己決定什麼時候要燒額度做回補；③沒有另外做節流保守 margin（例如只用到額度的 90% 就提早停），直接沿用跟「個股」頁「已達免費額度上限」同一個判斷門檻（`>= FINMIND_HOURLY_LIMIT`），維持單一定義來源。
+- **既有缺口**：「設定」分頁沒有 FinMind API Token 輸入欄位，但 `finmind_token` 仍被多處讀取，目前只能手動編輯 `data/settings.json`。
+- **刻意留白／已知限制**：①TPEX 回補沒有獨立的「回補天數」設定，共用既有 `backfill_target_days`；②沒有把 TPEX 回補掛進啟動時自動同步，避免未經操作就消耗 FinMind 額度；③沒有另外做節流保守 margin，直接沿用 `FINMIND_HOURLY_LIMIT` 判斷門檻。
 
 #### 2026-08-08：「部位紀錄」頁新增融資融券／外資持股／借券／停資停券籌碼面資訊
 - **動機**：使用者要求「部位模組新增，以 FinMind 查詢籌碼面變化，能取用的都顯示」——在既有的三大法人 120 日趨勢圖之外，把 FinMind 其他籌碼面資料集也加進「部位紀錄」頁，範圍是「實際能查到的都顯示」，不是照抄 FinMind 文件清單。
@@ -304,7 +306,7 @@ tradingnote/
   - `tradingnote_taifex.py`：`get_cached_daily_futures_report` 同樣改用檔案快取三個函式，拿掉自己的 `json`/`Path`/`datetime` import（不再需要）。
   - `tradingnote_finmind.py`：`_dataset_cache` 改成 `TTLCache` 實例，`_fetch_dataset` 內部抓取邏輯包成 closure `_do_fetch`，交給 `get_or_fetch` 處理快取判斷（`_call_timestamps.append` 仍只在 closure 真的被呼叫、也就是快取未命中時才執行，用量統計語意不變）。
 - **驗證（單元層級）**：`python3 -m py_compile` 全部通過；用真正的 `/opt/homebrew/bin/python3.12`（專案指定直譯器，不是系統內建 3.9，import 型別語法 `str | None` 需要 3.10+）import 三個改動模組成功；獨立腳本驗證 `TTLCache`（命中快取不重呼叫 fetch_fn、過期後重呼叫、`fetch_fn` 拋例外時不寫入快取）與檔案快取三函式（不存在回 `None`、寫入後讀得回來、TTL=0 視為過期）皆符合預期。
-- **驗證（headless GUI smoke test，含真實網路）**：`QT_QPA_PLATFORM=offscreen` 跑一份臨時腳本（複製 `main()` 的啟動流程，`app.exec()` 在 `on_ready` 裡 `app.quit()` 收尾），驗證：①`run_startup_preload_in_thread` 正常跑完、`TradingNoteWindow` 建成、6 個分頁（資金流向分析／部位紀錄／個股／期貨／AI 助理／設定）都在；②`get_market_snapshot`／`get_cached_daily_futures_report` 重新呼叫時吃到剛才啟動時寫入的快取，回傳筆數一致（真實 `price_cache.json` 11696 檔、`futures_cache.json` 2201 筆、`get_futures_snapshot` 正確回傳 TX／MTX）；③`get_tpex_valuation("6488")` 真的打了一次 TPEX 官方估值 API（拿到本益比/股價淨值比/殖利率），第二次呼叫從 `TTLCache` 命中、耗時從 0.363s 降到 <0.1ms；④`fetch_valuation("2330", token, market="TWSE")` 真的打了一次 FinMind API（`get_call_count()` +1），第二次呼叫命中 `_dataset_cache`（`get_call_count()` 不再增加）。13 項檢查全數通過，跟改動前記錄的行為一致。
+- **當時驗證（headless GUI smoke test，含真實網路）**：啟動流程、報價與期貨快取、TPEX 估值、FinMind 快取均通過；分頁數與內容以目前程式為準。
 - **已 commit**（hash 見上方必讀簡介）。
 
 #### 2026-08-07：「期貨」分頁顯示資料日期
@@ -337,12 +339,11 @@ tradingnote/
 ### 尚未做 / 刻意留白
 - 沒有寫任何自動化測試（unit test），驗證方式都是手動跑 + headless（`QT_QPA_PLATFORM=offscreen`）smoke test。
 - 只有 EOD（收盤）/ 盤後資料，非即時報價（刻意選擇：TWSE/TPEX 即時 API 需要 session/referer 處理；Fugle 免費方案不支援期貨；兩者皆放棄即時）。
-- CLI 沒有「個股」「期貨」「AI 助理」模組的對應指令，這三個目前只有 GUI 在用。
-- `ARCHITECTURE.md` 需要補上「期貨」「AI 助理」分頁、`tradingnote_taifex.py`、`tradingnote_ai_agent.py`、`tradingnote_http.py`、`google-genai` 依賴的說明（目前只寫到 FinMind 為止）。
-- 沒有 `requirements.txt`／venv，GUI 依賴（`PySide6`、`pyqtgraph`、`google-genai`）直接裝在 Homebrew python3.12 的使用者站台目錄。
+- CLI 沒有「個股」「期貨」模組的對應指令，這兩個目前只有 GUI 在用。
+- `ARCHITECTURE.md` 需要補上期貨與近期資金流向模組的說明。
 - 泡泡圖大小目前是「資金比重%」（絕對金額的線性換算），還不是能凸顯「小市值但爆量」的相對指標，見上方「變更歷史 → 2026-08-05」的注意事項。
 
 ### 如果要繼續開發，建議先讀
 1. 這份 `HANDOFF.md` 的「必讀簡介」（目前狀態最新，但 `ARCHITECTURE.md` 細節部分落後）
 2. `/Users/zhengyufan/Claude/tradingnote/tradingnote_gui.py`（GUI 全貌）
-3. 若要動到共用 HTTP／期貨／AI 助理：`tradingnote_http.py`（新重構，先 `git diff` 確認）、`tradingnote_taifex.py`、`tradingnote_ai_agent.py`
+3. 若要動到共用 HTTP／期貨：`tradingnote_http.py`、`tradingnote_taifex.py`

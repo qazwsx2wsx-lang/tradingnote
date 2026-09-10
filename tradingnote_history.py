@@ -30,7 +30,7 @@ _backfill_lock = threading.Lock()
 _SIGN_RE = re.compile(r">([+-])<")
 
 # 公開資訊觀測站產業別代碼（TWSE／TPEX 共用），驗證方式見 ARCHITECTURE.md。
-# 少數罕見代碼（如 37、38）未能確認對應名稱，industry_name() 會 fallback 顯示原始代碼。
+# 37／38 依櫃買中心「證券產業別代碼表」補為運動休閒／居家生活。
 INDUSTRY_CODE_NAMES = {
     "01": "水泥工業", "02": "食品工業", "03": "塑膠工業", "04": "紡織纖維",
     "05": "電機機械", "06": "電器電纜", "08": "玻璃陶瓷", "09": "造紙工業",
@@ -40,7 +40,8 @@ INDUSTRY_CODE_NAMES = {
     "23": "油電燃氣業", "24": "半導體業", "25": "電腦及週邊設備業", "26": "光電業",
     "27": "通信網路業", "28": "電子零組件業", "29": "電子通路業", "30": "資訊服務業",
     "31": "其他電子業", "32": "文化創意業", "33": "農業科技業", "34": "電子商務業",
-    "35": "綠能環保", "36": "數位雲端", "80": "全額交割股", "91": "臺灣存託憑證",
+    "35": "綠能環保", "36": "數位雲端", "37": "運動休閒", "38": "居家生活",
+    "80": "全額交割股", "91": "臺灣存託憑證",
     "97": "社會企業", "98": "農林漁牧業",
 }
 
@@ -53,6 +54,9 @@ class IndustryFlow:
     total_trading_value: float
     capital_share_pct: float
     stock_count: int
+    daily_change_pct: float | None = None
+    turnover_ratio: float | None = None
+    directional_flow_value: float | None = None
     popularity_score: float | None = None
     momentum_score: float | None = None
     volume_score: float | None = None
@@ -764,37 +768,50 @@ def get_industry_directory(db_path, max_age_days=INDUSTRY_MAP_MAX_AGE_DAYS):
 
 # ---------- 產業資金流向分析 ----------
 
-def compute_industry_flow(db_path, snapshot, avg_days=5):
-    """avg_days 同時決定兩件事，讓 X／Y 兩軸的「N 日流向」定義一致：
+def compute_group_flow(db_path, snapshot, groups, avg_days=5, market_universe=None):
+    """依任意群組成分股計算資金流向；groups 為 {群組名稱: ticker iterable}。
+
+    avg_days 同時決定兩件事，讓 X／Y 兩軸的「N 日流向」定義一致：
     ① avg_change_pct：該產業近 avg_days 個交易日的累積漲跌%（以今日收盤對比 avg_days
        個交易日前收盤，用今日成交金額加權平均），取代單日漲跌%；
     ② volume_ratio：今日成交量對近 avg_days 日均量的比值（沿用原本邏輯）。
     兩者用同一組「有足夠歷史資料」的成分股計算，資料不足的產業兩者皆回傳 None（由呼叫端
     過濾不畫出），不會出現 X 有值但 Y 沒有值的不一致情況。"""
-    industry_map = get_industry_map(db_path)
+    normalized_groups = {
+        str(name): set(members) for name, members in groups.items() if members
+    }
+    ticker_groups = {}
+    for group_name, members in normalized_groups.items():
+        for ticker in members:
+            ticker_groups.setdefault(ticker, []).append(group_name)
+    if market_universe is None:
+        market_universe = set(get_industry_map(db_path))
+    else:
+        market_universe = set(market_universe)
 
     groups = {}
     for price in snapshot.values():
         if price.close is None or price.trading_value is None:
             continue
-        industry = industry_map.get(price.ticker)
-        if not industry:
+        group_names = ticker_groups.get(price.ticker)
+        if not group_names:
             continue
-        g = groups.setdefault(
-            industry,
-            {
-                "trading_value": 0.0,
-                "ticker_prices": {},
-                "ticker_volumes": {},
-                "ticker_values": {},
-                "ticker_dates": {},
-            },
-        )
-        g["trading_value"] += price.trading_value
-        g["ticker_prices"][price.ticker] = price.close
-        g["ticker_volumes"][price.ticker] = price.volume or 0
-        g["ticker_values"][price.ticker] = price.trading_value
-        g["ticker_dates"][price.ticker] = price.date
+        for group_name in group_names:
+            g = groups.setdefault(
+                group_name,
+                {
+                    "trading_value": 0.0,
+                    "ticker_prices": {},
+                    "ticker_volumes": {},
+                    "ticker_values": {},
+                    "ticker_dates": {},
+                },
+            )
+            g["trading_value"] += price.trading_value
+            g["ticker_prices"][price.ticker] = price.close
+            g["ticker_volumes"][price.ticker] = price.volume or 0
+            g["ticker_values"][price.ticker] = price.trading_value
+            g["ticker_dates"][price.ticker] = price.date
 
     min_history_days = max(2, avg_days // 2)
     snapshot_today = _snapshot_today(snapshot)
@@ -807,7 +824,7 @@ def compute_industry_flow(db_path, snapshot, avg_days=5):
         # snapshot_today（snapshot 實際代表的交易日）而非 date.today()，理由見
         # _snapshot_today docstring。
         history_rows = conn.execute(
-            """SELECT ticker, date, close, volume FROM daily_prices
+            """SELECT ticker, date, close, volume, trading_value FROM daily_prices
                WHERE date < ? AND date >= ? ORDER BY date DESC""",
             (snapshot_today, cutoff),
         ).fetchall()
@@ -815,12 +832,23 @@ def compute_industry_flow(db_path, snapshot, avg_days=5):
         conn.close()
 
     ticker_history = {}
-    for ticker, day, close, volume in history_rows:
-        ticker_history.setdefault(ticker, []).append((day, close, volume or 0))
+    for ticker, day, close, volume, trading_value in history_rows:
+        ticker_history.setdefault(ticker, []).append(
+            (day, close, volume or 0, trading_value or 0.0)
+        )
 
     # 資金比重的分母用「全市場今日總成交金額」（含歷史資料不足、稍後會被過濾掉的產業），
     # 才能反映真實佔比；若只用 plotted 產業算分母，佔比會隨著哪些產業被過濾而跳動。
-    total_market_value = sum(g["trading_value"] for g in groups.values())
+    # 概念分類可重疊，因此分母不能把各群組成交額相加（會重複計入同一檔股票）。
+    # 一律直接用全市場個股母體的今日成交額；產業模式與舊版結果相同，概念模式則
+    # 表示「該概念涵蓋全市場多少成交額」，各概念百分比加總允許超過 100%。
+    total_market_value = sum(
+        price.trading_value or 0.0
+        for ticker, price in snapshot.items()
+        if ticker in market_universe
+        and price.close is not None
+        and price.trading_value is not None
+    )
 
     results = []
     for industry, g in groups.items():
@@ -828,7 +856,10 @@ def compute_industry_flow(db_path, snapshot, avg_days=5):
             continue
 
         weighted_change, change_weight = 0.0, 0.0
+        daily_weighted_change = 0.0
+        daily_change_weight = 0.0
         today_volume, baseline_volume = 0.0, 0.0
+        baseline_trading_value = 0.0
         for ticker, today_close in g["ticker_prices"].items():
             # 個股自己的 snapshot 日期可能比多數股票（snapshot_today 眾數）更舊
             # （少數個股資料延遲發布），這裡逐檔用該股自己的日期過濾歷史列，避免
@@ -847,11 +878,34 @@ def compute_industry_flow(db_path, snapshot, avg_days=5):
             weighted_change += n_day_change_pct * trading_value
             change_weight += trading_value
 
-            baseline_volume += sum(v for _, _, v in days) / len(days)
+            price = snapshot.get(ticker)
+            daily_change_pct = _change_pct(price) if price is not None else None
+            if daily_change_pct is not None:
+                daily_weighted_change += daily_change_pct * trading_value
+                daily_change_weight += trading_value
+
+            baseline_volume += sum(v for _, _, v, _ in days) / len(days)
+            baseline_trading_value += sum(v for _, _, _, v in days) / len(days)
             today_volume += g["ticker_volumes"][ticker]
 
         avg_change_pct = (weighted_change / change_weight) if change_weight > 0 else None
+        daily_change_pct = (
+            daily_weighted_change / daily_change_weight if daily_change_weight > 0 else None
+        )
         volume_ratio = (today_volume / baseline_volume) if baseline_volume > 0 else None
+        turnover_ratio = (
+            g["trading_value"] / baseline_trading_value
+            if baseline_trading_value > 0
+            else None
+        )
+        # 公開日資料沒有逐筆主動買賣方向。用「成交額 × 當日漲跌幅」作為方向強度
+        # 的保守代理值：正值代表量價偏流入，負值代表量價偏流出；GUI 會清楚標示
+        # 這是推估值，避免被誤讀為交易所公布的真實淨流入。
+        directional_flow_value = (
+            g["trading_value"] * daily_change_pct / 100
+            if daily_change_pct is not None
+            else None
+        )
 
         capital_share_pct = (
             (g["trading_value"] / total_market_value * 100) if total_market_value > 0 else 0.0
@@ -865,6 +919,9 @@ def compute_industry_flow(db_path, snapshot, avg_days=5):
                 total_trading_value=g["trading_value"],
                 capital_share_pct=capital_share_pct,
                 stock_count=len(g["ticker_prices"]),
+                daily_change_pct=daily_change_pct,
+                turnover_ratio=turnover_ratio,
+                directional_flow_value=directional_flow_value,
             )
         )
 
@@ -895,6 +952,21 @@ def compute_industry_flow(db_path, snapshot, avg_days=5):
     return results
 
 
+def compute_industry_flow(db_path, snapshot, avg_days=5):
+    """相容舊介面的官方產業流向；底層改走任意群組聚合器。"""
+    industry_map = get_industry_map(db_path)
+    groups = {}
+    for ticker, industry in industry_map.items():
+        groups.setdefault(industry, set()).add(ticker)
+    return compute_group_flow(
+        db_path,
+        snapshot,
+        groups,
+        avg_days=avg_days,
+        market_universe=industry_map,
+    )
+
+
 @dataclass
 class IndustryValuationFlow:
     industry: str
@@ -921,9 +993,17 @@ def _weighted_median(pairs):
     return pairs[-1][0]
 
 
-def compute_valuation_flow(db_path, snapshot, short_days=5, long_days=20, metric="per"):
-    """泡泡圖「估值」模式：X＝該產業成分股「最新一筆」metric（本益比 PER 或股價
-    淨值比 PBR，用今日成交金額加權中位數彙總到產業層級，見 _weighted_median 的
+def compute_group_valuation_flow(
+    db_path,
+    snapshot,
+    groups,
+    short_days=5,
+    long_days=20,
+    metric="per",
+    market_universe=None,
+):
+    """泡泡圖「估值」模式：X＝群組成分股「最新一筆」metric（本益比 PER 或股價
+    淨值比 PBR，用今日成交金額加權中位數彙總到群組層級，見 _weighted_median 的
     取捨說明）；Y＝資金流入強度（近
     short_days 日均成交金額 ÷ 近 long_days 日均成交金額，短天期均額相對長天期均額
     墊高＝錢開始流入，比「今日單日 ÷ N 日均額」更不怕單日爆量雜訊）。找的是 X 低、
@@ -935,23 +1015,41 @@ def compute_valuation_flow(db_path, snapshot, short_days=5, long_days=20, metric
     MIN_VALUATION_HISTORY_POINTS 天以上才有值，那個版本在整批回補跑完前，
     大部分產業都會因為資料不足被濾掉不顯示，體驗上像是「泡泡圖沒蓋到所有族群」。"""
     assert metric in ("per", "pbr")
-    industry_map = get_industry_map(db_path)
+    normalized_groups = {
+        str(name): set(members) for name, members in groups.items() if members
+    }
+    ticker_groups = {}
+    for group_name, members in normalized_groups.items():
+        for ticker in members:
+            ticker_groups.setdefault(ticker, []).append(group_name)
+    if market_universe is None:
+        market_universe = set(get_industry_map(db_path))
+    else:
+        market_universe = set(market_universe)
 
     groups = {}
     for price in snapshot.values():
         if price.close is None or price.trading_value is None:
             continue
-        industry = industry_map.get(price.ticker)
-        if not industry:
+        group_names = ticker_groups.get(price.ticker)
+        if not group_names:
             continue
-        g = groups.setdefault(
-            industry, {"trading_value": 0.0, "ticker_values": {}, "ticker_dates": {}}
-        )
-        g["trading_value"] += price.trading_value
-        g["ticker_values"][price.ticker] = price.trading_value
-        g["ticker_dates"][price.ticker] = price.date
+        for group_name in group_names:
+            g = groups.setdefault(
+                group_name,
+                {"trading_value": 0.0, "ticker_values": {}, "ticker_dates": {}},
+            )
+            g["trading_value"] += price.trading_value
+            g["ticker_values"][price.ticker] = price.trading_value
+            g["ticker_dates"][price.ticker] = price.date
 
-    total_market_value = sum(g["trading_value"] for g in groups.values())
+    total_market_value = sum(
+        price.trading_value or 0.0
+        for ticker, price in snapshot.items()
+        if ticker in market_universe
+        and price.close is not None
+        and price.trading_value is not None
+    )
 
     min_history_days = max(short_days, long_days // 2)
     # 分界用 snapshot_today（snapshot 實際代表的交易日）而非 date.today()，理由見
@@ -1043,14 +1141,33 @@ def compute_valuation_flow(db_path, snapshot, short_days=5, long_days=20, metric
     return results
 
 
+def compute_valuation_flow(db_path, snapshot, short_days=5, long_days=20, metric="per"):
+    """相容舊介面的官方產業估值流向；底層改走任意群組聚合器。"""
+    industry_map = get_industry_map(db_path)
+    groups = {}
+    for ticker, industry in industry_map.items():
+        groups.setdefault(industry, set()).add(ticker)
+    return compute_group_valuation_flow(
+        db_path,
+        snapshot,
+        groups,
+        short_days=short_days,
+        long_days=long_days,
+        metric=metric,
+        market_universe=industry_map,
+    )
+
+
 # ---------- 產業成分股（依累積成交金額排序，作為市值代理指標） ----------
 # 本專案沒有股本／發行股數資料（PriceInfo、daily_prices 都只有收盤價、成交量、成交
 # 金額），無法計算真正市值，因此「前N大成分股」改以區間累積成交金額排序，資料來源是
 # 即時 snapshot（今日）＋ daily_prices（歷史），不額外打 API，跟「個股」分頁列清單的
 # 原則一致。
 
-def get_industry_top_stocks_range(db_path, snapshot, industry, days, top_n=30, volume_avg_days=5):
-    """回傳某產業前 top_n 大成分股，排序依據是近 days 個交易日（含今日）的
+def get_group_top_stocks_range(
+    db_path, snapshot, members, days, top_n=30, volume_avg_days=5
+):
+    """回傳任意群組前 top_n 大成分股，排序依據是近 days 個交易日（含今日）的
     「累積成交金額」，讓成分股排名跟「資金流向分析」頁（泡泡圖／資金動向清單）的
     資料區間口徑一致。今日成交金額／收盤來自即時 snapshot，
     days-1 天以前的歷史資料來自 daily_prices，抓法跟 compute_industry_flow 相同
@@ -1067,13 +1184,13 @@ def get_industry_top_stocks_range(db_path, snapshot, industry, days, top_n=30, v
     valuation_history 裡「最新一筆」本益比（跟 compute_valuation_flow 同一套
     取值邏輯：按 date DESC 排序，每檔股票第一次出現的即為最新值），沒有資料
     則為 None。"""
-    industry_map = get_industry_map(db_path)
+    members = set(members)
 
     today_by_ticker = {}
     for price in snapshot.values():
         if price.close is None or price.trading_value is None:
             continue
-        if industry_map.get(price.ticker) != industry:
+        if price.ticker not in members:
             continue
         today_by_ticker[price.ticker] = price
 
@@ -1149,6 +1266,25 @@ def get_industry_top_stocks_range(db_path, snapshot, industry, days, top_n=30, v
 
     results.sort(key=lambda r: r["trading_value"], reverse=True)
     return results[:top_n]
+
+
+def get_industry_top_stocks_range(
+    db_path, snapshot, industry, days, top_n=30, volume_avg_days=5
+):
+    """相容舊介面的官方產業成分股查詢。"""
+    industry_map = get_industry_map(db_path)
+    members = {
+        ticker for ticker, ticker_industry in industry_map.items()
+        if ticker_industry == industry
+    }
+    return get_group_top_stocks_range(
+        db_path,
+        snapshot,
+        members,
+        days,
+        top_n=top_n,
+        volume_avg_days=volume_avg_days,
+    )
 
 
 # ---------- 全市場個股資金流入排行 ----------
