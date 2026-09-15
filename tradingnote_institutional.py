@@ -5,20 +5,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 import threading
 
-from tradingnote_cache import (
-    load_fresh_file_cache,
-    load_stale_file_cache,
-    write_file_cache,
-)
+from tradingnote_api_config import TPEX_INSTITUTIONAL_URL, TWSE_INSTITUTIONAL_URL
+from tradingnote_cache import fetch_with_file_cache, load_stale_file_cache
 from tradingnote_http import PriceFetchError, http_get_json, to_int
 
 
-TWSE_INSTITUTIONAL_URL = (
-    "https://www.twse.com.tw/rwd/zh/fund/T86?response=json&selectType=ALL"
-)
-TPEX_INSTITUTIONAL_URL = (
-    "https://www.tpex.org.tw/openapi/v1/tpex_3insti_daily_trading"
-)
 INSTITUTIONAL_CACHE_TTL_SECONDS = 30 * 60
 _loaded_file_cache = {}
 _loaded_file_cache_lock = threading.Lock()
@@ -131,24 +122,23 @@ def fetch_tpex_institutional():
     return result
 
 
+def _fetch_institutional_snapshot():
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        twse_future = executor.submit(fetch_twse_institutional)
+        tpex_future = executor.submit(fetch_tpex_institutional)
+        return twse_future.result() + tpex_future.result()
+
+
 def get_cached_institutional_snapshot(cache_path, force_refresh=False):
     """取得全市場法人資料；失敗時回退舊快取，避免阻斷行情更新。"""
-    if not force_refresh:
-        cached = load_fresh_file_cache(cache_path, INSTITUTIONAL_CACHE_TTL_SECONDS)
-        if cached is not None:
-            return [InstitutionalTickerFlow(**row) for row in cached.get("rows", [])]
-    try:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            twse_future = executor.submit(fetch_twse_institutional)
-            tpex_future = executor.submit(fetch_tpex_institutional)
-            rows = twse_future.result() + tpex_future.result()
-        write_file_cache(cache_path, {"rows": [asdict(row) for row in rows]})
-        return rows
-    except PriceFetchError:
-        stale = load_stale_file_cache(cache_path)
-        if stale is not None:
-            return [InstitutionalTickerFlow(**row) for row in stale.get("rows", [])]
-        raise
+    return fetch_with_file_cache(
+        cache_path, INSTITUTIONAL_CACHE_TTL_SECONDS, _fetch_institutional_snapshot,
+        force_refresh=force_refresh,
+        serialize=lambda rows: {"rows": [asdict(row) for row in rows]},
+        deserialize=lambda cached: [
+            InstitutionalTickerFlow(**row) for row in cached.get("rows", [])
+        ],
+    )
 
 
 def load_cached_institutional_snapshot(cache_path):

@@ -22,13 +22,13 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
+from tradingnote_api_config import TPEX_CHAIN_ROOT_URL as CHAIN_ROOT_URL
 from tradingnote_history import INDUSTRY_CODE_NAMES
 
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "data" / "history.db"
 CONCEPTS_PATH = ROOT / "concepts.json"
-CHAIN_ROOT_URL = "https://ic.tpex.org.tw/"
 USER_AGENT = "Mozilla/5.0 (compatible; TradingNote concept catalog updater)"
 
 CHAIN_LINK_RE = re.compile(r"introduce\.php\?ic=([A-Za-z0-9]+)")

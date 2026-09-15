@@ -6,7 +6,7 @@
 呼叫。改用 TAIFEX 官方公開的「期貨每日交易行情」端點（openapi.taifex.com.tw，
 無需 API Key、免費、無 header 限制），只反映「盤後」（EOD，含日盤/夜盤收盤後的
 彙總）資訊，不是真即時報價——跟 TWSE/TPEX 股票走 EOD 而非即時的既有設計原則
-一致（見 HANDOFF.md：「只有 EOD 資料，非即時報價」）。
+一致（見 STATUS.md「已知缺口」：「只有 EOD 資料，非即時報價」）。
 
 這支端點沒有商品/日期參數，一次回傳「最近一個交易日」全市場所有期貨契約
 （含價差單），呼叫端自行從裡面篩出想要的商品代碼與近月合約。
@@ -14,30 +14,25 @@
 
 import csv
 import io
+import sqlite3
 import time
 from datetime import date, timedelta
+from pathlib import Path
 
-from tradingnote_cache import load_fresh_file_cache, load_stale_file_cache, write_file_cache
-from tradingnote_history import (
-    get_large_traders_history_date_range,
-    upsert_large_traders_history,
+from tradingnote_api_config import (
+    TAIFEX_DAILY_FUTURES_URL,
+    TAIFEX_LARGE_TRADERS_FUTURES_URL,
+    TAIFEX_LARGE_TRADERS_HISTORY_URL,
+    TAIFEX_SSF_LIST_URL,
 )
+from tradingnote_cache import fetch_with_file_cache
 from tradingnote_http import (
-    PriceFetchError,
     http_get_json,
     http_post_text,
     to_float,
     to_int,
 )
 from urllib.parse import urlencode
-
-TAIFEX_DAILY_FUTURES_URL = "https://openapi.taifex.com.tw/v1/DailyMarketReportFut"
-
-# 大額交易人未沖銷部位（盤後）：同樣是 TAIFEX 官方公開、免金鑰端點，一次回傳
-# 最近一個交易日全市場所有期貨契約的前5／前10大交易人買賣方未沖銷部位。
-TAIFEX_LARGE_TRADERS_FUTURES_URL = (
-    "https://openapi.taifex.com.tw/v1/OpenInterestOfLargeTradersFutures"
-)
 
 # TypeOfTraders 代碼 → 中文（TAIFEX 官方定義）：0＝所有交易人、1＝特定法人。
 LARGE_TRADERS_TYPE_LABELS = {"0": "所有交易人", "1": "特定法人"}
@@ -46,23 +41,12 @@ LARGE_TRADERS_TYPE_LABELS = {"0": "所有交易人", "1": "特定法人"}
 # 排序時固定排在真實月份之後。
 LARGE_TRADERS_ALL_CONTRACTS_MONTH = "999912"
 
-# 大額交易人未沖銷部位「歷史」下載端點（TAIFEX 網站，非 openapi）。openapi 的
-# OpenInterestOfLargeTradersFutures 只回最新一天、沒有日期參數，要逐日歷史只能打
-# 這支網站 CSV 下載端點（POST queryStartDate／queryEndDate、Big5 編碼）。實測單次
-# 查詢的日期跨度有上限（90 天可、120 天會被擋回 HTML 錯誤頁），所以回補時要分段。
-TAIFEX_LARGE_TRADERS_HISTORY_URL = "https://www.taifex.com.tw/cht/3/largeTraderFutDown"
-
 # 單次歷史查詢的安全日期跨度（曆日）：實測 90 天可、120 天被擋，取 60 天保守留餘裕。
 LARGE_TRADERS_HISTORY_MAX_SPAN_DAYS = 60
 
 # 歷史 CSV 裡「所有契約合計」的到期月別代碼是 999999（跟 openapi 即時端點的 999912
 # 不同！趨勢圖要查歷史表時用這個）。
 LARGE_TRADERS_HISTORY_ALL_CONTRACTS_MONTH = "999999"
-
-# 股票期貨交易標的清單端點：把股票期貨契約代碼（如 CDF）對應到標的股票
-# （台積電 2330）。日盤行情端點只給不具名的契約代碼，靠這支補上標的名稱，
-# 讓「期貨」頁看得懂、也能用股票代號／名稱搜尋。免金鑰、內容變動很少。
-TAIFEX_SSF_LIST_URL = "https://openapi.taifex.com.tw/v1/SSFLists"
 
 # 預設顯示商品：TX（臺股期貨，大台）／MTX（小型臺指期貨，小台），對應 TAIFEX
 # 官方契約代號（不是 Fugle 舊版用的 TXF／MXF 命名）。
@@ -127,25 +111,14 @@ def get_front_month_sessions(product, rows):
 
 
 def get_cached_daily_futures_report(cache_path, force_refresh=False):
-    """比照 tradingnote_core.get_market_snapshot 的檔案快取模式：命中
+    """比照 tradingnote_cache.fetch_with_file_cache 的檔案快取模式：命中
     FUTURES_CACHE_TTL_SECONDS 內的快取就不重打 API，過期或 force_refresh 才
     真的呼叫 fetch_daily_futures_report()；API 失敗時退回舊快取（若有）而不是
     直接噴錯，跟個股快取失敗時的 fallback 邏輯一致。"""
-    if not force_refresh:
-        cached = load_fresh_file_cache(cache_path, FUTURES_CACHE_TTL_SECONDS)
-        if cached is not None:
-            return cached["rows"]
-
-    try:
-        rows = fetch_daily_futures_report()
-    except PriceFetchError:
-        stale = load_stale_file_cache(cache_path)
-        if stale is not None:
-            return stale["rows"]
-        raise
-
-    write_file_cache(cache_path, {"rows": rows})
-    return rows
+    return fetch_with_file_cache(
+        cache_path, FUTURES_CACHE_TTL_SECONDS, fetch_daily_futures_report,
+        force_refresh=force_refresh,
+    )
 
 
 def get_futures_snapshot(products=None, rows=None):
@@ -272,21 +245,10 @@ def get_cached_large_traders_futures_report(cache_path, force_refresh=False):
     FUTURES_CACHE_TTL_SECONDS 內的快取就不重打 API，過期或 force_refresh 才
     真的呼叫 fetch_large_traders_futures_report()；API 失敗時退回舊快取（若有）
     而不是直接噴錯。"""
-    if not force_refresh:
-        cached = load_fresh_file_cache(cache_path, FUTURES_CACHE_TTL_SECONDS)
-        if cached is not None:
-            return cached["rows"]
-
-    try:
-        rows = fetch_large_traders_futures_report()
-    except PriceFetchError:
-        stale = load_stale_file_cache(cache_path)
-        if stale is not None:
-            return stale["rows"]
-        raise
-
-    write_file_cache(cache_path, {"rows": rows})
-    return rows
+    return fetch_with_file_cache(
+        cache_path, FUTURES_CACHE_TTL_SECONDS, fetch_large_traders_futures_report,
+        force_refresh=force_refresh,
+    )
 
 
 # ---------- 股票期貨交易標的（SSFLists，個股期貨代碼 → 標的股票） ----------
@@ -302,21 +264,10 @@ def fetch_ssf_list():
 def get_cached_ssf_list(cache_path, force_refresh=False):
     """SSFLists 的檔案快取，模式同 get_cached_daily_futures_report（命中
     FUTURES_CACHE_TTL_SECONDS 內快取不重打、失敗退回舊快取）。"""
-    if not force_refresh:
-        cached = load_fresh_file_cache(cache_path, FUTURES_CACHE_TTL_SECONDS)
-        if cached is not None:
-            return cached["rows"]
-
-    try:
-        rows = fetch_ssf_list()
-    except PriceFetchError:
-        stale = load_stale_file_cache(cache_path)
-        if stale is not None:
-            return stale["rows"]
-        raise
-
-    write_file_cache(cache_path, {"rows": rows})
-    return rows
+    return fetch_with_file_cache(
+        cache_path, FUTURES_CACHE_TTL_SECONDS, fetch_ssf_list,
+        force_refresh=force_refresh,
+    )
 
 
 def build_ssf_map(rows):
@@ -344,12 +295,117 @@ def large_traders_code_for_product(product, ssf_map):
     return product
 
 
+# ---------- SQLite：large_traders_history 表 ----------
+# 跟 tradingnote_history.py 共用同一個 db_path（history.db 實體檔案），但這張表
+# 是期貨資料，schema／讀寫都獨立宣告在這裡，不透過 tradingnote_history 曲折
+# import——避免期貨模組反過來依賴股票歷史模組才能操作自己的資料表。
+
+def _connect(db_path):
+    p = Path(db_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    # timeout=30／WAL：跟 tradingnote_history._connect 同一套理由，同一個檔案可能
+    # 被兩邊同時開啟（GUI 啟動自動回補 vs. 使用者手動操作）。
+    conn = sqlite3.connect(p, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    # 期貨大額交易人未沖銷部位逐日歷史（backfill_large_traders_history，資料來源是
+    # TAIFEX 網站的歷史 CSV 下載端點）。contract 是大額端點自己的契約代碼
+    # （TX／CD／BRF…，股票期貨去尾 F），settlement_month 的 999999＝所有契約合計，
+    # trader_type 0＝所有交易人、1＝特定法人。供「期貨」頁選取某商品時畫前10大
+    # 未沖銷部位趨勢圖用。
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS large_traders_history (
+            date TEXT NOT NULL,
+            contract TEXT NOT NULL,
+            settlement_month TEXT NOT NULL,
+            trader_type TEXT NOT NULL,
+            contract_name TEXT,
+            top5_buy INTEGER,
+            top5_sell INTEGER,
+            top10_buy INTEGER,
+            top10_sell INTEGER,
+            market_oi INTEGER,
+            PRIMARY KEY (date, contract, settlement_month, trader_type)
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_large_traders_history_contract_date "
+        "ON large_traders_history (contract, settlement_month, trader_type, date)"
+    )
+    conn.commit()
+    return conn
+
+
+def upsert_large_traders_history(db_path, rows):
+    """寫入一批 (date, contract, settlement_month, trader_type, contract_name,
+    top5_buy, top5_sell, top10_buy, top10_sell, market_oi) tuple 到
+    large_traders_history（INSERT OR REPLACE，以 (date, contract, settlement_month,
+    trader_type) 為主鍵，重複回補同一天同一契約會覆蓋而非重複）。rows 為空時直接
+    return，不開連線。"""
+    if not rows:
+        return
+    conn = _connect(db_path)
+    try:
+        conn.executemany(
+            """INSERT OR REPLACE INTO large_traders_history
+               (date, contract, settlement_month, trader_type, contract_name,
+                top5_buy, top5_sell, top10_buy, top10_sell, market_oi)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_large_traders_history_date_range(db_path):
+    """回傳 large_traders_history 目前已存的最早／最新日期（ISO 字串）
+    (min_date, max_date)；整張表還沒有任何資料時回傳 (None, None)。給
+    backfill_large_traders_history 判斷還缺哪段日期用。"""
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT MIN(date), MAX(date) FROM large_traders_history"
+        ).fetchone()
+        return (row[0], row[1]) if row else (None, None)
+    finally:
+        conn.close()
+
+
+def get_large_traders_history_series(db_path, contract, settlement_month, trader_type):
+    """回傳某契約某到期月別（settlement_month，999999＝所有契約合計）某交易人類別
+    （trader_type，'0'＝所有交易人、'1'＝特定法人）的逐日大額未沖銷部位序列，
+    依日期由舊到新排序：[{"date":, "top5_buy":, "top5_sell":, "top10_buy":,
+    "top10_sell":, "market_oi":}, ...]。給「期貨」頁趨勢圖用；查無資料回傳空清單。"""
+    conn = _connect(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT date, top5_buy, top5_sell, top10_buy, top10_sell, market_oi "
+            "FROM large_traders_history "
+            "WHERE contract = ? AND settlement_month = ? AND trader_type = ? "
+            "ORDER BY date",
+            (contract, settlement_month, trader_type),
+        )
+        return [
+            {
+                "date": d,
+                "top5_buy": t5b,
+                "top5_sell": t5s,
+                "top10_buy": t10b,
+                "top10_sell": t10s,
+                "market_oi": moi,
+            }
+            for d, t5b, t5s, t10b, t10s, moi in cur.fetchall()
+        ]
+    finally:
+        conn.close()
+
+
 # ---------- 大額交易人未沖銷部位「歷史」回補（TAIFEX 網站 CSV，綁定回補天數） ----------
 
 def fetch_large_traders_history_range(start_date, end_date):
     """打一次 TAIFEX 歷史 CSV 下載端點，回傳 [start_date, end_date]（含端點，datetime.date）
     區間內全市場大額交易人未沖銷部位，正規化成可直接餵給
-    tradingnote_history.upsert_large_traders_history 的 tuple 清單：
+    upsert_large_traders_history 的 tuple 清單：
     (date_iso, contract, settlement_month, trader_type, contract_name,
      top5_buy, top5_sell, top10_buy, top10_sell, market_oi)。
 

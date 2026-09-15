@@ -19,6 +19,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+from tradingnote_http import PriceFetchError
+
 
 _FILE_LOCKS = {}
 _FILE_LOCKS_GUARD = threading.Lock()
@@ -90,6 +92,48 @@ def write_file_cache(cache_path, payload):
             p,
             {"fetched_at": datetime.now().isoformat(), **payload},
         )
+
+
+def fetch_with_file_cache(
+    cache_path,
+    ttl_seconds,
+    fetch_fn,
+    force_refresh=False,
+    serialize=None,
+    deserialize=None,
+):
+    """封裝「讀新鮮檔案快取 → 過期或 force_refresh 才呼叫 fetch_fn() 重抓 → 成功寫回
+    → API 失敗（PriceFetchError）時退回舊快取」這套流程，取代 get_cached_daily_futures_report／
+    get_cached_large_traders_futures_report／get_cached_ssf_list／get_cached_institutional_snapshot
+    原本各自重寫一份幾乎一樣的邏輯，只有 payload 的 key 名稱或要不要在 dataclass
+    ↔ dict 之間轉換不同。
+
+    `serialize(value) -> dict`／`deserialize(cached) -> value` 預設用 {"rows": value}
+    這個最常見的形狀；payload key 不是 "rows"，或 fetch_fn() 回傳的是 dataclass
+    需要額外轉換成可存進 JSON 的形式時，呼叫端自行傳入這兩個函式。
+
+    `get_market_snapshot()`（tradingnote_core.py）故意沒有改用這支 helper：它的
+    on_progress 是「並行抓 TWSE／TPEX 兩階段各自報告進度」，跟這裡單純的
+    fetch/cache 兩態不是同一種需求，硬套會讓這支 helper 多出一堆只為了那一個
+    呼叫端存在的 hook 參數，不值得。"""
+    serialize = serialize or (lambda value: {"rows": value})
+    deserialize = deserialize or (lambda cached: cached["rows"])
+
+    if not force_refresh:
+        cached = load_fresh_file_cache(cache_path, ttl_seconds)
+        if cached is not None:
+            return deserialize(cached)
+
+    try:
+        value = fetch_fn()
+    except PriceFetchError:
+        stale = load_stale_file_cache(cache_path)
+        if stale is not None:
+            return deserialize(stale)
+        raise
+
+    write_file_cache(cache_path, serialize(value))
+    return value
 
 
 def load_keyed_store(store_path):

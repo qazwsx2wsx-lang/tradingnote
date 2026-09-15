@@ -9,13 +9,9 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from tradingnote_api_config import TPEX_PERATIO_URL, TPEX_URL, TWSE_URL, TWSE_VALUATION_URL
 from tradingnote_cache import TTLCache, load_fresh_file_cache, load_stale_file_cache, write_file_cache
 from tradingnote_http import PriceFetchError, http_get_json, to_float, to_int
-
-TWSE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-TPEX_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
-TPEX_PERATIO_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis"
-TWSE_VALUATION_URL = "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL"
 
 CACHE_TTL_SECONDS = 30 * 60
 # 上櫃股票本益比／殖利率／股價淨值比，實測跟 FinMind 同一天數值完全一致（FinMind

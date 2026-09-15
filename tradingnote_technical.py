@@ -6,6 +6,9 @@
 """
 
 from dataclasses import dataclass
+import math
+import sqlite3
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -21,7 +24,8 @@ class TechnicalPriceBar:
 
 def _number(value):
     try:
-        return float(value) if value is not None else None
+        number = float(value) if value is not None else None
+        return number if number is not None and math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
 
@@ -166,6 +170,8 @@ def _calculate_rsi(closes, period=14):
     average_loss = sum(losses[:period]) / period
 
     def value():
+        if average_gain == average_loss == 0:
+            return 50.0
         if average_loss == 0:
             return 100.0
         relative_strength = average_gain / average_loss
@@ -227,7 +233,7 @@ def calculate_indicators(rows, kd_period=9, macd_fast=12, macd_slow=26, macd_sig
         return None
     closes = [bar.close for bar in bars]
     macd = _calculate_macd(closes, macd_fast, macd_slow, macd_signal)
-    return {
+    result = {
         "dates": [bar.date for bar in bars],
         "close": closes,
         "kd": _calculate_kd(bars, kd_period),
@@ -239,3 +245,101 @@ def calculate_indicators(rows, kd_period=9, macd_fast=12, macd_slow=26, macd_sig
         },
         "rsi": _calculate_rsi(closes, 14),
     }
+    result["charts"] = build_chart_catalog(bars, result)
+    return result
+
+
+def build_chart_catalog(bars, base):
+    """日線指標目錄；None 表示暖機或必要欄位不足，不補造價格。"""
+    c = [b.close for b in bars]
+    v = [b.volume for b in bars]
+    n = len(c)
+    charts = {}
+
+    def add(key, title, unit, series, levels=()):
+        charts[key] = dict(title=title, unit=unit, series=series, levels=levels)
+
+    ma = {f"MA{p}": _simple_moving_average(c, p) for p in (5, 10, 20, 60, 120, 240)}
+    add("ma", "收盤價與均線", "價格", {"收盤": c, **ma})
+    add("ema", "指數移動平均", "價格", {f"EMA{p}": _ema(c, p) for p in (5, 12, 26, 60)})
+    add("kd", "KD（9／3／3）", "數值", {"K": base["kd"]["k"], "D": base["kd"]["d"]}, (20, 80))
+    add("macd", "MACD（12／26／9）", "價差", base["macd"], (0,))
+    add("rsi", "RSI（Wilder）", "數值", {f"RSI{p}": _calculate_rsi(c, p) for p in (6, 14)}, (30, 70))
+    mid = ma["MA20"]
+    std = [None if i < 19 else (sum((x-mid[i])**2 for x in c[i-19:i+1])/20)**.5 for i in range(n)]
+    upper = [None if s is None else m+2*s for m, s in zip(mid, std)]
+    lower = [None if s is None else m-2*s for m, s in zip(mid, std)]
+    add("boll", "布林通道（20／2，母體標準差）", "價格", {"收盤": c, "中軌": mid, "上軌": upper, "下軌": lower})
+    add("bandwidth", "布林帶寬", "%", {"帶寬": [None if m in (None, 0) else 400*s/m for m,s in zip(mid,std)]})
+    add("bias", "乖離率", "%", {f"BIAS{p}": [None if m in (None,0) else (x/m-1)*100 for x,m in zip(c,_simple_moving_average(c,p))] for p in (5,20,60)}, (0,))
+    add("roc", "變動率 ROC（12）", "%", {"ROC": [None if i<12 or c[i-12]==0 else (c[i]/c[i-12]-1)*100 for i in range(n)]}, (0,))
+    add("momentum", "動量 MOM（10）", "價差", {"MOM": [None if i<10 else c[i]-c[i-10] for i in range(n)]}, (0,))
+    add("volume", "成交量與均量", "股", {"成交量": v, "均量5": _simple_moving_average(v,5), "均量20": _simple_moving_average(v,20)})
+    add("value", "成交金額", "元", {"成交金額": [b.trading_value for b in bars]})
+    returns = [None if i == 0 or c[i-1] == 0 else (c[i]/c[i-1]-1)*100 for i in range(n)]
+    add("returns", "日報酬率", "%", {"日報酬": returns}, (0,))
+    volatility = [None]*n
+    for i in range(20,n):
+        window = returns[i-19:i+1]
+        if all(x is not None for x in window):
+            mean = sum(window)/20
+            volatility[i] = (sum((x-mean)**2 for x in window)/19*252)**.5
+    add("volatility", "歷史波動率（20日，年化252日）", "%", {"波動率": volatility})
+    add("volume_ratio", "量比（今日量／前20日均量）", "倍", {"量比": [None if i<20 or sum(v[i-20:i])==0 else v[i]*20/sum(v[i-20:i]) for i in range(n)]}, (1,))
+    peak = c[0]
+    drawdown = []
+    for close in c:
+        peak = max(peak, close)
+        drawdown.append((close/peak-1)*100 if peak else None)
+    add("drawdown", "距區間歷史高點回落", "%", {"回落": drawdown}, (0,))
+    add("daily_vwap", "每日成交均價（金額／股數）", "價格", {"成交均價": [b.trading_value/b.volume if b.trading_value is not None and b.volume else None for b in bars], "收盤": c})
+    obv, vpt = [0.0], [0.0]
+    for i in range(1,n):
+        obv.append(obv[-1]+v[i]*(1 if c[i]>c[i-1] else -1 if c[i]<c[i-1] else 0))
+        vpt.append(vpt[-1]+(v[i]*(c[i]/c[i-1]-1) if c[i-1] else 0))
+    add("obv", "OBV（區間起點為零）", "股", {"OBV": obv})
+    add("vpt", "VPT（區間起點為零）", "量價", {"VPT": vpt})
+    add("vwma", "成交量加權均線（20）", "價格", {"收盤": c, "VWMA20": [None if i<19 or sum(v[i-19:i+1])==0 else sum(c[j]*v[j] for j in range(i-19,i+1))/sum(v[i-19:i+1]) for i in range(n)]})
+    highs = [b.high for b in bars]
+    lows = [b.low for b in bars]
+    wr, cci, atr, mfi = ([None]*n for _ in range(4))
+    tr = [None if b.high is None or b.low is None else max(b.high-b.low, abs(b.high-c[i-1]), abs(b.low-c[i-1])) if i else b.high-b.low for i,b in enumerate(bars)]
+    typical = [None if b.high is None or b.low is None else (b.high+b.low+b.close)/3 for b in bars]
+    for i in range(n):
+        if i>=13 and all(x is not None for x in highs[i-13:i+1]+lows[i-13:i+1]):
+            h,l = max(highs[i-13:i+1]),min(lows[i-13:i+1])
+            wr[i] = -50 if h==l else -100*(h-c[i])/(h-l)
+        if i>=13 and all(x is not None for x in tr[i-13:i+1]):
+            atr[i] = (atr[i-1]*13+tr[i])/14 if i and atr[i-1] is not None else sum(tr[i-13:i+1])/14
+        if i>=19 and all(x is not None for x in typical[i-19:i+1]):
+            window=typical[i-19:i+1]
+            mean=sum(window)/20
+            dev=sum(abs(x-mean) for x in window)/20
+            cci[i]=(typical[i]-mean)/(.015*dev) if dev else 0
+        if i>=14 and all(x is not None for x in typical[i-14:i+1]):
+            positive=sum(typical[j]*v[j] for j in range(i-13,i+1) if typical[j]>typical[j-1])
+            negative=sum(typical[j]*v[j] for j in range(i-13,i+1) if typical[j]<typical[j-1])
+            mfi[i]=100*positive/(positive+negative) if positive+negative else 50
+    add("wr", "Williams %R（14，需要高低價）", "%", {"%R": wr}, (-80,-20))
+    add("cci", "CCI（20，需要高低價）", "數值", {"CCI": cci}, (-100,100))
+    add("atr", "ATR（Wilder 14，需要高低價）", "價格", {"ATR": atr})
+    add("mfi", "MFI（14，需要高低價）", "數值", {"MFI": mfi}, (20,80))
+    return charts
+
+
+def load_local_technical(db_path, ticker, price_history=()):
+    """唯讀本地 DB，合併已快取 OHLCV；同日以 DB 收盤量價為準。"""
+    rows = {r["date"]: dict(date=r["date"], open=r.get("open"), max=r.get("high"), min=r.get("low"), close=r.get("close"), Trading_Volume=r.get("volume"), Trading_money=r.get("trading_value")) for r in price_history or ()}
+    path = Path(db_path)
+    if path.exists():
+        with sqlite3.connect(path.resolve().as_uri()+"?mode=ro", uri=True) as conn:
+            for day, close, volume, value in conn.execute("SELECT date, close, volume, trading_value FROM daily_prices WHERE ticker=? ORDER BY date", (ticker,)):
+                if close is None:
+                    continue
+                row=rows.setdefault(day, {"date":day})
+                # 不混用不同收盤基準的 OHLC（例如除權息調整）。
+                if row.get("close") is not None and row["close"] != close:
+                    for key in ("open", "max", "min"):
+                        row.pop(key, None)
+                row.update(close=close, Trading_Volume=volume, Trading_money=value)
+    return calculate_indicators(list(rows.values()))

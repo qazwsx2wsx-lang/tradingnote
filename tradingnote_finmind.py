@@ -41,6 +41,7 @@ import time
 from datetime import date, timedelta
 from urllib.parse import urlencode
 
+from tradingnote_api_config import FINMIND_URL
 from tradingnote_cache import TTLCache, load_keyed_store, save_keyed_entry
 from tradingnote_core import get_tpex_valuation
 from tradingnote_history import (
@@ -57,8 +58,6 @@ from tradingnote_technical import (
     calculate_vpt_mfi_history,
     normalize_price_rows,
 )
-
-FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 
 # FinMind 免費方案額度：600 次／小時（依官方文件），超過會回 HTTP 402。
 FINMIND_HOURLY_LIMIT = 600

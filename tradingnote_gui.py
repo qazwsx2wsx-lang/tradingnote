@@ -3,9 +3,8 @@
 
 import html
 import statistics
-import sys
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -38,7 +37,6 @@ from tradingnote_history import (
     get_history_status,
     get_industry_directory,
     get_industry_map,
-    get_large_traders_history_series,
     get_latest_ticker_record,
     record_snapshot,
     record_valuation_snapshot,
@@ -73,6 +71,7 @@ from tradingnote_taifex import (
     get_cached_large_traders_futures_report,
     get_cached_ssf_list,
     get_futures_snapshot,
+    get_large_traders_history_series,
     group_large_traders_all,
     large_traders_code_for_product,
     list_all_products,
@@ -82,6 +81,13 @@ from tradingnote_institutional import get_cached_institutional_snapshot
 from tradingnote_http import PriceFetchError
 from tradingnote_paths import APP_PATHS
 from tradingnote_tasks import run_background_task
+from tradingnote_technical import load_local_technical, calculate_indicators
+from tradingnote_journal import (
+    initialize_journal,
+    load_week,
+    save_journal_entry,
+    save_portfolio_snapshot,
+)
 
 DATA_DIR = APP_PATHS.data_dir
 POSITIONS_PATH = APP_PATHS.positions
@@ -117,84 +123,37 @@ COLUMNS = [
     ("updated_at", "更新日期", 90),
 ]
 
-# ---------- 視覺主題：冷灰底、白色內容、藍色操作重點 ----------
-COLOR_BG = "#F3F6FA"
-COLOR_SURFACE = "#FFFFFF"
-COLOR_TEXT = "#172B4D"
-COLOR_MUTED = "#617187"
-COLOR_ACCENT = "#2563B0"
-COLOR_ACCENT_ACTIVE = "#174EA6"
-COLOR_ACCENT_TEXT = "#FFFFFF"
-COLOR_BORDER = "#DCE3EC"
-COLOR_ROW_ALT = "#F7F9FC"
-COLOR_HOVER = "#EDF3FB"
-# 漲跌（損益）刻意保留紅綠上色——功能性色彩，用來一眼辨識盈虧方向，不算裝飾用色。
-COLOR_GAIN = "#1E7A3E"
-COLOR_LOSS = "#C0392B"
-
-
-# 依作業系統選擇內建的繁體中文字型：macOS 用 PingFang TC，Windows 用微軟正黑體
-# （Microsoft JhengHei），其他平台留給 Qt 自行 fallback。字型名稱不存在時 Qt 會
-# 回退到預設字型，不會報錯，但指定正確的系統字型中文才不會變成方框／宋體。
-if sys.platform == "darwin":
-    FONT_FAMILY = "PingFang TC"
-elif sys.platform.startswith("win"):
-    FONT_FAMILY = "Microsoft JhengHei"
-else:
-    FONT_FAMILY = "Noto Sans CJK TC"
-
-STYLESHEET = f"""
-QWidget {{ color: {COLOR_TEXT}; font-family: "{FONT_FAMILY}"; font-size: 13px; }}
-QMainWindow, QDialog {{ background: {COLOR_BG}; }}
-QLabel {{ background: transparent; }}
-QLabel[muted="true"] {{ color: {COLOR_MUTED}; font-size: 12px; }}
-QLabel[header="true"] {{ font-size: 16px; font-weight: 600; }}
-QLabel#brandTitle {{ font-size: 23px; font-weight: 700; color: {COLOR_TEXT}; }}
-QFrame[summaryCard="true"] {{ background: #F7F9FC; border: 1px solid {COLOR_BORDER}; border-radius: 8px; }}
-QLabel[metricValue="true"] {{ font-size: 17px; font-weight: 700; }}
-QFrame[stockHero="true"] {{ background: #F7F9FC; border: 1px solid {COLOR_BORDER}; border-radius: 10px; }}
-QTabWidget::pane {{ border: 1px solid {COLOR_BORDER}; background: {COLOR_SURFACE}; border-radius: 8px; }}
-QTabBar::tab {{ background: transparent; color: {COLOR_MUTED}; padding: 11px 18px; margin-right: 4px; border-bottom: 3px solid transparent; }}
-QTabBar::tab:selected {{ color: {COLOR_ACCENT}; border-bottom: 3px solid {COLOR_ACCENT}; font-weight: 700; background: {COLOR_SURFACE}; }}
-QTabBar::tab:hover:!selected {{ background: {COLOR_HOVER}; color: {COLOR_TEXT}; }}
-QPushButton {{ background: {COLOR_SURFACE}; border: 1px solid {COLOR_BORDER}; border-radius: 6px; padding: 7px 13px; min-height: 18px; }}
-QPushButton:hover {{ background: {COLOR_HOVER}; border-color: #A9BED9; }}
-QPushButton:pressed {{ background: #DFEAF8; }}
-QPushButton:focus {{ border: 1px solid {COLOR_ACCENT}; }}
-QPushButton:disabled {{ background: #F0F3F7; color: #8793A4; border-color: {COLOR_BORDER}; }}
-QPushButton[accent="true"] {{ background: {COLOR_ACCENT}; color: white; border: 1px solid {COLOR_ACCENT}; font-weight: 600; }}
-QPushButton[accent="true"]:hover {{ background: {COLOR_ACCENT_ACTIVE}; }}
-QPushButton[accent="true"]:disabled {{ background: #A3B8D3; border-color: #A3B8D3; color: white; }}
-QPushButton[flowSectionButton="true"] {{ padding: 7px 14px; border-radius: 6px; }}
-QPushButton[flowSectionButton="true"]:checked {{ background: #E7F0FC; color: #174EA6; border-color: #B7CEEC; font-weight: 600; }}
-QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QDateEdit {{ background: white; border: 1px solid {COLOR_BORDER}; border-radius: 5px; padding: 6px 8px; min-height: 18px; selection-background-color: {COLOR_ACCENT}; }}
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus, QDateEdit:focus {{ border-color: {COLOR_ACCENT}; }}
-QComboBox {{ padding-right: 24px; }}
-QComboBox::drop-down {{ width: 22px; border: none; }}
-QComboBox::down-arrow {{ image: url("{(APP_PATHS.root / 'assets' / 'chevron-down.svg').as_posix()}"); width: 14px; height: 14px; }}
-QSpinBox::up-button {{ subcontrol-origin: border; subcontrol-position: top right; width: 20px; border: none; }}
-QSpinBox::down-button {{ subcontrol-origin: border; subcontrol-position: bottom right; width: 20px; border: none; }}
-QSpinBox::up-arrow {{ image: url("{(APP_PATHS.root / 'assets' / 'chevron-up.svg').as_posix()}"); width: 12px; height: 12px; }}
-QSpinBox::down-arrow {{ image: url("{(APP_PATHS.root / 'assets' / 'chevron-down.svg').as_posix()}"); width: 12px; height: 12px; }}
-QComboBox QAbstractItemView {{ background: white; selection-background-color: #E7F0FC; selection-color: {COLOR_TEXT}; border: 1px solid {COLOR_BORDER}; }}
-QTextEdit, QPlainTextEdit {{ background: white; border: 1px solid {COLOR_BORDER}; border-radius: 7px; padding: 8px; }}
-QTableWidget, QTreeWidget {{ background: white; alternate-background-color: {COLOR_ROW_ALT}; gridline-color: #EDF1F6; border: 1px solid {COLOR_BORDER}; border-radius: 7px; selection-background-color: #DEEBFC; selection-color: #172B4D; outline: none; }}
-QTableWidget::item, QTreeWidget::item {{ padding: 5px 7px; }}
-QTableWidget::item:hover, QTreeWidget::item:hover {{ background: #EDF3FB; }}
-QHeaderView::section {{ background: #EDF2F8; color: #455873; padding: 9px 7px; border: none; border-bottom: 1px solid {COLOR_BORDER}; font-weight: 600; }}
-QTableCornerButton::section {{ background: #EDF2F8; border: none; }}
-QScrollArea {{ border: none; background: transparent; }}
-QScrollArea > QWidget > QWidget {{ background: white; }}
-QCheckBox {{ spacing: 8px; }}
-QGroupBox {{ border: 1px solid {COLOR_BORDER}; border-radius: 8px; margin-top: 16px; padding: 14px; font-weight: 600; }}
-QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 5px; }}
-QSplitter::handle {{ background: {COLOR_BORDER}; }}
-QStatusBar {{ background: {COLOR_BG}; color: {COLOR_MUTED}; border-top: 1px solid {COLOR_BORDER}; font-size: 12px; padding: 4px 8px; }}
-QStatusBar::item {{ border: none; }}
-QProgressBar {{ border: 1px solid {COLOR_BORDER}; border-radius: 5px; background: white; text-align: center; min-height: 18px; }}
-QProgressBar::chunk {{ background: #94B8E7; border-radius: 4px; }}
-QToolTip {{ background: #172B4D; color: white; border: none; padding: 6px; }}
-"""
+# 視覺主題常數與全域 QSS 已搬到 ui/theme.py（2026-09-15，見 ARCHITECTURE.md／
+# STATUS.md）；這裡改用 import，內容不變，往後要調色只改 ui/theme.py 一處。
+from ui.theme import (  # noqa: E402
+    COLOR_BG,
+    COLOR_SURFACE,
+    COLOR_TEXT,
+    COLOR_MUTED,
+    COLOR_ACCENT,
+    COLOR_ACCENT_ACTIVE,
+    COLOR_ACCENT_TEXT,
+    COLOR_BORDER,
+    COLOR_ROW_ALT,
+    COLOR_HOVER,
+    COLOR_CARD_BG,
+    COLOR_GAIN,
+    COLOR_LOSS,
+    COLOR_GAIN_TINT,
+    COLOR_LOSS_TINT,
+    COLOR_WARNING_TINT,
+    COLOR_NEUTRAL_TINT,
+    COLOR_SELECTED_BG,
+    COLOR_DISABLED_BG,
+    COLOR_DISABLED_TEXT,
+    FONT_FAMILY,
+    STYLESHEET,
+)
+from ui.format import gain_loss_color  # noqa: E402
+from ui.components.stat_card import StatCard  # noqa: E402
+from ui.components.signal_badge import SignalBadge  # noqa: E402
+from ui.components.section_card import SectionCard  # noqa: E402
+from ui.components.insight_card import InsightCard  # noqa: E402
 
 
 def accent_button(text, slot=None):
@@ -205,11 +164,58 @@ def accent_button(text, slot=None):
     return btn
 
 
+def _set_standard_icon(button, standard_pixmap, tooltip=None):
+    """套用會隨 DPI 清晰縮放的 Qt 系統圖示，避免用文字符號模擬小圖示。"""
+    button.setIcon(button.style().standardIcon(standard_pixmap))
+    button.setIconSize(QtCore.QSize(22, 22))
+    if tooltip:
+        button.setToolTip(tooltip)
+    return button
+
+
 def _compact_money(value):
     """把金額縮成適合摘要卡與提示框閱讀的億元格式。"""
     if value is None:
         return "—"
     return f"{value / 1e8:+,.1f} 億"
+
+
+def _flow_momentum_insight(rows):
+    """rule-based（不接 LLM）：從族群資金流向清單挑出今天最值得注意的一則量價觀察，
+    給 InsightCard 用。只用 turnover_ratio（今日量比）與 daily_change_pct（當日
+    漲跌%）——兩者都存在才夠格參與，門檻（量比 >= 1.5、漲跌 >= 0.5%）是為了避免拿
+    普通、不特別的日子也硬生出一句「看起來煞有其事」的結論。回傳
+    (headline, detail, tone)；沒有夠格的族群時回傳中性的「暫無訊號」文案，而不是
+    留白或報錯——見規格「Loading/Error/Empty State」的一致性要求。
+    """
+    candidates = [
+        row
+        for row in rows
+        if row.turnover_ratio is not None
+        and row.daily_change_pct is not None
+        and row.turnover_ratio >= 1.5
+        and abs(row.daily_change_pct) >= 0.5
+    ]
+    if not candidates:
+        return (
+            "暫無明顯資金訊號",
+            "今日各族群量能與價格變動都在正常範圍內。",
+            "neutral",
+        )
+    top = max(candidates, key=lambda row: row.turnover_ratio)
+    if top.daily_change_pct > 0:
+        return (
+            "資金動能增強",
+            f"{top.industry}今日成交量為近期均量的 {top.turnover_ratio:.2f} 倍，"
+            f"且價格同步走強（{top.daily_change_pct:+.2f}%）。",
+            "positive",
+        )
+    return (
+        "放量下跌需留意",
+        f"{top.industry}今日成交量為近期均量的 {top.turnover_ratio:.2f} 倍，"
+        f"但價格走弱（{top.daily_change_pct:+.2f}%），賣壓可能未完全釋放。",
+        "negative",
+    )
 
 
 def _screen_fit_size(widget, preferred_width=None, preferred_height=None, ratio=0.85):
@@ -626,22 +632,17 @@ class StockDetailDialog(QtWidgets.QDialog):
         hero_layout.addLayout(identity_layout)
         hero_layout.addStretch(1)
         price = getattr(parent, "snapshot", {}).get(ticker)
-        price_layout = QtWidgets.QVBoxLayout()
-        self.hero_price_label = QtWidgets.QLabel(
+        price_text = (
             f"{price.close:,.2f}" if price is not None and price.close is not None else "—"
         )
-        self.hero_price_label.setProperty("metricValue", True)
         change_pct = _change_pct(price) if price is not None else None
-        self.hero_change_label = QtWidgets.QLabel(
-            f"{change_pct:+.2f}%" if change_pct is not None else "今日漲跌 —"
-        )
-        if change_pct is not None:
-            self.hero_change_label.setStyleSheet(
-                f"color: {COLOR_GAIN if change_pct >= 0 else COLOR_LOSS};"
-            )
-        price_layout.addWidget(self.hero_price_label, alignment=QtCore.Qt.AlignRight)
-        price_layout.addWidget(self.hero_change_label, alignment=QtCore.Qt.AlignRight)
-        hero_layout.addLayout(price_layout)
+        change_text = f"{change_pct:+.2f}%" if change_pct is not None else "今日漲跌 —"
+        status = None if change_pct is None else ("positive" if change_pct >= 0 else "negative")
+        self.hero_stat = StatCard(bordered=False)
+        self.hero_stat.value_label.setAlignment(QtCore.Qt.AlignRight)
+        self.hero_stat.change_label.setAlignment(QtCore.Qt.AlignRight)
+        self.hero_stat.set_value(price_text, change=change_text, status=status)
+        hero_layout.addWidget(self.hero_stat)
 
         self.status_label = QtWidgets.QLabel("查詢中...")
         self.status_label.setWordWrap(True)
@@ -651,6 +652,11 @@ class StockDetailDialog(QtWidgets.QDialog):
         self._layout.setContentsMargins(20, 20, 20, 16)
         self._layout.addWidget(self.hero)
         self._layout.addWidget(self.status_label)
+        self.local_technical_widget = TechnicalAnalysisWidget()
+        cached = load_position_detail_cache(POSITION_DETAIL_CACHE_PATH, ticker) or {}
+        self.local_technical_widget.set_data(load_local_technical(HISTORY_DB_PATH, ticker, cached.get("price_history")))
+        self._layout.addWidget(self.local_technical_widget)
+        self.resize(900, 650)
 
         self.full_detail_button = QtWidgets.QPushButton("顯示完整籌碼面資訊（同部位紀錄）")
         self.full_detail_button.clicked.connect(self._on_show_full_detail)
@@ -697,7 +703,7 @@ class StockDetailDialog(QtWidgets.QDialog):
         else:
             items = []
             for row in institutional["breakdown"]:
-                color = COLOR_GAIN if row["net"] >= 0 else COLOR_LOSS
+                color = gain_loss_color(row["net"])
                 items.append(
                     f"<span style='color:{color}'>{row['label']} {row['net']:+,}</span>"
                 )
@@ -735,6 +741,7 @@ class StockDetailDialog(QtWidgets.QDialog):
         self.full_detail_label.setMaximumHeight(170)
         # 完整摘要已包含基本估值與法人資訊，展開後收起上方簡版以免重複並節省高度。
         self.status_label.setVisible(False)
+        self.local_technical_widget.setVisible(False)
 
         self.full_detail_price_chart = pg.PlotWidget()
         self.full_detail_flow_chart = pg.PlotWidget()
@@ -752,7 +759,7 @@ class StockDetailDialog(QtWidgets.QDialog):
         ):
             chart.setBackground(COLOR_SURFACE)
             chart.showGrid(x=True, y=True, alpha=0.08)
-            chart.setMinimumHeight(320)
+            chart.setMinimumHeight(240)
             chart.addLegend()
         _setup_price_chart_click(self.full_detail_price_chart)
 
@@ -907,7 +914,7 @@ class IndustryTopStocksDialog(QtWidgets.QDialog):
         for row, stock in enumerate(top_stocks):
             change_pct = stock["change_pct"]
             change_str = f"{change_pct:+.2f}%" if change_pct is not None else "N/A"
-            color = COLOR_GAIN if (change_pct or 0) >= 0 else COLOR_LOSS
+            color = gain_loss_color(change_pct or 0)
             avg_volume = stock["avg_volume"]
             per = stock["per"]
             eps = stock["close"] / per if per else None
@@ -952,7 +959,7 @@ LARGE_TRADERS_TABLE_COLUMNS = [
 def _populate_large_traders_table(table, groups):
     """把某商品的大額交易人未沖銷部位（get_large_traders_for_product 的回傳
     groups）填進 table（欄位須為 LARGE_TRADERS_TABLE_COLUMNS）。每個到期月份最多
-    兩列（所有交易人／特定法人）。前10大淨＝前10大買－賣，正綠負紅；前10大買佔比
+    兩列（所有交易人／特定法人）。前10大淨＝前10大買－賣，正紅負綠；前10大買佔比
     ＝前10大買 ÷ 全市場未沖銷。回傳實際畫出的列數（0＝查無資料）。"""
     display_rows = []
     for group in groups:
@@ -983,8 +990,8 @@ def _populate_large_traders_table(table, groups):
             item = QtWidgets.QTableWidgetItem(value)
             if col != 1:
                 item.setTextAlignment(QtCore.Qt.AlignCenter)
-            if col == 6:  # 前10大淨：正綠負紅
-                item.setForeground(QtGui.QColor(COLOR_GAIN if top10_net >= 0 else COLOR_LOSS))
+            if col == 6:  # 前10大淨：正紅負綠
+                item.setForeground(QtGui.QColor(gain_loss_color(top10_net)))
             table.setItem(row, col, item)
     return len(display_rows)
 
@@ -1006,7 +1013,7 @@ def _large_traders_summary_entry(groups, contract_month):
 def _populate_large_traders_trend(chart, series):
     """畫某商品「所有契約合計・所有交易人」前10大買方／賣方未沖銷部位的逐日趨勢
     （兩條線，跟 _populate_margin_chart 一樣直接畫原始「部位數（口）」、不累加）。
-    series 是 tradingnote_history.get_large_traders_history_series 的回傳（歷史由
+    series 是 tradingnote_taifex.get_large_traders_history_series 的回傳（歷史由
     背景回補累積，見 backfill_large_traders_history）；空的就清空圖並提示。
     以「所有契約合計」為序列而非近月，是因為近月合約每月換倉會造成序列斷點，
     所有契約合計才連續。"""
@@ -1284,16 +1291,16 @@ def _flow_quadrant_specs(mode):
     """回傳象限名稱、解讀與底色；鍵值依序是 X／Y 是否高於參考線。"""
     if mode == "valuation":
         return {
-            (False, True): ("便宜吸金", "估值較低・資金升溫", "#E9F6EF"),
-            (True, True): ("強勢追價", "估值較高・資金升溫", "#FFF4DE"),
-            (False, False): ("低估觀望", "估值較低・資金降溫", "#EDF3FA"),
-            (True, False): ("高估降溫", "估值較高・資金降溫", "#FBECEC"),
+            (False, True): ("便宜吸金", "估值較低・資金升溫", COLOR_GAIN_TINT),
+            (True, True): ("強勢追價", "估值較高・資金升溫", COLOR_WARNING_TINT),
+            (False, False): ("低估觀望", "估值較低・資金降溫", COLOR_NEUTRAL_TINT),
+            (True, False): ("高估降溫", "估值較高・資金降溫", COLOR_LOSS_TINT),
         }
     return {
-        (False, True): ("放量承壓", "區間下跌・今日放量", "#FBECEC"),
-        (True, True): ("強勢吸金", "區間上漲・今日放量", "#E9F6EF"),
-        (False, False): ("弱勢觀望", "區間下跌・量能不足", "#EFF2F6"),
-        (True, False): ("量縮走強", "區間上漲・量能待確認", "#FFF4DE"),
+        (False, True): ("放量承壓", "區間下跌・今日放量", COLOR_LOSS_TINT),
+        (True, True): ("強勢吸金", "區間上漲・今日放量", COLOR_GAIN_TINT),
+        (False, False): ("弱勢觀望", "區間下跌・量能不足", COLOR_NEUTRAL_TINT),
+        (True, False): ("量縮走強", "區間上漲・量能待確認", COLOR_WARNING_TINT),
     }
 
 
@@ -1325,8 +1332,8 @@ def _add_flow_quadrants(chart, bounds, x_ref, y_ref, mode):
         y = (top - 0.055 * y_span) if anchor[1] == 0 else (bottom + 0.055 * y_span)
         label = pg.TextItem(
             html=(
-                f'<div style="color:#344054; font-size:11pt; font-weight:600;">{name}</div>'
-                f'<div style="color:#667085; font-size:8pt;">{detail}</div>'
+                f'<div style="color:{COLOR_TEXT}; font-size:11pt; font-weight:600;">{name}</div>'
+                f'<div style="color:{COLOR_MUTED}; font-size:8pt;">{detail}</div>'
             ),
             anchor=anchor,
         )
@@ -1528,13 +1535,13 @@ def populate_flow_chart(
             f.industry, (None, None, None)
         )
         if daily_change is None or abs(daily_change) < 0.05:
-            color = QtGui.QColor("#8290A3")
+            color = QtGui.QColor(COLOR_MUTED)
             direction_text = "中性"
         elif daily_change > 0:
-            color = QtGui.QColor("#2E9B65")
+            color = QtGui.QColor(COLOR_GAIN)
             direction_text = "偏流入"
         else:
-            color = QtGui.QColor("#D95852")
+            color = QtGui.QColor(COLOR_LOSS)
             direction_text = "偏流出"
         tip = (
             f"{f.industry}｜當日{direction_text}\n"
@@ -1909,7 +1916,7 @@ def _plot_technical_series(chart, dates, series, color, name):
     if not points:
         return []
     x, y = zip(*points)
-    chart.plot(x, y, pen=pg.mkPen(color, width=2), name=name)
+    chart.plot(list(range(len(series))), [float("nan") if value is None else value for value in series], connect="finite", pen=pg.mkPen(color, width=2), name=name)
     return list(y)
 
 
@@ -1924,49 +1931,30 @@ def _populate_technical_chart(chart, technical_data, mode="kd"):
         return
 
     dates = technical_data["dates"]
-    x = list(range(len(dates)))
+    spec = technical_data.get("charts", {}).get(mode)
+    if not spec:
+        chart.setTitle("此快取尚無指標，請重新載入資料")
+        return
     values = []
-    if mode == "macd":
-        macd = technical_data.get("macd", {})
-        values += _plot_technical_series(chart, dates, macd.get("macd"), "#1f77b4", "MACD")
-        values += _plot_technical_series(
-            chart, dates, macd.get("signal"), "#d62728", "Signal"
-        )
-        values += _plot_technical_series(
-            chart, dates, macd.get("histogram"), "#7f7f7f", "Histogram"
-        )
-        chart.setLabel("left", "MACD", color=COLOR_TEXT)
-        chart.setTitle("MACD（12／26／9）", color=COLOR_TEXT, size="11pt")
-        chart.addLine(y=0, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine))
-    elif mode == "ma":
-        values += _plot_technical_series(chart, dates, technical_data.get("close"), COLOR_TEXT, "收盤")
-        ma = technical_data.get("ma", {})
-        values += _plot_technical_series(chart, dates, ma.get("ma5"), "#1f77b4", "MA5")
-        values += _plot_technical_series(chart, dates, ma.get("ma20"), "#ff7f0e", "MA20")
-        values += _plot_technical_series(chart, dates, ma.get("ma60"), "#2ca02c", "MA60")
-        chart.setLabel("left", "價格", color=COLOR_TEXT)
-        chart.setTitle("均線（MA5／MA20／MA60）", color=COLOR_TEXT, size="11pt")
+    colors = ("#409cff", "#ffab40", "#43c59e", "#dc709f", "#b399ff", "#b8c85a", "#cccccc")
+    for index, (name, series) in enumerate(spec["series"].items()):
+        values += _plot_technical_series(chart, dates, series, colors[index % len(colors)], name)
+    for level in spec["levels"]:
+        chart.addLine(y=level, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine))
+    chart.setTitle(spec["title"], color=COLOR_TEXT, size="11pt")
+    chart.setLabel("left", spec["unit"])
+    step = max(1, len(dates)//6)
+    chart.getAxis("bottom").setTicks([[(i, dates[i]) for i in range(0,len(dates),step)]])
+    chart.setXRange(0, max(1,len(dates)-1), padding=.02)
+    if values:
+        lo, hi = min(values), max(values)
+        pad = max(abs(lo)*.02, 1) if lo == hi else (hi-lo)*.1
+        chart.setYRange(lo-pad, hi+pad, padding=0)
     else:
-        kd = technical_data.get("kd", {})
-        values += _plot_technical_series(chart, dates, kd.get("k"), "#1f77b4", "K")
-        values += _plot_technical_series(chart, dates, kd.get("d"), "#d62728", "D")
-        chart.setLabel("left", "數值", color=COLOR_TEXT)
-        chart.setTitle("KD（9／3／3）", color=COLOR_TEXT, size="11pt")
-        chart.addLine(y=80, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine))
-        chart.addLine(y=20, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine))
-
-    chart.setLabel("bottom", "交易日", color=COLOR_TEXT)
-    if x:
-        chart.setXRange(min(x), max(x), padding=0.02)
-    if mode == "kd":
-        chart.setYRange(0, 100, padding=0.02)
-    elif values:
-        y_lo, y_hi = min(values), max(values)
-        if y_lo == y_hi:
-            pad = max(abs(y_lo) * 0.02, 1.0)
-            y_lo -= pad
-            y_hi += pad
-        chart.setYRange(y_lo, y_hi, padding=0.12)
+        chart.setYRange(0, 1)
+        empty = pg.TextItem("資料不足：缺少必要欄位或尚未滿計算期數", color=COLOR_MUTED)
+        chart.addItem(empty)
+        empty.setPos(0,.5)
 
 
 class TechnicalAnalysisWidget(QtWidgets.QWidget):
@@ -1978,21 +1966,27 @@ class TechnicalAnalysisWidget(QtWidgets.QWidget):
         controls = QtWidgets.QHBoxLayout()
         controls.addWidget(QtWidgets.QLabel("指標："))
         self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItem("KD", "kd")
-        self.mode_combo.addItem("MACD", "macd")
-        self.mode_combo.addItem("均線", "ma")
+        catalog = calculate_indicators([dict(date="sample", close=1)])["charts"]
+        for key, spec in catalog.items():
+            self.mode_combo.addItem(spec["title"], key)
         self.mode_combo.currentIndexChanged.connect(self._refresh_chart)
         controls.addWidget(self.mode_combo)
+        self.range_combo = QtWidgets.QComboBox()
+        for title, count in (("全部歷史", 0), ("近60筆", 60), ("近120筆", 120), ("近240筆", 240)):
+            self.range_combo.addItem(title, count)
+        self.range_combo.currentIndexChanged.connect(self._refresh_chart)
+        controls.addWidget(self.range_combo)
         self.latest_label = QtWidgets.QLabel("")
         self.latest_label.setProperty("muted", True)
-        controls.addWidget(self.latest_label)
+        self.latest_label.setWordWrap(True)
+        layout.addWidget(self.latest_label)
         controls.addStretch(1)
         layout.addLayout(controls)
 
         self.chart = pg.PlotWidget()
         self.chart.setBackground(COLOR_SURFACE)
         self.chart.showGrid(x=True, y=True, alpha=0.08)
-        self.chart.setMinimumHeight(320)
+        self.chart.setMinimumHeight(240)
         self.chart.addLegend()
         layout.addWidget(self.chart, 1)
         self._technical_data = None
@@ -2003,37 +1997,30 @@ class TechnicalAnalysisWidget(QtWidgets.QWidget):
 
     def _refresh_chart(self):
         mode = self.mode_combo.currentData()
-        _populate_technical_chart(self.chart, self._technical_data, mode)
+        data = self._technical_data
+        count = self.range_combo.currentData()
+        if data and count:
+            data = {**data, "dates": data["dates"][-count:], "charts": {
+                key: {**spec, "series": {name: values[-count:] for name, values in spec["series"].items()}}
+                for key, spec in data.get("charts", {}).items()
+            }}
+        _populate_technical_chart(self.chart, data, mode)
         self.latest_label.setText(self._latest_text(mode))
 
     def _latest_text(self, mode):
         data = self._technical_data
         if not data:
             return "資料不足"
-        if mode == "macd":
-            group = data.get("macd", {})
-            return (
-                f"MACD {self._last(group.get('macd'))}　"
-                f"Signal {self._last(group.get('signal'))}　"
-                f"柱體 {self._last(group.get('histogram'))}"
-            )
-        if mode == "ma":
-            ma = data.get("ma", {})
-            return (
-                f"收盤 {self._last(data.get('close'))}　"
-                f"MA5 {self._last(ma.get('ma5'))}　"
-                f"MA20 {self._last(ma.get('ma20'))}　"
-                f"MA60 {self._last(ma.get('ma60'))}"
-            )
-        kd = data.get("kd", {})
-        return f"K {self._last(kd.get('k'))}　D {self._last(kd.get('d'))}"
+        spec = data.get("charts", {}).get(mode, {})
+        latest = "　".join(f"{name} {self._last(series)}" for name, series in spec.get("series", {}).items())
+        dates = data.get("dates", [])
+        return f"{dates[0]} ～ {dates[-1]}｜{len(dates)} 筆日線｜{latest}" if dates else "資料不足"
 
     @staticmethod
     def _last(values):
-        for value in reversed(values or []):
-            if value is not None:
-                return f"{value:.2f}"
-        return "N/A"
+        value = values[-1] if values else None
+        return f"{value:.2f}" if value is not None else "N/A"
+
 
 
 def _render_detail_block(
@@ -2171,7 +2158,7 @@ def _render_detail_block(
     _populate_vpt_chart(vpt_chart, data.get("vpt_mfi_history"))
     _populate_mfi_chart(mfi_chart, data.get("vpt_mfi_history"))
     if technical_widget is not None:
-        technical_widget.set_data(data.get("technical_indicators"))
+        technical_widget.set_data(calculate_indicators([dict(date=r["date"], open=r.get("open"), max=r.get("high"), min=r.get("low"), close=r.get("close"), Trading_Volume=r.get("volume"), Trading_money=r.get("trading_value")) for r in data.get("price_history", [])]) or data.get("technical_indicators"))
 
 
 class TradingCalendarWidget(QtWidgets.QCalendarWidget):
@@ -2260,13 +2247,14 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         都已經在背景執行緒做完，這裡不再重做一次，避免視窗建立過程又卡一次網路。"""
         super().__init__()
         self.setWindowTitle("tradingnote - 台股資金流向分析")
-        self.setMinimumSize(860, 600)
-        width, height = _screen_fit_size(self, ratio=0.85)
+        self.setMinimumSize(680, 480)
+        width, height = _screen_fit_size(self, ratio=0.88)
         self.resize(width, height)
         _center_on_screen(self)
 
         self.settings = load_settings(SETTINGS_PATH)
         self.positions = load_positions(POSITIONS_PATH)
+        initialize_journal(HISTORY_DB_PATH, self.positions)
         # 概念目錄在啟動時讀入一次；重建 concepts.json 後需重開程式，
         # 才會讓持股概念標籤與資金流向分類同時更新。
         self._concepts = load_concepts()
@@ -2297,43 +2285,100 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self._pending_data_date = None
         self._new_data_check_timer = None
 
-        central = QtWidgets.QWidget()
-        central_layout = QtWidgets.QVBoxLayout(central)
-        central_layout.setContentsMargins(18, 14, 18, 8)
-        central_layout.setSpacing(12)
-        heading = QtWidgets.QHBoxLayout()
-        brand = QtWidgets.QLabel("TradingNote")
-        brand.setObjectName("brandTitle")
-        heading.addWidget(brand)
-        subtitle = QtWidgets.QLabel("市場觀察 / 部位管理")
-        subtitle.setProperty("muted", True)
-        heading.addSpacing(12)
-        heading.addWidget(subtitle)
-        heading.addStretch()
-        central_layout.addLayout(heading)
-        self._build_new_data_banner(central_layout)
-
-        self.tabs = QtWidgets.QTabWidget()
-        central_layout.addWidget(self.tabs)
-        self.setCentralWidget(central)
-
         self.flow_tab = QtWidgets.QWidget()
         self.positions_tab = QtWidgets.QWidget()
+        self.journal_tab = QtWidgets.QWidget()
         self.stocks_tab = QtWidgets.QWidget()
         self.futures_tab = QtWidgets.QWidget()
         self.settings_tab = QtWidgets.QWidget()
-        # 資金流向分析先加入，成為預設頁；其餘依序是部位紀錄、個股、期貨、設定。
-        self.tabs.addTab(self.flow_tab, "資金流向分析")
-        self.tabs.addTab(self.positions_tab, "部位紀錄")
-        self.tabs.addTab(self.stocks_tab, "個股")
-        self.tabs.addTab(self.futures_tab, "期貨")
-        self.tabs.addTab(self.settings_tab, "設定")
+        # 主功能改用左側導覽列，頁面本體放進右側堆疊；各頁內的技術圖表分頁仍維持
+        # QTabWidget，讓主導覽與頁內切換有清楚的視覺層級。
+        self._page_specs = (
+            (self.flow_tab, "資金流向", "市場族群、排行與法人方向"),
+            (self.positions_tab, "部位紀錄", "持股損益與個股明細"),
+            (self.journal_tab, "交易週誌", "每週持股變化與交易筆記"),
+            (self.stocks_tab, "個股查詢", "全市場股票搜尋與基本資料"),
+            (self.futures_tab, "期貨行情", "期貨盤後與大額交易人部位"),
+            (self.settings_tab, "設定", "資料同步、回補與本機偏好"),
+        )
+
+        central = QtWidgets.QWidget()
+        shell_layout = QtWidgets.QHBoxLayout(central)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+        self._shell_layout = shell_layout
+
+        self.sidebar = QtWidgets.QFrame()
+        self.sidebar.setObjectName("sidebar")
+        sidebar_layout = QtWidgets.QVBoxLayout(self.sidebar)
+        self._sidebar_layout = sidebar_layout
+        sidebar_layout.setContentsMargins(10, 14, 10, 10)
+        sidebar_layout.setSpacing(10)
+
+        sidebar_header = QtWidgets.QFrame()
+        sidebar_header.setObjectName("sidebarHeader")
+        sidebar_header_layout = QtWidgets.QVBoxLayout(sidebar_header)
+        sidebar_header_layout.setContentsMargins(9, 2, 9, 6)
+        sidebar_header_layout.setSpacing(1)
+        brand = QtWidgets.QLabel("TradingNote")
+        brand.setObjectName("brandTitle")
+        sidebar_header_layout.addWidget(brand)
+        self.sidebar_subtitle = QtWidgets.QLabel("台股投資工作台")
+        self.sidebar_subtitle.setObjectName("sidebarSubtitle")
+        sidebar_header_layout.addWidget(self.sidebar_subtitle)
+        sidebar_layout.addWidget(sidebar_header)
+
+        self.main_navigation = QtWidgets.QListWidget()
+        self.main_navigation.setObjectName("mainNavigation")
+        self.main_navigation.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.main_navigation.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self.main_navigation.setSpacing(1)
+        sidebar_layout.addWidget(self.main_navigation, 1)
+
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
+        self._central_layout = content_layout
+        content_layout.setContentsMargins(18, 14, 18, 8)
+        content_layout.setSpacing(10)
+
+        heading = QtWidgets.QHBoxLayout()
+        heading.setSpacing(10)
+        title_block = QtWidgets.QVBoxLayout()
+        title_block.setSpacing(1)
+        self.page_title = QtWidgets.QLabel()
+        self.page_title.setObjectName("pageTitle")
+        self.page_subtitle = QtWidgets.QLabel()
+        self.page_subtitle.setProperty("muted", True)
+        title_block.addWidget(self.page_title)
+        title_block.addWidget(self.page_subtitle)
+        heading.addLayout(title_block)
+        heading.addStretch()
+        content_layout.addLayout(heading)
+        self._build_new_data_banner(content_layout)
+
+        self.page_stack = QtWidgets.QStackedWidget()
+        self.page_stack.setObjectName("mainPageStack")
+        for page, label, description in self._page_specs:
+            self.page_stack.addWidget(page)
+            item = QtWidgets.QListWidgetItem(label)
+            item.setToolTip(description)
+            item.setSizeHint(QtCore.QSize(0, 44))
+            self.main_navigation.addItem(item)
+        content_layout.addWidget(self.page_stack, 1)
+        shell_layout.addWidget(self.sidebar)
+        shell_layout.addWidget(content, 1)
+        self.setCentralWidget(central)
+
+        self.main_navigation.currentRowChanged.connect(self._set_main_page)
+        self.main_navigation.setCurrentRow(0)
 
         self._build_flow_tab()
         self._build_positions_tab()
+        self._build_journal_tab()
         self._build_stocks_tab()
         self._build_futures_tab()
         self._build_settings_tab()
+        self._apply_responsive_density()
 
         self.status_bar = QtWidgets.QStatusBar()
         self.status_bar.setSizeGripEnabled(False)
@@ -2370,6 +2415,64 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self._new_data_check_timer.timeout.connect(self._check_for_new_data)
         self._new_data_check_timer.start(NEW_DATA_CHECK_INTERVAL_MS)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_responsive_density()
+
+    def _set_main_page(self, index):
+        """同步左側導覽、右側頁面與頁首說明。"""
+        if not 0 <= index < len(self._page_specs):
+            return
+        self.page_stack.setCurrentIndex(index)
+        _page, title, description = self._page_specs[index]
+        self.page_title.setText(title)
+        self.page_subtitle.setText(description)
+
+    def _apply_responsive_density(self):
+        """依可用視窗切換版面密度；只在跨過門檻時更新，拖曳視窗不會反覆重排。"""
+        if not hasattr(self, "_central_layout"):
+            return
+        compact = self.width() < 1080 or self.height() < 700
+        if getattr(self, "_compact_layout", None) == compact:
+            return
+        self._compact_layout = compact
+
+        margin_x, margin_top, spacing = (10, 8, 8) if compact else (18, 14, 12)
+        self._central_layout.setContentsMargins(margin_x, margin_top, margin_x, 6)
+        self._central_layout.setSpacing(spacing)
+        if hasattr(self, "sidebar"):
+            self.sidebar.setFixedWidth(164 if compact else 218)
+            self._sidebar_layout.setContentsMargins(7 if compact else 10, 8 if compact else 14, 7 if compact else 10, 8)
+            self.sidebar_subtitle.setVisible(not compact)
+            item_height = 40 if compact else 44
+            for row in range(self.main_navigation.count()):
+                self.main_navigation.item(row).setSizeHint(QtCore.QSize(0, item_height))
+        elif hasattr(self, "tabs"):
+            # 測試用的精簡 journal harness 仍以 QTabWidget 提供 icon size API。
+            self.tabs.setIconSize(QtCore.QSize(24 if compact else 22, 24 if compact else 22))
+
+        if hasattr(self, "journal_layout"):
+            journal_margin = 6 if compact else 10
+            self.journal_layout.setContentsMargins(
+                journal_margin, journal_margin, journal_margin, journal_margin
+            )
+            self.journal_layout.setSpacing(7 if compact else 10)
+            self.journal_previous_button.setText("上週" if compact else "上一週")
+            self.journal_today_button.setText("本週" if compact else "回到本週")
+            self.journal_next_button.setText("下週" if compact else "下一週")
+            self.journal_jump_label.setVisible(not compact)
+            self.journal_date_edit.setDisplayFormat("MM-dd" if compact else "yyyy-MM-dd")
+            card_height = 132 if compact else 164
+            card_min_width = 64 if compact else 92
+            for card in self.journal_cards:
+                card.setFixedHeight(card_height)
+                card.setMinimumWidth(card_min_width)
+            if self.journal_days:
+                self._refresh_journal_week()
+
+        if hasattr(self, "stock_search_hint"):
+            self.stock_search_hint.setVisible(not compact)
+
     # ---------- 「有新資料可更新」提示 ----------
     # 背景每隔 NEW_DATA_CHECK_INTERVAL_MS 用不強制的 get_market_snapshot 檢查一次
     # TWSE／TPEX 目前發布的資料屬於哪個交易日；發現比畫面上顯示的還新（且不是使用者
@@ -2387,12 +2490,13 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.new_data_banner_label = QtWidgets.QLabel("")
         banner_layout.addWidget(self.new_data_banner_label)
         banner_layout.addStretch(1)
-        banner_layout.addWidget(
-            QtWidgets.QPushButton("立即更新", clicked=self._apply_new_data_now)
-        )
-        banner_layout.addWidget(
-            QtWidgets.QPushButton("✕", clicked=self._dismiss_new_data_banner)
-        )
+        refresh_button = QtWidgets.QPushButton("立即更新", clicked=self._apply_new_data_now)
+        _set_standard_icon(refresh_button, QtWidgets.QStyle.SP_BrowserReload, "更新最新資料")
+        banner_layout.addWidget(refresh_button)
+        close_button = QtWidgets.QPushButton(clicked=self._dismiss_new_data_banner)
+        _set_standard_icon(close_button, QtWidgets.QStyle.SP_DialogCloseButton, "關閉提示")
+        close_button.setAccessibleName("關閉提示")
+        banner_layout.addWidget(close_button)
         container_layout.addWidget(self.new_data_banner)
 
     def _check_for_new_data(self):
@@ -2453,6 +2557,11 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         toolbar = QtWidgets.QHBoxLayout()
         toolbar.addWidget(QtWidgets.QLabel("流向區間："))
         self.flow_date_button = QtWidgets.QPushButton()
+        _set_standard_icon(
+            self.flow_date_button,
+            QtWidgets.QStyle.SP_FileDialogDetailedView,
+            "選擇流向區間",
+        )
         self.flow_date_button.clicked.connect(self._open_flow_date_picker)
         toolbar.addWidget(self.flow_date_button)
 
@@ -2550,35 +2659,29 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.flow_section_buttons[0].setChecked(True)
 
     def _build_institutional_direction_section(self, layout):
-        header_row = QtWidgets.QHBoxLayout()
-        header = QtWidgets.QLabel("三大法人族群調整方向")
-        header.setProperty("header", True)
+        card = SectionCard(
+            title="三大法人族群調整方向",
+            description=(
+                "每張圖獨立顯示該法人的前八大族群：右側為買超、左側為賣超。"
+                "方向採交易所實際淨買賣股數，淨額以當日收盤價估算。"
+            ),
+        )
         self.institutional_direction_date_label = QtWidgets.QLabel("資料尚未載入")
         self.institutional_direction_date_label.setProperty("muted", True)
-        header_row.addWidget(header)
-        header_row.addStretch(1)
-        header_row.addWidget(self.institutional_direction_date_label)
-        layout.addLayout(header_row)
-
-        hint = QtWidgets.QLabel(
-            "每張圖獨立顯示該法人的前八大族群：右側為買超、左側為賣超。"
-            "方向採交易所實際淨買賣股數，淨額以當日收盤價估算。"
-        )
-        hint.setProperty("muted", True)
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        card.header_row.addWidget(self.institutional_direction_date_label)
 
         chart_row = QtWidgets.QHBoxLayout()
         chart_row.setSpacing(8)
         self.institutional_direction_charts = []
         for _title in ("外資", "投信", "自營商"):
             chart = pg.PlotWidget()
-            chart.setBackground(COLOR_SURFACE)
+            chart.setBackground(COLOR_CARD_BG)
             chart.showGrid(x=True, y=False, alpha=0.08)
-            chart.setMinimumSize(260, 370)
+            chart.setMinimumSize(180, 260)
             chart_row.addWidget(chart, 1)
             self.institutional_direction_charts.append(chart)
-        layout.addLayout(chart_row, 1)
+        card.body_layout.addLayout(chart_row, 1)
+        layout.addWidget(card, 1)
 
     def _refresh_institutional_direction(self, dashboard):
         rows = dashboard.institutional_flow
@@ -2603,32 +2706,36 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.flow_chart_header)
         summary_row = QtWidgets.QHBoxLayout()
         summary_row.setSpacing(8)
-        self.flow_summary_labels = []
+        self.flow_summary_cards = []
         for title in ("今日偏流入", "今日偏流出", "成交最活躍"):
-            card = QtWidgets.QFrame()
-            card.setProperty("summaryCard", True)
-            card_layout = QtWidgets.QVBoxLayout(card)
-            card_layout.setContentsMargins(12, 8, 12, 8)
-            caption = QtWidgets.QLabel(title)
-            caption.setProperty("muted", True)
-            value = QtWidgets.QLabel("—")
-            value.setProperty("metricValue", True)
-            card_layout.addWidget(caption)
-            card_layout.addWidget(value)
+            card = StatCard(title=title)
             summary_row.addWidget(card, 1)
-            self.flow_summary_labels.append(value)
+            self.flow_summary_cards.append(card)
         layout.addLayout(summary_row)
+        layout.addSpacing(8)
+
+        self.flow_insight_card = InsightCard("資料載入中...", tone="neutral")
+        layout.addWidget(self.flow_insight_card)
         layout.addSpacing(4)
+
+        legend_row = QtWidgets.QHBoxLayout()
+        legend_row.setSpacing(6)
+        legend_row.addWidget(SignalBadge("偏流入", tone="positive"))
+        legend_row.addWidget(SignalBadge("偏流出", tone="negative"))
+        legend_row.addWidget(SignalBadge("中性", tone="neutral"))
+        legend_row.addStretch(1)
+        layout.addLayout(legend_row)
+        layout.addSpacing(4)
+
         self.flow_chart_hint = QtWidgets.QLabel(
-            "綠色＝當日量價偏流入，紅色＝偏流出，灰色＝中性；"
-            "標示成交佔比前五大族群，滑鼠移至泡泡查看數值。"
+            "顏色＝當日量價方向（見上方圖例）；標示成交佔比前五大族群，滑鼠移至泡泡查看數值。"
         )
         self.flow_chart_hint.setProperty("muted", True)
         self.flow_chart_hint.setWordWrap(True)
         layout.addWidget(self.flow_chart_hint)
         layout.addSpacing(8)
         self.flow_chart = FlowChartWidget()
-        self.flow_chart.setMinimumHeight(380)
+        self.flow_chart.setMinimumHeight(280)
         layout.addWidget(self.flow_chart, 1)
 
     def _update_flow_date_button(self):
@@ -2727,16 +2834,16 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             key=lambda row: row.turnover_ratio,
             default=None,
         )
-        self.flow_summary_labels[0].setText(f"{len(inflow)} 個族群")
-        self.flow_summary_labels[0].setStyleSheet(f"color: {COLOR_GAIN};")
-        self.flow_summary_labels[1].setText(f"{len(outflow)} 個族群")
-        self.flow_summary_labels[1].setStyleSheet(f"color: {COLOR_LOSS};")
+        self.flow_summary_cards[0].set_value(f"{len(inflow)} 個族群", status="positive")
+        self.flow_summary_cards[1].set_value(f"{len(outflow)} 個族群", status="negative")
         if active is None:
-            self.flow_summary_labels[2].setText("—")
+            self.flow_summary_cards[2].set_value("—")
         else:
-            self.flow_summary_labels[2].setText(
+            self.flow_summary_cards[2].set_value(
                 f"{active.industry}　{active.turnover_ratio:.2f}×"
             )
+        headline, detail, tone = _flow_momentum_insight(rows)
+        self.flow_insight_card.set_content(headline, detail=detail, tone=tone)
 
     def _show_industry_top_stocks(self, industry):
         period = self.flow_period
@@ -2876,7 +2983,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             for col in (0, 2, 3, 4, 5, 6, 7, 8, 9, 10):
                 item.setTextAlignment(col, QtCore.Qt.AlignCenter)
             if f.avg_change_pct is not None:
-                color = COLOR_GAIN if f.avg_change_pct >= 0 else COLOR_LOSS
+                color = gain_loss_color(f.avg_change_pct)
                 item.setForeground(5, QtGui.QColor(color))
             else:
                 item.setForeground(5, QtGui.QColor(COLOR_MUTED))
@@ -2965,7 +3072,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             for col in (0, 1, 3, 4, 5, 6, 7, 8):
                 item.setTextAlignment(col, QtCore.Qt.AlignCenter)
             if stock.change_pct is not None:
-                color = COLOR_GAIN if stock.change_pct >= 0 else COLOR_LOSS
+                color = gain_loss_color(stock.change_pct)
                 item.setForeground(6, QtGui.QColor(color))
             self.stock_capital_flow_list.addTopLevelItem(item)
 
@@ -3066,7 +3173,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
                 item.setTextAlignment(col, QtCore.Qt.AlignCenter)
             item.setForeground(0, QtGui.QColor(tier_colors[o.tier]))
             if o.change_pct is not None:
-                color = COLOR_GAIN if o.change_pct >= 0 else COLOR_LOSS
+                color = gain_loss_color(o.change_pct)
                 item.setForeground(5, QtGui.QColor(color))
             self.volume_outliers_list.addTopLevelItem(item)
         self.volume_outliers_list.setSortingEnabled(True)
@@ -3173,10 +3280,18 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(10, 10, 10, 10)
 
         toolbar = QtWidgets.QHBoxLayout()
-        toolbar.addWidget(accent_button("新增部位", self.open_add_dialog))
-        toolbar.addWidget(QtWidgets.QPushButton("編輯部位", clicked=self.open_edit_dialog))
-        toolbar.addWidget(QtWidgets.QPushButton("刪除部位", clicked=self.delete_selected))
-        toolbar.addWidget(QtWidgets.QPushButton("查價", clicked=self.open_price_dialog))
+        add_button = accent_button("新增部位", self.open_add_dialog)
+        _set_standard_icon(add_button, QtWidgets.QStyle.SP_FileDialogNewFolder, "新增部位")
+        toolbar.addWidget(add_button)
+        edit_button = QtWidgets.QPushButton("編輯部位", clicked=self.open_edit_dialog)
+        _set_standard_icon(edit_button, QtWidgets.QStyle.SP_FileDialogDetailedView, "編輯部位")
+        toolbar.addWidget(edit_button)
+        delete_button = QtWidgets.QPushButton("刪除部位", clicked=self.delete_selected)
+        _set_standard_icon(delete_button, QtWidgets.QStyle.SP_TrashIcon, "刪除選取部位")
+        toolbar.addWidget(delete_button)
+        price_button = QtWidgets.QPushButton("查價", clicked=self.open_price_dialog)
+        _set_standard_icon(price_button, QtWidgets.QStyle.SP_FileDialogInfoView, "查詢股價")
+        toolbar.addWidget(price_button)
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
 
@@ -3239,7 +3354,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         ):
             chart.setBackground(COLOR_SURFACE)
             chart.showGrid(x=True, y=True, alpha=0.08)
-            chart.setMinimumHeight(320)
+            chart.setMinimumHeight(240)
             chart.addLegend()
         _setup_price_chart_click(self.position_price_chart)
 
@@ -3285,7 +3400,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
                 current_price = f"{pnl.current_price:.2f}"
                 pnl_amt = f"{pnl.unrealized_pnl:+.0f}"
                 pnl_pct = f"{pnl.pnl_pct:+.2f}%"
-                color = COLOR_GAIN if pnl.unrealized_pnl >= 0 else COLOR_LOSS
+                color = gain_loss_color(pnl.unrealized_pnl)
                 equity_value = f"{pnl.current_value:,.0f}"
                 total_pnl += pnl.unrealized_pnl
                 has_pnl = True
@@ -3317,6 +3432,10 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
                 self.table.setItem(row_index, col, item)
 
         save_positions(POSITIONS_PATH, self.positions)
+        save_portfolio_snapshot(HISTORY_DB_PATH, date.today().isoformat(), self.positions)
+        if hasattr(self, "journal_cards"):
+            self._save_journal_if_dirty()
+            self._refresh_journal_week()
         self._total_pnl = total_pnl if has_pnl else None
         self._update_status_bar()
 
@@ -3537,6 +3656,333 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self._refresh_data_freshness_label()
         self._refresh_history_status()
 
+    # ---------- 交易週誌 ----------
+
+    def _build_journal_tab(self):
+        layout = QtWidgets.QVBoxLayout(self.journal_tab)
+        self.journal_layout = layout
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+
+        today = date.today()
+        self.journal_week_start = today - timedelta(days=today.weekday())
+        self.journal_selected_date = today.isoformat()
+        self.journal_days = {}
+        self.journal_dirty = False
+        self._journal_loading = False
+
+        toolbar = QtWidgets.QHBoxLayout()
+        toolbar.setSpacing(6)
+        self.journal_previous_button = QtWidgets.QPushButton(
+            "上一週", clicked=self._journal_previous_week
+        )
+        _set_standard_icon(
+            self.journal_previous_button, QtWidgets.QStyle.SP_ArrowLeft, "查看上一週"
+        )
+        toolbar.addWidget(self.journal_previous_button)
+        self.journal_today_button = QtWidgets.QPushButton("回到本週", clicked=self._journal_current_week)
+        _set_standard_icon(
+            self.journal_today_button, QtWidgets.QStyle.SP_DirHomeIcon, "回到本週"
+        )
+        toolbar.addWidget(self.journal_today_button)
+        self.journal_next_button = QtWidgets.QPushButton("下一週", clicked=self._journal_next_week)
+        _set_standard_icon(
+            self.journal_next_button, QtWidgets.QStyle.SP_ArrowRight, "查看下一週"
+        )
+        toolbar.addWidget(self.journal_next_button)
+        toolbar.addSpacing(12)
+        self.journal_week_label = QtWidgets.QLabel()
+        self.journal_week_label.setProperty("header", True)
+        toolbar.addWidget(self.journal_week_label)
+        toolbar.addStretch(1)
+        self.journal_jump_label = QtWidgets.QLabel("跳到日期")
+        toolbar.addWidget(self.journal_jump_label)
+        self.journal_date_edit = QtWidgets.QDateEdit()
+        self.journal_date_edit.setCalendarPopup(True)
+        self.journal_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.journal_date_edit.setMaximumDate(QtCore.QDate.currentDate())
+        self.journal_date_edit.setDate(QtCore.QDate.currentDate())
+        self.journal_date_edit.dateChanged.connect(self._journal_jump_to_date)
+        toolbar.addWidget(self.journal_date_edit)
+        layout.addLayout(toolbar)
+
+        hint = QtWidgets.QLabel(
+            "每日金額變化＝股數 ×（當日收盤－前一交易日收盤）；週一通常與前週五比較。"
+            "這是整日價格變化，不代表盤中實際成交損益。"
+        )
+        hint.setProperty("muted", True)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        cards_widget = QtWidgets.QWidget()
+        cards_layout = QtWidgets.QGridLayout(cards_widget)
+        cards_layout.setContentsMargins(0, 0, 0, 0)
+        cards_layout.setSpacing(6)
+        self.journal_card_group = QtWidgets.QButtonGroup(self)
+        self.journal_card_group.setExclusive(True)
+        self.journal_cards = []
+        for index in range(7):
+            card = QtWidgets.QPushButton()
+            card.setCheckable(True)
+            card.setMinimumHeight(164)
+            card.setMinimumWidth(92)
+            card.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
+            card.clicked.connect(
+                lambda _checked, day_index=index: self._select_journal_day_index(day_index)
+            )
+            self.journal_card_group.addButton(card, index)
+            self.journal_cards.append(card)
+            cards_layout.addWidget(card, 0, index)
+            cards_layout.setColumnStretch(index, 1)
+        layout.addWidget(cards_widget)
+
+        detail_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        holdings_panel = QtWidgets.QWidget()
+        holdings_layout = QtWidgets.QVBoxLayout(holdings_panel)
+        holdings_layout.setContentsMargins(0, 0, 6, 0)
+        self.journal_detail_title = QtWidgets.QLabel()
+        self.journal_detail_title.setProperty("header", True)
+        holdings_layout.addWidget(self.journal_detail_title)
+        self.journal_source_label = QtWidgets.QLabel()
+        self.journal_source_label.setProperty("muted", True)
+        self.journal_source_label.setWordWrap(True)
+        holdings_layout.addWidget(self.journal_source_label)
+        self.journal_holdings_table = QtWidgets.QTableWidget(0, 6)
+        self.journal_holdings_table.setHorizontalHeaderLabels(
+            ["代號", "名稱", "股數", "收盤", "漲跌%", "金額變化"]
+        )
+        self.journal_holdings_table.verticalHeader().setVisible(False)
+        self.journal_holdings_table.setAlternatingRowColors(True)
+        self.journal_holdings_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        journal_header = self.journal_holdings_table.horizontalHeader()
+        journal_header.setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        journal_header.setMinimumSectionSize(54)
+        holdings_layout.addWidget(self.journal_holdings_table, 1)
+
+        editor_panel = QtWidgets.QWidget()
+        editor_layout = QtWidgets.QVBoxLayout(editor_panel)
+        editor_layout.setContentsMargins(6, 0, 0, 0)
+        editor_header = QtWidgets.QLabel("交易日誌")
+        editor_header.setProperty("header", True)
+        editor_layout.addWidget(editor_header)
+        editor_hint = QtWidgets.QLabel("自由記錄交易心情、犯錯的地方與當日體悟。")
+        editor_hint.setProperty("muted", True)
+        editor_layout.addWidget(editor_hint)
+        self.journal_note_edit = QtWidgets.QPlainTextEdit()
+        self.journal_note_edit.setPlaceholderText(
+            "今天做得如何？當下的心情是什麼？\n有哪些錯誤、值得保留的判斷或新的體悟？"
+        )
+        self.journal_note_edit.textChanged.connect(self._on_journal_note_changed)
+        editor_layout.addWidget(self.journal_note_edit, 1)
+        save_row = QtWidgets.QHBoxLayout()
+        self.journal_save_status = QtWidgets.QLabel("")
+        self.journal_save_status.setProperty("muted", True)
+        save_row.addWidget(self.journal_save_status)
+        save_row.addStretch(1)
+        self.journal_save_button = accent_button("儲存日誌", self._save_journal_clicked)
+        _set_standard_icon(
+            self.journal_save_button, QtWidgets.QStyle.SP_DialogSaveButton, "儲存交易日誌 (Ctrl+S)"
+        )
+        save_row.addWidget(self.journal_save_button)
+        editor_layout.addLayout(save_row)
+
+        detail_splitter.addWidget(holdings_panel)
+        detail_splitter.addWidget(editor_panel)
+        detail_splitter.setStretchFactor(0, 3)
+        detail_splitter.setStretchFactor(1, 2)
+        layout.addWidget(detail_splitter, 1)
+
+        save_shortcut = QtGui.QShortcut(QtGui.QKeySequence.Save, self.journal_tab)
+        save_shortcut.activated.connect(self._save_journal_clicked)
+        self._journal_save_shortcut = save_shortcut
+        self._refresh_journal_week()
+
+    @staticmethod
+    def _journal_money(value):
+        return "N/A" if value is None else f"{value:+,.0f}"
+
+    def _refresh_journal_week(self):
+        week = load_week(
+            HISTORY_DB_PATH,
+            self.journal_week_start,
+            self.positions,
+        )
+        self.journal_days = {day.date: day for day in week}
+        end = self.journal_week_start + timedelta(days=6)
+        if getattr(self, "_compact_layout", False):
+            week_text = f"{self.journal_week_start:%m/%d}－{end:%m/%d}"
+        else:
+            week_text = f"{self.journal_week_start:%Y/%m/%d}－{end:%Y/%m/%d}"
+        self.journal_week_label.setText(week_text)
+        current_week = date.today() - timedelta(days=date.today().weekday())
+        self.journal_next_button.setEnabled(self.journal_week_start < current_week)
+        weekday_names = ("週一", "週二", "週三", "週四", "週五", "週六", "週日")
+        for index, (card, day) in enumerate(zip(self.journal_cards, week)):
+            is_future = day.date > date.today().isoformat()
+            card.setEnabled(not is_future)
+            card.setProperty("journalDate", day.date)
+            moves = sorted(
+                (move for move in day.holdings if move.change_amount is not None),
+                key=lambda move: abs(move.change_amount),
+                reverse=True,
+            )[:3]
+            if is_future:
+                summary = "未來日期"
+            elif not day.market_open:
+                summary = "休市／無行情"
+            elif not day.holdings:
+                summary = "無持股"
+            else:
+                prefix = "約 " if day.holding_source == "estimated" else ""
+                summary = f"合計 {prefix}{self._journal_money(day.total_change_amount)}"
+            lines = [weekday_names[index], day.date[5:], summary]
+            lines.extend(
+                f"{move.ticker} {move.change_pct:+.2f}% {move.change_amount:+,.0f}"
+                for move in moves
+            )
+            first_note_line = next(
+                (line.strip() for line in day.note.splitlines() if line.strip()), ""
+            )
+            if first_note_line:
+                lines.append("✎ " + first_note_line[:22] + ("…" if len(first_note_line) > 22 else ""))
+            card.setText("\n".join(lines))
+            color = (
+                COLOR_GAIN if day.total_change_amount is not None and day.total_change_amount > 0
+                else COLOR_LOSS if day.total_change_amount is not None and day.total_change_amount < 0
+                else COLOR_MUTED
+            )
+            checked = day.date == self.journal_selected_date
+            card.setChecked(checked)
+            card.setStyleSheet(
+                "QPushButton { text-align:left; padding:9px; "
+                f"font-size:{10 if getattr(self, '_compact_layout', False) else 11}px; "
+                f"color:{color}; border:1px solid {COLOR_BORDER}; background:{COLOR_SURFACE}; }}"
+                f"QPushButton:checked {{ border:2px solid {COLOR_ACCENT}; background:{COLOR_SELECTED_BG}; }}"
+                f"QPushButton:disabled {{ background:{COLOR_DISABLED_BG}; color:{COLOR_DISABLED_TEXT}; }}"
+            )
+        if self.journal_selected_date not in self.journal_days:
+            self.journal_selected_date = self.journal_week_start.isoformat()
+        self._render_journal_day()
+
+    def _render_journal_day(self):
+        day = self.journal_days.get(self.journal_selected_date)
+        if day is None:
+            return
+        selected_date = date.fromisoformat(day.date)
+        self.journal_detail_title.setText(f"{day.date}　持股漲跌明細")
+        if day.holding_source == "estimated":
+            source = "估算持股：依目前持股與進場日回推，過去加減碼及已賣出股票可能未包含。"
+        elif day.holding_source == "future":
+            source = "未來日期不提供持股與日誌編輯。"
+        elif day.snapshot_date == day.date:
+            source = f"已記錄持股快照：{day.snapshot_date}"
+        else:
+            source = f"持股沿用最近快照：{day.snapshot_date or '尚無快照'}"
+        if not day.market_open and day.holding_source != "future":
+            source += "　｜　休市或尚無當日行情。"
+        self.journal_source_label.setText(source)
+
+        self.journal_holdings_table.setRowCount(len(day.holdings))
+        for row, move in enumerate(day.holdings):
+            values = (
+                move.ticker,
+                move.name or "-",
+                f"{move.shares:,}",
+                "N/A" if move.close is None else f"{move.close:.2f}",
+                "N/A" if move.change_pct is None else f"{move.change_pct:+.2f}%",
+                self._journal_money(move.change_amount),
+            )
+            for column, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                if column in (0, 2, 3, 4, 5):
+                    item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+                if column in (4, 5) and move.change_amount is not None:
+                    item.setForeground(
+                        QtGui.QColor(gain_loss_color(move.change_amount))
+                    )
+                self.journal_holdings_table.setItem(row, column, item)
+
+        self._journal_loading = True
+        self.journal_note_edit.setPlainText(day.note)
+        self._journal_loading = False
+        editable = selected_date <= date.today()
+        self.journal_note_edit.setEnabled(editable)
+        self.journal_save_button.setEnabled(editable)
+        self.journal_dirty = False
+        self.journal_save_status.setText("已儲存" if day.note else "尚無日誌")
+
+    def _select_journal_day_index(self, index):
+        self._save_journal_if_dirty()
+        self.journal_selected_date = (
+            self.journal_week_start + timedelta(days=index)
+        ).isoformat()
+        self._refresh_journal_week()
+
+    def _on_journal_note_changed(self):
+        if self._journal_loading:
+            return
+        self.journal_dirty = True
+        self.journal_save_status.setText("尚未儲存")
+
+    def _save_journal_if_dirty(self):
+        if not getattr(self, "journal_dirty", False):
+            return
+        if self.journal_selected_date > date.today().isoformat():
+            return
+        save_journal_entry(
+            HISTORY_DB_PATH,
+            self.journal_selected_date,
+            self.journal_note_edit.toPlainText(),
+        )
+        self.journal_dirty = False
+        self.journal_save_status.setText("已儲存")
+
+    def _save_journal_clicked(self):
+        if self.journal_selected_date > date.today().isoformat():
+            return
+        if self.journal_selected_date == date.today().isoformat():
+            save_portfolio_snapshot(HISTORY_DB_PATH, self.journal_selected_date, self.positions)
+        save_journal_entry(
+            HISTORY_DB_PATH,
+            self.journal_selected_date,
+            self.journal_note_edit.toPlainText(),
+        )
+        self.journal_dirty = False
+        self._refresh_journal_week()
+        self.journal_save_status.setText("已儲存")
+
+    def _set_journal_week(self, target):
+        self._save_journal_if_dirty()
+        current_week = date.today() - timedelta(days=date.today().weekday())
+        target = min(target, current_week)
+        self.journal_week_start = target
+        self.journal_selected_date = (
+            date.today().isoformat() if target == current_week else target.isoformat()
+        )
+        blocker = QtCore.QSignalBlocker(self.journal_date_edit)
+        self.journal_date_edit.setDate(
+            QtCore.QDate.fromString(self.journal_selected_date, "yyyy-MM-dd")
+        )
+        del blocker
+        self._refresh_journal_week()
+
+    def _journal_previous_week(self):
+        self._set_journal_week(self.journal_week_start - timedelta(days=7))
+
+    def _journal_next_week(self):
+        self._set_journal_week(self.journal_week_start + timedelta(days=7))
+
+    def _journal_current_week(self):
+        today = date.today()
+        self._set_journal_week(today - timedelta(days=today.weekday()))
+
+    def _journal_jump_to_date(self, qdate):
+        target = date(qdate.year(), qdate.month(), qdate.day())
+        self._save_journal_if_dirty()
+        self.journal_week_start = target - timedelta(days=target.weekday())
+        self.journal_selected_date = target.isoformat()
+        self._refresh_journal_week()
+
     # ---------- 個股頁 ----------
 
     def _build_stocks_tab(self):
@@ -3547,8 +3993,12 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         toolbar.addWidget(QtWidgets.QLabel("搜尋"))
         self.stock_search_edit = QtWidgets.QLineEdit()
         self.stock_search_edit.setPlaceholderText("搜尋股票代號或名稱")
-        self.stock_search_edit.setMinimumWidth(210)
+        self.stock_search_edit.setMinimumWidth(160)
         self.stock_search_edit.setMaximumWidth(320)
+        self.stock_search_edit.addAction(
+            self.style().standardIcon(QtWidgets.QStyle.SP_FileDialogContentsView),
+            QtWidgets.QLineEdit.LeadingPosition,
+        )
         self.stock_search_edit.textChanged.connect(self._filter_stocks_tree)
         toolbar.addWidget(self.stock_search_edit)
 
@@ -3557,6 +4007,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             "改查 TPEX 官方端點；法人買賣不分市場皆為 FinMind）"
         )
         hint.setProperty("muted", True)
+        hint.setToolTip(hint.text())
+        self.stock_search_hint = hint
         toolbar.addWidget(hint)
         toolbar.addStretch(1)
 
@@ -3583,12 +4035,16 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         preview_caption.setProperty("muted", True)
         self.stock_preview_title = QtWidgets.QLabel("選取股票查看摘要")
         self.stock_preview_title.setProperty("header", True)
-        self.stock_preview_price = QtWidgets.QLabel("—")
-        self.stock_preview_price.setProperty("metricValue", True)
+        self.stock_preview_price = StatCard(bordered=False)
         self.stock_preview_meta = QtWidgets.QLabel("雙擊股票可開啟完整估值與法人資訊。")
         self.stock_preview_meta.setProperty("muted", True)
         self.stock_preview_meta.setWordWrap(True)
         self.stock_preview_button = accent_button("查看完整分析", self._open_selected_stock_detail)
+        _set_standard_icon(
+            self.stock_preview_button,
+            QtWidgets.QStyle.SP_FileDialogInfoView,
+            "開啟完整個股分析",
+        )
         self.stock_preview_button.setEnabled(False)
         preview_layout.addWidget(preview_caption)
         preview_layout.addWidget(self.stock_preview_title)
@@ -3706,8 +4162,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         ticker = item.data(0, QtCore.Qt.UserRole) if item is not None else None
         if not ticker:
             self.stock_preview_title.setText("選取股票查看摘要")
-            self.stock_preview_price.setText("—")
-            self.stock_preview_price.setStyleSheet("")
+            self.stock_preview_price.set_value("—")
             self.stock_preview_meta.setText("雙擊股票可開啟完整估值與法人資訊。")
             self.stock_preview_button.setEnabled(False)
             return
@@ -3719,18 +4174,16 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         if price is not None and price.close is not None:
             change_pct = _change_pct(price)
             change_text = f"{change_pct:+.2f}%" if change_pct is not None else "—"
-            self.stock_preview_price.setText(f"{price.close:,.2f}　{change_text}")
-            if change_pct is not None:
-                self.stock_preview_price.setStyleSheet(
-                    f"color: {COLOR_GAIN if change_pct >= 0 else COLOR_LOSS};"
-                )
+            status = None if change_pct is None else ("positive" if change_pct >= 0 else "negative")
+            self.stock_preview_price.set_value(
+                f"{price.close:,.2f}　{change_text}", status=status
+            )
             volume_text = f"{(price.volume or 0) / 1000:,.0f} 張"
             self.stock_preview_meta.setText(
                 f"{market} · {industry}\n成交量 {volume_text}\n資料日期 {price.date or '—'}"
             )
         else:
-            self.stock_preview_price.setText("暫無行情")
-            self.stock_preview_price.setStyleSheet("")
+            self.stock_preview_price.set_value("暫無行情")
             self.stock_preview_meta.setText(f"{market} · {industry}")
         self.stock_preview_button.setEnabled(True)
 
@@ -3762,8 +4215,12 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         toolbar.addWidget(QtWidgets.QLabel("搜尋"))
         self.futures_search_edit = QtWidgets.QLineEdit()
         self.futures_search_edit.setPlaceholderText("輸入代號／名稱，如 TX／台積電／2330／布蘭特")
-        self.futures_search_edit.setMinimumWidth(240)
+        self.futures_search_edit.setMinimumWidth(170)
         self.futures_search_edit.setMaximumWidth(320)
+        self.futures_search_edit.addAction(
+            self.style().standardIcon(QtWidgets.QStyle.SP_FileDialogContentsView),
+            QtWidgets.QLineEdit.LeadingPosition,
+        )
         self.futures_search_edit.textChanged.connect(self._filter_futures_table)
         toolbar.addWidget(self.futures_search_edit)
 
@@ -3983,8 +4440,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             item = QtWidgets.QTableWidgetItem(text)
             if col in (4, 5) and color:
                 item.setForeground(QtGui.QColor(color))
-            if col == 12 and lt_net is not None:  # 大額前10淨：正綠負紅
-                item.setForeground(QtGui.QColor(COLOR_GAIN if lt_net >= 0 else COLOR_LOSS))
+            if col == 12 and lt_net is not None:  # 大額前10淨：正紅負綠
+                item.setForeground(QtGui.QColor(gain_loss_color(lt_net)))
             self.futures_table.setItem(index, col, item)
 
     def refresh_futures_tab(self, force_refresh=False):
@@ -4083,10 +4540,11 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         # _apply_refresh_result 裡跟著一起刷新），拆開放在各分頁反而讓人以為
         # 是三個獨立的資料來源；集中在這裡＋下方即時顯示各類資料實際的最新日期，
         # 使用者才看得出「重新整理」到底有沒有真的抓到新資料。
-        layout.addWidget(
-            accent_button("重新整理所有資料", self.force_refresh),
-            alignment=QtCore.Qt.AlignLeft,
+        refresh_all_button = accent_button("重新整理所有資料", self.force_refresh)
+        _set_standard_icon(
+            refresh_all_button, QtWidgets.QStyle.SP_BrowserReload, "重新整理所有資料"
         )
+        layout.addWidget(refresh_all_button, alignment=QtCore.Qt.AlignLeft)
         layout.addSpacing(4)
 
         self.data_freshness_label = QtWidgets.QLabel("")
@@ -4194,6 +4652,21 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         不需要另外開背景執行緒。"""
         status = get_history_status(HISTORY_DB_PATH)
         self.history_status_label.setText(_format_history_status(status))
+
+    def closeEvent(self, event):
+        """離開前保存使用者正在編輯的週誌內容。"""
+        try:
+            if hasattr(self, "journal_note_edit"):
+                self._save_journal_if_dirty()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "週誌尚未儲存",
+                f"交易週誌儲存失敗：{exc}\n\n請先處理問題後再關閉程式。",
+            )
+            event.ignore()
+            return
+        event.accept()
 
 def main():
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
