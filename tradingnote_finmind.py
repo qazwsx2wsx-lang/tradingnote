@@ -225,8 +225,15 @@ def fetch_margin_short_sale_history(ticker, token, lookback_days=120):
     }
 
 
-def fetch_short_sale_balance(ticker, token, lookback_days=10):
-    """回傳最新交易日「借券賣出餘額」：{"date":, "balance":, "change":}。
+def fetch_short_sale_balance(ticker, token, lookback_days=120):
+    """回傳近 lookback_days 天「借券賣出餘額」逐日資料＋最新一天摘要：
+    {"date":, "balance":, "change":, "dates": [...], "series": {"借券賣出餘額": [...]}}。
+    "date"/"balance"/"change" 是既有呼叫端（文字摘要）在用的最新一天欄位，維持
+    不變；"dates"/"series" 是新增的，給趨勢圖用——這兩組資料本來就同一次 API
+    呼叫拿得到，只是舊版只挑最新一天、把其餘天數丟掉（lookback_days 預設值
+    也從 10 天拉長到 120 天，比照 fetch_margin_short_sale_history，實測 FinMind
+    免費額度在 120 天窗口內確實有約 85 個交易日的資料，不是只給最近幾天）。
+
     資料來源 TaiwanDailyShortSaleBalances 的 SBLShortSalesCurrentDayBalance
     （單位：股，不是張）——這是證券商辦理「有價證券借貸」讓人借去放空的餘額，
     跟融資融券（fetch_margin_short_sale_history 的「融券餘額」）是兩個不同的
@@ -237,12 +244,21 @@ def fetch_short_sale_balance(ticker, token, lookback_days=10):
     if not rows:
         return None
 
-    latest = max(rows, key=lambda r: r["date"])
+    rows = sorted(rows, key=lambda r: r["date"])
+    latest = rows[-1]
     balance = latest.get("SBLShortSalesCurrentDayBalance")
     if balance is None:
         return None
     previous = latest.get("SBLShortSalesPreviousDayBalance") or 0
-    return {"date": latest["date"], "balance": balance, "change": balance - previous}
+    return {
+        "date": latest["date"],
+        "balance": balance,
+        "change": balance - previous,
+        "dates": [r["date"] for r in rows],
+        "series": {
+            "借券賣出餘額": [r.get("SBLShortSalesCurrentDayBalance") or 0 for r in rows]
+        },
+    }
 
 
 def fetch_margin_cost_estimate(ticker, token, margin_lookback_days=120, price_lookback_days=150):
@@ -338,8 +354,16 @@ def fetch_foreign_shareholding(ticker, token, lookback_days=10):
     return {"date": latest["date"], "ratio": ratio, "change": change}
 
 
-def fetch_securities_lending_summary(ticker, token, lookback_days=10):
-    """回傳最新交易日借券成交彙總：{"date":, "volume":, "avg_fee_rate":}。
+def fetch_securities_lending_summary(ticker, token, lookback_days=120):
+    """回傳近 lookback_days 天借券成交彙總逐日資料＋最新一天摘要：
+    {"date":, "volume":, "avg_fee_rate":, "dates": [...], "series": {"借券成交量": [...]}}。
+    "date"/"volume"/"avg_fee_rate" 是既有呼叫端（文字摘要）在用的最新一天欄位，
+    維持不變；"dates"/"series" 是新增的每日成交量趨勢（張），給趨勢圖用——
+    lookback_days 預設值從 10 天拉長到 120 天，比照 fetch_margin_short_sale_history
+    （同一次 API 呼叫本來就抓得到這個區間，不是原本 10 天不夠、要多打 API）。
+    每日費率沒有一起做成序列：沒成交的日子費率沒有意義（會是 0 或 None 摻在一起
+    畫成線反而誤導），只有「最新一天」才需要顯示費率文字，這裡維持原樣。
+
     TaiwanStockSecuritiesLending 是逐筆成交資料（同一天可能有多筆不同費率的
     成交紀錄），volume 是當天全部成交量加總（張），avg_fee_rate 是用成交量
     加權的平均費率；當天總量為 0 時 avg_fee_rate 回傳 None（避免除以 0）。
@@ -348,18 +372,30 @@ def fetch_securities_lending_summary(ticker, token, lookback_days=10):
     if not rows:
         return None
 
-    latest_date = max(row["date"] for row in rows)
-    day_rows = [row for row in rows if row["date"] == latest_date]
-    total_volume = sum(row.get("volume") or 0 for row in day_rows)
+    dates = sorted(set(row["date"] for row in rows))
+    daily_volume = []
+    for day in dates:
+        day_rows = [row for row in rows if row["date"] == day]
+        daily_volume.append(sum(row.get("volume") or 0 for row in day_rows))
+
+    latest_date = dates[-1]
+    latest_rows = [row for row in rows if row["date"] == latest_date]
+    total_volume = daily_volume[-1]
 
     avg_fee_rate = None
     if total_volume > 0:
         weighted_fee = sum(
-            (row.get("volume") or 0) * (row.get("fee_rate") or 0) for row in day_rows
+            (row.get("volume") or 0) * (row.get("fee_rate") or 0) for row in latest_rows
         )
         avg_fee_rate = weighted_fee / total_volume
 
-    return {"date": latest_date, "volume": total_volume, "avg_fee_rate": avg_fee_rate}
+    return {
+        "date": latest_date,
+        "volume": total_volume,
+        "avg_fee_rate": avg_fee_rate,
+        "dates": dates,
+        "series": {"借券成交量": daily_volume},
+    }
 
 
 def fetch_margin_short_sale_suspension(ticker, token, lookback_days=90):

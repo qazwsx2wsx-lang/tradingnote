@@ -173,7 +173,7 @@ def aggregate_institutional_by_group(rows, groups, snapshot):
         for ticker in members:
             row = by_ticker.get(ticker)
             price = snapshot.get(ticker)
-            if row is None or price is None or price.close is None:
+            if row is None or price is None or price.close is None or row.date != price.date or row.date != data_date:
                 continue
             close = float(price.close)
             foreign_value += row.foreign_net * close

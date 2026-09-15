@@ -10,6 +10,9 @@ from dataclasses import dataclass, replace
 
 from tradingnote_history import (
     compute_group_flow,
+    get_available_dates,
+    get_data_revision,
+    analysis_snapshot,
     compute_group_valuation_flow,
     compute_stock_capital_flow,
     compute_volume_ratio_outliers,
@@ -33,6 +36,22 @@ class FlowPeriod:
 
     start_date: str
     trading_days: int
+    end_date: str | None = None
+    actual_dates: tuple = ()
+    prior_dates: tuple = ()
+
+    @property
+    def sufficient(self):
+        return len(self.actual_dates) == self.trading_days
+
+    def resolve(self, db_path, snapshot):
+        end = self.end_date or max((p.date for p in snapshot.values() if p.date), default=self.start_date)
+        dates = set(get_available_dates(db_path)) | {p.date for p in snapshot.values() if p.date}
+        available = sorted(d for d in dates if d <= end)
+        end = available[-1] if available else end
+        dates = [d for d in available if self.start_date <= d][-self.trading_days:]
+        return replace(self, end_date=end, actual_dates=tuple(dates),
+                       prior_dates=tuple(d for d in available if d < end))
 
     def __post_init__(self):
         if not self.start_date:
@@ -142,13 +161,16 @@ class FlowAnalysisService:
                     ticker,
                     price.date,
                     price.close,
+                    price.change,
                     price.volume,
                     price.trading_value,
+                    price.name,
+                    price.market,
                 )
                 for ticker, price in snapshot.items()
             )
         )
-        return hash(values)
+        return values
 
     def analyze(
         self,
@@ -167,27 +189,25 @@ class FlowAnalysisService:
         groups, classification_scope = self._groups(
             classification_mode, classification_scope
         )
-        market_key = (self._snapshot_key(snapshot), period)
+        period = period.resolve(self.db_path, snapshot)
+        snapshot = analysis_snapshot(self.db_path, snapshot, period)
+        revision = get_data_revision(self.db_path)
+        market_key = (revision, self._snapshot_key(snapshot), period)
         market_cached = self._cache.get(market_key)
         if market_cached is not None:
             self._cache.move_to_end(market_key)
         else:
             days = period.trading_days
+            stocks = compute_stock_capital_flow(
+                self.db_path, snapshot, avg_days=days, top_n=len(snapshot),
+                volume_avg_days=days, period=period,
+            )
             market_cached = (
-                tuple(
-                    compute_stock_capital_flow(
-                        self.db_path,
-                        snapshot,
-                        avg_days=days,
-                        top_n=50,
-                        volume_avg_days=days,
-                    )
-                ),
-                tuple(
-                    compute_volume_ratio_outliers(
-                        self.db_path, snapshot, avg_days=days, min_ratio=1.5
-                    )
-                ),
+                tuple(stocks[:50]),
+                tuple(compute_volume_ratio_outliers(
+                    self.db_path, snapshot, avg_days=days, min_ratio=1.5,
+                    period=period, stock_rows=stocks,
+                )),
             )
             self._remember(self._cache, market_key, market_cached)
 
@@ -205,6 +225,7 @@ class FlowAnalysisService:
                     snapshot,
                     groups,
                     avg_days=period.trading_days,
+                    period=period,
                     market_universe=self._market_universe,
                 )
             )
@@ -257,6 +278,7 @@ class FlowAnalysisService:
                     self.db_path,
                     snapshot,
                     groups,
+                    period=period,
                     short_days=period.recent_days,
                     long_days=period.valuation_baseline_days,
                     metric=valuation_metric,
@@ -278,6 +300,7 @@ class FlowAnalysisService:
             period.trading_days,
             top_n=top_n,
             volume_avg_days=period.trading_days,
+            period=period,
         )
 
     def get_group_top_stocks(
@@ -301,4 +324,5 @@ class FlowAnalysisService:
             period.trading_days,
             top_n=top_n,
             volume_avg_days=period.trading_days,
+            period=period,
         )

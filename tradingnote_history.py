@@ -6,7 +6,7 @@ import sqlite3
 import threading
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -58,6 +58,9 @@ class IndustryFlow:
     momentum_score: float | None = None
     volume_score: float | None = None
     composite_score: float | None = None
+    actual_days: int = 0
+    required_days: int = 0
+    actual_volume_days: int = 0
 
 
 def industry_name(code):
@@ -162,16 +165,129 @@ def _connect(db_path):
             PRIMARY KEY (date, ticker)
         )"""
     )
+    if "retrieved_at" not in {r[1] for r in conn.execute("PRAGMA table_info(valuation_history)")}:
+        conn.execute("ALTER TABLE valuation_history ADD COLUMN retrieved_at TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_valuation_history_ticker_date "
         "ON valuation_history (ticker, date DESC)"
     )
+    observations_exist = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='valuation_observations'"
+    ).fetchone()
+    conn.execute("""CREATE TABLE IF NOT EXISTS valuation_observations (
+        date TEXT NOT NULL, ticker TEXT NOT NULL, market TEXT, per REAL, pbr REAL,
+        dividend_yield REAL, retrieved_at TEXT NOT NULL,
+        PRIMARY KEY (date, ticker, retrieved_at))""")
+    if not observations_exist:
+        conn.execute("""INSERT OR IGNORE INTO valuation_observations
+            SELECT date, ticker, market, per, pbr, dividend_yield, retrieved_at
+            FROM valuation_history WHERE retrieved_at IS NOT NULL""")
+    conn.execute("CREATE TABLE IF NOT EXISTS analysis_revision (revision INTEGER NOT NULL)")
+    conn.execute("INSERT INTO analysis_revision SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM analysis_revision)")
+    for table in ("daily_prices", "valuation_history", "valuation_observations", "industry_map"):
+        for action in ("INSERT", "UPDATE", "DELETE"):
+            conn.execute(
+                f"CREATE TRIGGER IF NOT EXISTS revision_{table}_{action} AFTER {action} ON {table} "
+                "BEGIN UPDATE analysis_revision SET revision = revision + 1; END"
+            )
     conn.commit()
     return conn
 
 
 # ---------- 每日快照累積（TPEX 逐日累積的基礎來源，另見下方 upsert_daily_prices／
 # tradingnote_finmind.backfill_tpex_history_via_finmind 的 FinMind 補缺口機制） ----------
+
+def get_data_revision(db_path):
+    """Persistent revision, including direct SQL corrections and backfills."""
+    conn = _connect(db_path)
+    try:
+        return conn.execute("SELECT revision FROM analysis_revision").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def load_analysis_history(db_path, snapshot, period=None, days=5, history_days=None):
+    """Resolve one calendar and read prices without a calendar-day heuristic."""
+    from tradingnote_flow import FlowPeriod
+    period = (period or FlowPeriod("0001-01-01", days)).resolve(db_path, snapshot)
+    needed = period.actual_dates + period.prior_dates[-max(history_days or days, period.trading_days):]
+    lower = min(needed, default=period.end_date)
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT ticker, date, close, trading_value, volume FROM daily_prices "
+            "WHERE date >= ? AND date < ? ORDER BY date DESC", (lower, period.end_date)
+        ).fetchall()
+    finally:
+        conn.close()
+    history = {}
+    for ticker, day, close, value, volume in rows:
+        history.setdefault(ticker, []).append((day, close, value, volume))
+    return period, history
+
+
+def analysis_snapshot(db_path, snapshot, period):
+    """For an explicit historical cutoff, never reuse a future snapshot close."""
+    if not any(p.date > period.end_date for p in snapshot.values()):
+        return snapshot
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT ticker, date, close, change_pct, volume, trading_value FROM daily_prices "
+            "WHERE date <= ? ORDER BY date DESC", (period.end_date,)
+        ).fetchall()
+    finally:
+        conn.close()
+    latest = {}
+    for ticker, day, close, pct, volume, value in rows:
+        latest.setdefault(ticker, (day, close, pct, volume, value))
+    result = dict(snapshot)
+    for ticker, price in snapshot.items():
+        if price.date <= period.end_date:
+            continue
+        record = latest.get(ticker)
+        if record is None:
+            result[ticker] = replace(price, close=None, change=None, volume=None, trading_value=None)
+            continue
+        day, close, pct, volume, value = record
+        change = close * pct / (100 + pct) if close is not None and pct is not None and pct != -100 else None
+        result[ticker] = replace(price, date=day, close=close, change=change, volume=volume, trading_value=value)
+    return result
+
+
+def volume_day_count(price, history, period, volume_days):
+    if price.date != period.end_date:
+        return 0
+    required = set(period.prior_dates[-volume_days:])
+    return sum(row[0] in required and row[3] is not None for row in history)
+
+
+def analysis_values(price, history, period, volume_days):
+    selected = {row[0]: row for row in history}
+    dates = period.actual_dates
+    valid_today = price.date == period.end_date and price.date in dates and price.close is not None
+    actual = int(valid_today) + sum(
+        day in selected and selected[day][1] is not None
+        for day in dates if day != period.end_date
+    )
+    sufficient = period.sufficient and actual == period.trading_days
+    change = None
+    if sufficient:
+        if period.trading_days == 1:
+            change = _change_pct(price)
+        else:
+            baseline = selected[dates[0]][1]
+            if baseline and baseline > 0:
+                change = (price.close / baseline - 1) * 100
+    required_prior = period.prior_dates[-volume_days:]
+    prior = [selected[d] for d in required_prior if d in selected]
+    avg_volume = None
+    if valid_today and len(prior) == volume_days and all(row[3] is not None for row in prior):
+        avg_volume = sum(row[3] for row in prior) / volume_days
+    value = (price.trading_value or 0) if valid_today else 0
+    value += sum(selected[d][2] or 0 for d in dates if d != period.end_date and d in selected)
+    return change, avg_volume, value, actual, sufficient
+
 
 def record_snapshot(db_path, snapshot, as_of_date=None):
     """`as_of_date` 給定時強制套用到每一筆（呼叫端明確指定的情況）；未給定時改採
@@ -236,11 +352,14 @@ def upsert_valuation_history(db_path, rows):
         return
     conn = _connect(db_path)
     try:
+        observations = [(*row, datetime.now().isoformat()) for row in rows]
+        conn.executemany(
+            "INSERT OR REPLACE INTO valuation_observations VALUES (?, ?, ?, ?, ?, ?, ?)", observations
+        )
         conn.executemany(
             """INSERT OR REPLACE INTO valuation_history
-               (date, ticker, market, per, pbr, dividend_yield)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            rows,
+               (date, ticker, market, per, pbr, dividend_yield, retrieved_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""", observations
         )
         conn.commit()
     finally:
@@ -248,16 +367,10 @@ def upsert_valuation_history(db_path, rows):
 
 
 def record_valuation_snapshot(db_path, valuation_map, market, as_of_date=None):
-    """valuation_map：{ticker: {"per":, "pbr":, "dividend_yield":}}（來自
-    tradingnote_core.fetch_twse_valuation_all／fetch_tpex_valuation_all，多出來的
-    "date" key 這裡用不到，忽略即可），逐日累積進 valuation_history，機制跟
-    record_snapshot（daily_prices）一致。呼叫端（GUI 的啟動前置作業／重新整理）
-    應該把這個包成 best-effort（失敗不影響其他功能），見 tradingnote_gui 對應
-    change log。"""
-    today_iso = as_of_date or date.today().isoformat()
+    """保存來源交易日；無來源日期且未明確指定日期時跳過，禁止猜測日期。"""
     rows = [
-        (today_iso, ticker, market, v.get("per"), v.get("pbr"), v.get("dividend_yield"))
-        for ticker, v in valuation_map.items()
+        (v.get("date") or as_of_date, ticker, market, v.get("per"), v.get("pbr"), v.get("dividend_yield"))
+        for ticker, v in valuation_map.items() if v.get("date") or as_of_date
     ]
     upsert_valuation_history(db_path, rows)
 
@@ -676,15 +789,15 @@ def get_industry_directory(db_path, max_age_days=INDUSTRY_MAP_MAX_AGE_DAYS):
 
 # ---------- 產業資金流向分析 ----------
 
-def compute_group_flow(db_path, snapshot, groups, avg_days=5, market_universe=None):
-    """依任意群組成分股計算資金流向；groups 為 {群組名稱: ticker iterable}。
+def compute_group_flow(db_path, snapshot, groups, avg_days=5, market_universe=None, period=None):
+    """群組與成分股共用含截止日 N 筆收盤；1 日採官方當日漲跌。
 
-    avg_days 同時決定兩件事，讓 X／Y 兩軸的「N 日流向」定義一致：
-    ① avg_change_pct：該產業近 avg_days 個交易日的累積漲跌%（以今日收盤對比 avg_days
-       個交易日前收盤，用今日成交金額加權平均），取代單日漲跌%；
-    ② volume_ratio：今日成交量對近 avg_days 日均量的比值（沿用原本邏輯）。
-    兩者用同一組「有足夠歷史資料」的成分股計算，資料不足的產業兩者皆回傳 None（由呼叫端
-    過濾不畫出），不會出現 X 有值但 Y 沒有值的不一致情況。"""
+    量比另需截止日以前完整 N 筆成交量，不將缺值當成零。
+    漲幅以有完整價格期間的成分股當日成交金額加權。
+    """
+    period, ticker_history = load_analysis_history(db_path, snapshot, period, avg_days)
+    snapshot = analysis_snapshot(db_path, snapshot, period)
+    avg_days = period.trading_days
     normalized_groups = {
         str(name): set(members) for name, members in groups.items() if members
     }
@@ -699,7 +812,7 @@ def compute_group_flow(db_path, snapshot, groups, avg_days=5, market_universe=No
 
     groups = {}
     for price in snapshot.values():
-        if price.close is None or price.trading_value is None:
+        if price.date != period.end_date or price.close is None or price.trading_value is None:
             continue
         group_names = ticker_groups.get(price.ticker)
         if not group_names:
@@ -721,30 +834,6 @@ def compute_group_flow(db_path, snapshot, groups, avg_days=5, market_universe=No
             g["ticker_values"][price.ticker] = price.trading_value
             g["ticker_dates"][price.ticker] = price.date
 
-    min_history_days = max(2, avg_days // 2)
-    snapshot_today = _snapshot_today(snapshot)
-    cutoff = (date.fromisoformat(snapshot_today) - timedelta(days=avg_days * 3)).isoformat()
-    conn = _connect(db_path)
-    try:
-        # LIFO：以 date DESC 為主要存取順序，讓每檔股票的區間內紀錄天然由新到舊排列，
-        # 下面直接取前 avg_days 筆即為「近 avg_days 日」，不需要再用 Python 額外排序；
-        # 該切片的最後一筆（最舊）即為「avg_days 個交易日前」的收盤價基準。分界用
-        # snapshot_today（snapshot 實際代表的交易日）而非 date.today()，理由見
-        # _snapshot_today docstring。
-        history_rows = conn.execute(
-            """SELECT ticker, date, close, volume, trading_value FROM daily_prices
-               WHERE date < ? AND date >= ? ORDER BY date DESC""",
-            (snapshot_today, cutoff),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    ticker_history = {}
-    for ticker, day, close, volume, trading_value in history_rows:
-        ticker_history.setdefault(ticker, []).append(
-            (day, close, volume or 0, trading_value or 0.0)
-        )
-
     # 資金比重的分母用「全市場今日總成交金額」（含歷史資料不足、稍後會被過濾掉的產業），
     # 才能反映真實佔比；若只用 plotted 產業算分母，佔比會隨著哪些產業被過濾而跳動。
     # 概念分類可重疊，因此分母不能把各群組成交額相加（會重複計入同一檔股票）。
@@ -753,7 +842,7 @@ def compute_group_flow(db_path, snapshot, groups, avg_days=5, market_universe=No
     total_market_value = sum(
         price.trading_value or 0.0
         for ticker, price in snapshot.items()
-        if ticker in market_universe
+        if ticker in market_universe and price.date == period.end_date
         and price.close is not None
         and price.trading_value is not None
     )
@@ -763,25 +852,21 @@ def compute_group_flow(db_path, snapshot, groups, avg_days=5, market_universe=No
         if g["trading_value"] <= 0:
             continue
 
+        available_counts = []
+        volume_counts = []
         weighted_change, change_weight = 0.0, 0.0
         daily_weighted_change = 0.0
         daily_change_weight = 0.0
         today_volume, baseline_volume = 0.0, 0.0
         baseline_trading_value = 0.0
         for ticker, today_close in g["ticker_prices"].items():
-            # 個股自己的 snapshot 日期可能比多數股票（snapshot_today 眾數）更舊
-            # （少數個股資料延遲發布），這裡逐檔用該股自己的日期過濾歷史列，避免
-            # 「今天」跟「N 天前」不小心撞到同一天，見 _snapshot_today docstring。
-            ticker_date = g["ticker_dates"][ticker]
-            days = [
-                row for row in ticker_history.get(ticker, []) if row[0] < ticker_date
-            ][:avg_days]
-            if len(days) < min_history_days:
+            price = snapshot[ticker]
+            history = ticker_history.get(ticker, [])
+            n_day_change_pct, avg_volume, _, actual, _ = analysis_values(price, history, period, avg_days)
+            available_counts.append(actual)
+            volume_counts.append(volume_day_count(price, history, period, avg_days))
+            if n_day_change_pct is None:
                 continue
-            baseline_close = days[-1][1]
-            if not baseline_close:
-                continue
-            n_day_change_pct = (today_close - baseline_close) / baseline_close * 100
             trading_value = g["ticker_values"][ticker]
             weighted_change += n_day_change_pct * trading_value
             change_weight += trading_value
@@ -792,9 +877,11 @@ def compute_group_flow(db_path, snapshot, groups, avg_days=5, market_universe=No
                 daily_weighted_change += daily_change_pct * trading_value
                 daily_change_weight += trading_value
 
-            baseline_volume += sum(v for _, _, v, _ in days) / len(days)
-            baseline_trading_value += sum(v for _, _, _, v in days) / len(days)
-            today_volume += g["ticker_volumes"][ticker]
+            if avg_volume is not None:
+                baseline_volume += avg_volume
+                prior = [row for row in history if row[0] in period.prior_dates[-avg_days:]]
+                baseline_trading_value += sum(row[2] or 0 for row in prior) / avg_days
+                today_volume += g["ticker_volumes"][ticker]
 
         avg_change_pct = (weighted_change / change_weight) if change_weight > 0 else None
         daily_change_pct = (
@@ -822,6 +909,9 @@ def compute_group_flow(db_path, snapshot, groups, avg_days=5, market_universe=No
         results.append(
             IndustryFlow(
                 industry=industry,
+                actual_days=min(available_counts, default=0),
+                required_days=period.trading_days,
+                actual_volume_days=min(volume_counts, default=0),
                 avg_change_pct=avg_change_pct,
                 volume_ratio=volume_ratio,
                 total_trading_value=g["trading_value"],
@@ -909,6 +999,7 @@ def compute_group_valuation_flow(
     long_days=20,
     metric="per",
     market_universe=None,
+    period=None,
 ):
     """泡泡圖「估值」模式：X＝群組成分股「最新一筆」metric（本益比 PER 或股價
     淨值比 PBR，用今日成交金額加權中位數彙總到群組層級，見 _weighted_median 的
@@ -962,7 +1053,7 @@ def compute_group_valuation_flow(
     min_history_days = max(short_days, long_days // 2)
     # 分界用 snapshot_today（snapshot 實際代表的交易日）而非 date.today()，理由見
     # _snapshot_today docstring。
-    today_iso = _snapshot_today(snapshot)
+    today_iso = period.end_date if period is not None else _snapshot_today(snapshot)
     cutoff = (date.fromisoformat(today_iso) - timedelta(days=long_days * 3)).isoformat()
 
     conn = _connect(db_path)
@@ -974,8 +1065,10 @@ def compute_group_valuation_flow(
         ).fetchall()
         column = "per" if metric == "per" else "pbr"
         valuation_rows = conn.execute(
-            f"""SELECT ticker, date, {column} FROM valuation_history
-               WHERE {column} IS NOT NULL ORDER BY date DESC"""
+            f"""SELECT ticker, date, {column} FROM valuation_observations
+               WHERE {column} IS NOT NULL AND date <= ?
+               AND substr(retrieved_at, 1, 10) <= ? ORDER BY date DESC, retrieved_at DESC""",
+            (today_iso, today_iso),
         ).fetchall()
     finally:
         conn.close()
@@ -1073,111 +1166,45 @@ def compute_valuation_flow(db_path, snapshot, short_days=5, long_days=20, metric
 # 原則一致。
 
 def get_group_top_stocks_range(
-    db_path, snapshot, members, days, top_n=30, volume_avg_days=5
+    db_path, snapshot, members, days, top_n=30, volume_avg_days=5, period=None
 ):
-    """回傳任意群組前 top_n 大成分股，排序依據是近 days 個交易日（含今日）的
-    「累積成交金額」，讓成分股排名跟「資金流向分析」頁（泡泡圖／資金動向清單）的
-    資料區間口徑一致。今日成交金額／收盤來自即時 snapshot，
-    days-1 天以前的歷史資料來自 daily_prices，抓法跟 compute_industry_flow 相同
-    （today 不在 daily_prices 裡，用 date < today 排除，避免重複計入）。change_pct
-    是區間累積漲跌%（區間起點收盤到今日收盤），跟清單「加權漲跌%」欄位定義一致。
-    歷史筆數不足 days 天的 ticker 仍會列入、用實際可拿到的筆數計算，不像
-    compute_industry_flow 會整檔排除——這裡只是排序用途，不要求嚴謹的樣本數。
-
-    另外附上近日成交量／均量／本益比，純粹讀既有本地快取（daily_prices、
-    valuation_history），不額外打任何 API：today_volume 取自 snapshot（今日
-    quantity），avg_volume 是近 volume_avg_days 天 daily_prices.volume 的簡單
-    平均（跟 compute_volume_ratio_outliers 同一套算法，天數語意跟排序用的
-    days 無關，固定用 volume_avg_days，沒有歷史資料則為 None）；per 是該股
-    valuation_history 裡「最新一筆」本益比（跟 compute_valuation_flow 同一套
-    取值邏輯：按 date DESC 排序，每檔股票第一次出現的即為最新值），沒有資料
-    則為 None。"""
-    members = set(members)
-
-    today_by_ticker = {}
-    for price in snapshot.values():
-        if price.close is None or price.trading_value is None:
-            continue
-        if price.ticker not in members:
-            continue
-        today_by_ticker[price.ticker] = price
-
-    if not today_by_ticker:
-        return []
-
-    tickers = list(today_by_ticker)
-    # 分界用 snapshot_today（snapshot 實際代表的交易日）而非 date.today()，理由見
-    # _snapshot_today docstring。
-    today_iso = _snapshot_today(snapshot)
-    cutoff = (date.fromisoformat(today_iso) - timedelta(days=max(days, volume_avg_days, 1) * 3)).isoformat()
+    """Shared close-to-close return; one day uses the published daily change."""
+    period, history = load_analysis_history(db_path, snapshot, period, days, volume_avg_days)
+    snapshot = analysis_snapshot(db_path, snapshot, period)
     conn = _connect(db_path)
     try:
-        placeholders = ",".join("?" * len(tickers))
-        rows = conn.execute(
-            f"""SELECT ticker, date, close, trading_value, volume FROM daily_prices
-               WHERE ticker IN ({placeholders}) AND date < ? AND date >= ?
-               ORDER BY date DESC""",
-            (*tickers, today_iso, cutoff),
-        ).fetchall()
-        valuation_rows = conn.execute(
-            f"""SELECT ticker, date, per FROM valuation_history
-               WHERE ticker IN ({placeholders}) AND per IS NOT NULL
-               ORDER BY date DESC""",
-            tickers,
+        valuations = conn.execute(
+            "SELECT ticker, per FROM valuation_observations WHERE date <= ? AND substr(retrieved_at, 1, 10) <= ? ORDER BY date DESC, retrieved_at DESC",
+            (period.end_date, period.end_date),
         ).fetchall()
     finally:
         conn.close()
-
-    ticker_history = {}
-    for ticker, day, close, trading_value, volume in rows:
-        ticker_history.setdefault(ticker, []).append(
-            (day, close, trading_value or 0.0, volume or 0)
-        )
-
-    # valuation_rows 已經是 date DESC，同一檔股票第一次出現的即為目前最新一筆
-    # （跟 compute_valuation_flow 同一套取值邏輯）。
-    ticker_latest_per = {}
-    for ticker, _day, per in valuation_rows:
-        if ticker not in ticker_latest_per:
-            ticker_latest_per[ticker] = per
-
+    per = {}
+    for ticker, value in valuations:
+        per.setdefault(ticker, value)
     results = []
-    for ticker, price in today_by_ticker.items():
-        # 個股自己的 snapshot 日期可能比多數股票（today_iso 眾數）更舊（少數個股
-        # 資料延遲發布），這裡逐檔用該股自己的日期過濾歷史列，避免「今天」跟
-        # 「N 天前」不小心撞到同一天，見 _snapshot_today docstring。
-        full_history = [row for row in ticker_history.get(ticker, []) if row[0] < price.date]
-        history = full_history[: max(days - 1, 0)]
-        total_trading_value = price.trading_value + sum(v for _, _, v, _ in history)
-        baseline_close = history[-1][1] if history else price.close
-        change_pct = (
-            (price.close - baseline_close) / baseline_close * 100
-            if baseline_close
-            else None
+    for ticker in members:
+        price = snapshot.get(ticker)
+        if price is None:
+            continue
+        change, avg_volume, value, actual, sufficient = analysis_values(
+            price, history.get(ticker, []), period, volume_avg_days
         )
-
-        volume_history = [v for _, _, _, v in full_history[:volume_avg_days]]
-        avg_volume = sum(volume_history) / len(volume_history) if volume_history else None
-
-        results.append(
-            {
-                "ticker": ticker,
-                "name": price.name,
-                "close": price.close,
-                "change_pct": change_pct,
-                "trading_value": total_trading_value,
-                "today_volume": price.volume,
-                "avg_volume": avg_volume,
-                "per": ticker_latest_per.get(ticker),
-            }
-        )
-
-    results.sort(key=lambda r: r["trading_value"], reverse=True)
+        results.append(dict(
+            ticker=ticker, name=price.name, close=price.close, change_pct=change,
+            trading_value=value, today_volume=price.volume, avg_volume=avg_volume,
+            per=per.get(ticker), actual_days=actual, required_days=period.trading_days,
+            sufficient=sufficient, start_date=period.actual_dates[0] if period.actual_dates else period.start_date, end_date=period.end_date,
+            data_date=price.date,
+            actual_volume_days=volume_day_count(price, history.get(ticker, []), period, volume_avg_days),
+            required_volume_days=volume_avg_days,
+        ))
+    results.sort(key=lambda row: row["trading_value"], reverse=True)
     return results[:top_n]
 
 
 def get_industry_top_stocks_range(
-    db_path, snapshot, industry, days, top_n=30, volume_avg_days=5
+    db_path, snapshot, industry, days, top_n=30, volume_avg_days=5, period=None
 ):
     """相容舊介面的官方產業成分股查詢。"""
     industry_map = get_industry_map(db_path)
@@ -1192,6 +1219,7 @@ def get_industry_top_stocks_range(
         days,
         top_n=top_n,
         volume_avg_days=volume_avg_days,
+        period=period,
     )
 
 
@@ -1217,117 +1245,32 @@ class StockCapitalFlow:
     avg_volume: float | None
     volume_ratio: float | None
     capital_share_pct: float
+    actual_days: int = 0
+    required_days: int = 0
+    actual_volume_days: int = 0
 
 
-def compute_stock_capital_flow(db_path, snapshot, avg_days=20, top_n=50, volume_avg_days=5):
-    """回傳全市場前 top_n 名個股的區間成交金額排行。
-
-    「資金流入」的實際計算口徑是今日 snapshot 加上前 avg_days-1 個交易日的
-    累積成交金額。這和產業資金流向／產業成分股的成交金額口徑一致，且完全使用
-    本地 snapshot 與 daily_prices，不新增網路 API 呼叫。
-
-    只納入有產業分類的股票，排除 ETF、權證等沒有產業分類的商品。歷史資料不足
-    的個股仍可參加排行，但至少要有 max(1, avg_days // 2) 筆歷史資料；避免只有
-    一兩天資料的股票因為區間較短而誤進排行。avg_days=1 時只使用今日資料。
-    """
+def compute_stock_capital_flow(db_path, snapshot, avg_days=20, top_n=50, volume_avg_days=5, period=None):
+    period, _ = load_analysis_history(db_path, snapshot, period, avg_days)
+    snapshot = analysis_snapshot(db_path, snapshot, period)
     industry_map = get_industry_map(db_path)
-    avg_days = max(1, int(avg_days))
-    top_n = max(1, int(top_n))
-    volume_avg_days = max(1, int(volume_avg_days))
-
-    today_by_ticker = {}
-    for price in snapshot.values():
-        if price.close is None or price.trading_value is None:
-            continue
-        industry = industry_map.get(price.ticker)
-        if not industry:
-            continue
-        today_by_ticker[price.ticker] = (price, industry)
-
-    if not today_by_ticker:
-        return []
-
-    snapshot_today = _snapshot_today(snapshot)
-    cutoff = (
-        date.fromisoformat(snapshot_today)
-        - timedelta(days=max(avg_days, volume_avg_days, 1) * 3)
-    ).isoformat()
-    conn = _connect(db_path)
-    try:
-        rows = conn.execute(
-            """SELECT ticker, date, close, trading_value, volume FROM daily_prices
-               WHERE date < ? AND date >= ? ORDER BY date DESC""",
-            (snapshot_today, cutoff),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    ticker_history = {}
-    for ticker, day, close, trading_value, volume in rows:
-        ticker_history.setdefault(ticker, []).append(
-            (day, close, trading_value or 0.0, volume or 0)
-        )
-
-    # 市場比重的分母要包含 snapshot 裡所有有成交金額的商品，不能只加總有產業
-    # 分類的股票；否則 ETF／權證等被排除後，個股的比重會被放大。
-    total_market_value = sum(
-        price.trading_value
-        for price in snapshot.values()
-        if price.trading_value and price.trading_value > 0
-    )
-    min_history_days = max(1, avg_days // 2)
+    rows = get_group_top_stocks_range(db_path, snapshot, industry_map, avg_days,
+                                    top_n=len(snapshot), volume_avg_days=volume_avg_days, period=period)
+    total = sum(p.trading_value or 0 for p in snapshot.values() if p.date == period.end_date)
     results = []
-    for ticker, (price, industry) in today_by_ticker.items():
-        # 個別股票的 snapshot 日期可能比眾數日期舊，必須用該股票自己的日期切分，
-        # 避免把同一天資料誤當成歷史基準。
-        full_history = [
-            row for row in ticker_history.get(ticker, []) if row[0] < price.date
-        ]
-        history = full_history[: max(avg_days - 1, 0)]
-        if avg_days > 1 and len(history) < min_history_days:
-            continue
-
-        baseline_close = history[-1][1] if history and history[-1][1] else None
-        change_pct = (
-            (price.close - baseline_close) / baseline_close * 100
-            if baseline_close
-            else None
-        )
-        trading_value = price.trading_value + sum(
-            value for _day, _close, value, _volume in history
-        )
-        volume_history = [
-            volume for _day, _close, _value, volume in full_history[:volume_avg_days]
-        ]
-        avg_volume = sum(volume_history) / len(volume_history) if volume_history else None
-        volume_ratio = (
-            price.volume / avg_volume
-            if price.volume is not None and avg_volume and avg_volume > 0
-            else None
-        )
-        capital_share_pct = (
-            price.trading_value / total_market_value * 100
-            if total_market_value > 0
-            else 0.0
-        )
-        results.append(
-            StockCapitalFlow(
-                ticker=ticker,
-                name=price.name or "",
-                market=price.market or "",
-                industry=industry,
-                close=price.close,
-                change_pct=change_pct,
-                trading_value=trading_value,
-                today_trading_value=price.trading_value,
-                today_volume=price.volume,
-                avg_volume=avg_volume,
-                volume_ratio=volume_ratio,
-                capital_share_pct=capital_share_pct,
-            )
-        )
-
-    results.sort(key=lambda row: row.trading_value, reverse=True)
+    for row in rows:
+        price = snapshot[row["ticker"]]
+        avg = row["avg_volume"]
+        results.append(StockCapitalFlow(
+            ticker=price.ticker, name=price.name, market=price.market,
+            actual_days=row["actual_days"], required_days=row["required_days"],
+            actual_volume_days=row["actual_volume_days"],
+            industry=industry_map[price.ticker], close=price.close, change_pct=row["change_pct"],
+            trading_value=row["trading_value"], today_trading_value=(price.trading_value or 0) if price.date == period.end_date else 0,
+            today_volume=price.volume, avg_volume=avg,
+            volume_ratio=price.volume / avg if avg and price.volume is not None else None,
+            capital_share_pct=(price.trading_value or 0) / total * 100 if total and price.date == period.end_date else 0,
+        ))
     return results[:top_n]
 
 
@@ -1358,83 +1301,13 @@ def _volume_ratio_tier(ratio):
     return "1.5～2倍"
 
 
-def compute_volume_ratio_outliers(db_path, snapshot, avg_days=5, min_ratio=1.5):
-    """掃描全市場個股，找出「今日成交量 ÷ 近 avg_days 日均量」達到 min_ratio 倍以上的
-    爆量股票，依比值分成三個級距（1.5～2倍／2～3倍／3倍以上）。
-
-    跟 compute_industry_flow 的 volume_ratio 不同：那裡是整個產業加總後的量比，
-    單一檔股票爆量會被同產業其他股票的量能稀釋掉；這裡逐檔股票各自比較自己的
-    歷史均量，才抓得到「個股」層級的異常。查詢手法（LIFO 取近 avg_days 筆歷史）
-    跟 compute_industry_flow／get_industry_top_stocks_range 一致。只納入
-    industry_map 裡有分類的股票，藉此排除權證、ETF 等非個股商品。"""
-    industry_map = get_industry_map(db_path)
-    min_history_days = max(2, avg_days // 2)
-    # 分界用 snapshot_today（snapshot 實際代表的交易日）而非 date.today()，理由見
-    # _snapshot_today docstring。
-    snapshot_today = _snapshot_today(snapshot)
-    cutoff = (date.fromisoformat(snapshot_today) - timedelta(days=avg_days * 3)).isoformat()
-
-    tickers_today = {}
-    for price in snapshot.values():
-        if price.close is None or price.volume is None:
-            continue
-        if price.ticker not in industry_map:
-            continue
-        tickers_today[price.ticker] = price
-
-    if not tickers_today:
-        return []
-
-    tickers = list(tickers_today)
-    conn = _connect(db_path)
-    try:
-        placeholders = ",".join("?" * len(tickers))
-        rows = conn.execute(
-            f"""SELECT ticker, date, volume FROM daily_prices
-               WHERE ticker IN ({placeholders}) AND date < ? AND date >= ?
-               ORDER BY date DESC""",
-            (*tickers, snapshot_today, cutoff),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    ticker_history = {}
-    for ticker, day, volume in rows:
-        ticker_history.setdefault(ticker, []).append((day, volume or 0))
-
-    results = []
-    for ticker, price in tickers_today.items():
-        # 個股自己的 snapshot 日期可能比多數股票更舊（少數個股資料延遲發布），這裡
-        # 逐檔用該股自己的日期過濾歷史列，避免「今天」跟「N 天前」不小心撞到同一天，
-        # 見 _snapshot_today docstring。
-        days = [
-            volume
-            for day, volume in ticker_history.get(ticker, [])
-            if day < price.date
-        ][:avg_days]
-        if len(days) < min_history_days:
-            continue
-        avg_volume = sum(days) / len(days)
-        if avg_volume <= 0:
-            continue
-        ratio = price.volume / avg_volume
-        if ratio < min_ratio:
-            continue
-
-        results.append(
-            VolumeRatioOutlier(
-                ticker=ticker,
-                name=price.name,
-                industry=industry_map.get(ticker, "未分類"),
-                market=price.market,
-                close=price.close,
-                change_pct=_change_pct(price),
-                today_volume=price.volume,
-                avg_volume=avg_volume,
-                volume_ratio=ratio,
-                tier=_volume_ratio_tier(ratio),
-            )
-        )
-
-    results.sort(key=lambda r: r.volume_ratio, reverse=True)
-    return results
+def compute_volume_ratio_outliers(db_path, snapshot, avg_days=5, min_ratio=1.5, period=None, stock_rows=None):
+    rows = stock_rows if stock_rows is not None else compute_stock_capital_flow(
+        db_path, snapshot, avg_days, len(snapshot), avg_days, period
+    )
+    results = [VolumeRatioOutlier(
+        ticker=r.ticker, name=r.name, industry=r.industry, market=r.market,
+        close=r.close, change_pct=r.change_pct, today_volume=r.today_volume,
+        avg_volume=r.avg_volume, volume_ratio=r.volume_ratio, tier=_volume_ratio_tier(r.volume_ratio),
+    ) for r in rows if r.volume_ratio is not None and r.volume_ratio >= min_ratio]
+    return sorted(results, key=lambda r: r.volume_ratio, reverse=True)

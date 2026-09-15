@@ -6,6 +6,37 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 
 ---
 
+## 2026-09-15（續10）融資／借券歷史趨勢圖（借券賣出餘額、借券成交量）
+
+**動機**：user 要求「融資、借券、券賣要有歷史紀錄顯示」。先評估現況：融資餘額／融券餘額其實已經有 120 天歷史＋趨勢圖（`fetch_margin_short_sale_history`），真正缺的是借券賣出餘額（SBL，證券商辦理有價證券借貸的餘額）跟借券成交（借券市場實際成交量／費率）——這兩個原本只顯示最新一天文字，沒有歷史圖。
+
+**改法**：
+1. `tradingnote_finmind.fetch_short_sale_balance()`／`fetch_securities_lending_summary()`：兩者原本就用 `_fetch_dataset(..., lookback_days=10)` 抓多天資料，只是最後只取最新一天、把其餘天數丟掉——**不用新增任何 API 呼叫**，只要把丟掉的資料留下來即可。改法：`lookback_days` 預設從 10 拉長到 120（比照 `fetch_margin_short_sale_history`），回傳值新增 `"dates"`/`"series"` 兩個 key，原本 `"date"`/`"balance"`/`"change"`（或 `"volume"`/`"avg_fee_rate"`）維持不變、只是不再拿掉——現有讀取「最新一天」文字摘要的呼叫端完全不用改。動手前先實測 FinMind 免費額度在 120 天窗口內兩個資料集分別給了 85／84 個交易日，確認資料深度足夠畫趨勢圖，不是憑空假設。
+2. `tradingnote_gui.py`：新增 `_populate_short_sale_balance_chart()`／`_populate_lending_volume_chart()`，跟既有的 `_populate_margin_chart`／`_populate_vpt_chart`／`_populate_mfi_chart` 同一種寫法（各自一個小函式，不是抽一個通用 helper——這批函式本來就是已知的重複模式，這次維持現狀一致，不在無關的功能改動裡順便重構）。兩者分開兩個獨立分頁，不是合併成一張雙軸圖：借券賣出餘額（股）是累積餘額，借券成交量（張）是當日流量，量級跟性質都不同，合併成一張圖容易誤導。
+3. `_render_detail_block()`（「個股」頁 `StockDetailDialog` 的「顯示完整籌碼面資訊」跟「部位紀錄」頁的個股明細共用同一份畫面邏輯）簽名新增 `sbl_chart`／`lending_chart` 兩個參數，這兩個地方原本就各自有一份重複的「建立六個 `pg.PlotWidget`、加進 `QTabWidget`」樣板碼（已知架構債務），這次一併各加兩個新分頁「借券賣出餘額」「借券成交」——沒有讓債務變嚴重，但也沒有趁機解決它，維持現有慣例，這次只加內容不重構結構。連帶找到並更新 6 處 `_render_detail_block(...)` 呼叫、`StockDetailDialog`／`TradingNoteWindow` 兩邊各自的 3 處 `.clear()` 清空區塊，全部同步加上新的兩個圖表 widget。
+
+**驗證**：`.venv` python `import tradingnote_gui` 成功、`py_compile` 過關。用真實 `fetch_position_detail("2330", "")`（無 token，公開額度）拿到的真實資料直接呼叫 `_render_detail_block()`（不透過背景執行緒，跳過 UI 事件迴圈的等待），截圖確認「借券賣出餘額」分頁顯示 85 個交易日的真實趨勢線、數值走勢跟同一份文字摘要顯示的最新一筆（16,618,514 股）吻合；「借券成交」分頁顯示 84 個交易日的成交量趨勢，可以看到 6 月中旬有一次明顯放量的高峰。另外用全部欄位皆為 `None` 的假資料呼叫 `_render_detail_block()`、以及直接對兩個新的 `_populate_*_chart` 函式傳 `None`，確認資料不足或查詢失敗時不會拋例外、圖表正常留空——這對這個實際依賴 FinMind 免費額度（可能超額度、可能沒 token）的功能特別重要。**未做**：沒有在跑起來的完整 App 裡實際點「顯示完整籌碼面資訊」按鈕觸發背景執行緒＋UI 這條路徑（滑鼠座標/截圖已知 DPI 落差，見更早條目）——但背景執行緒／按鈕連線邏輯這次完全沒有改動，只有新增兩個參數傳遞跟兩個新函式，且已經用真實資料驗證過 `_render_detail_block` 本身，風險低。**額外發現**：這輪工作途中發現 working tree 裡有非本次改動產生的異動（`tradingnote_flow.py`／`tradingnote_history.py`／`tradingnote_institutional.py` 被修改，新增 `ANALYSIS_CONSISTENCY.md` 等檔案）——研判是 Codex 同時間在同一份共用資料夾工作，內容/進度不明，這次的 commit 刻意不包含這些檔案，見 `STATUS.md`「目前實際尚未 commit 的異動」。
+
+---
+
+## 2026-09-15（續9）趨勢徽章推廣到「個股查詢」分頁的 `stock_preview` 摘要面板
+
+**動機**：續8 把「趨勢／動能／量能」徽章加到 `StockDetailDialog`，但續8 的 CHANGELOG 條目也記錄「個股查詢」分頁右側的 `stock_preview` 摘要面板這次沒有一起加。user 這輪直接要求推廣過去。
+
+**改法**：
+1. 把續8 寫在 `StockDetailDialog.__init__` 裡的「建立徽章列＋沒資料時顯示 muted 提示」邏輯抽成共用函式 `_populate_trend_badge_row(layout, technical, empty_text=...)`，`StockDetailDialog` 自己也跟著改成呼叫這個共用函式（原本是內嵌一段重複邏輯）——避免這次推廣變成再複製貼上一份一樣的 if/else。
+2. 新增 `_clear_layout(layout)`：`stock_preview` 面板會隨使用者在清單上切換選取而重複更新，不像 `StockDetailDialog` 只在開啟時建立一次，所以需要「清空重繪」而不是「只建立一次」。
+3. `_build_stocks_tab`：`stock_preview` 面板新增 `self.stock_preview_trend_row`（QHBoxLayout），放在股價 StatCard 跟 meta 文字之間。`_on_stock_selected`：清單上什麼都沒選取時呼叫 `_clear_layout` 清空（不顯示「資料不足」，因為根本還沒選股票，語意不同）；選到股票時呼叫 `_populate_trend_badge_row(self.stock_preview_trend_row, load_local_technical(HISTORY_DB_PATH, ticker))`，跟股價/meta 一起同步更新。
+
+**驗證**：`.venv` python `import tradingnote_gui` 成功、`py_compile` 過關。用獨立測試腳本原樣複製 `stock_preview` 面板的容器建構程式碼，模擬三種切換情境截圖比對：
+- 未選取 → 選 2330：徽章正確顯示「趨勢：偏空／動能：中性／量能：萎縮」。
+- 選 2330 → 未選取：**第一次測試時發現真的 bug**——`_clear_layout` 原本只呼叫 `widget.deleteLater()`，但 `layout.takeAt()` 只是讓 layout 不再排版這個 widget，widget 本身仍是同一個 parent 的子物件，`deleteLater()` 排的是之後才執行的真正刪除，所以舊徽章會先「脫離 layout 版面控制、但還留在畫面上原地」，跟新的 meta 文字疊在一起變成一團亂碼。修法：`setParent(None)` 立刻把 widget 從父子關係拔掉（畫面立刻消失），`deleteLater()` 才負責之後真正釋放物件，兩者都要做。修完後重新截圖確認清空狀態乾淨、沒有殘影。
+- 2330 → 另一個不存在的假 ticker 9999：確認會正確清掉 2330 的徽章、顯示「歷史資料不足...」，不是疊加或殘留舊徽章。
+
+這個 bug 也回頭檢查過 `StockDetailDialog` 那邊沒有同樣風險——它的徽章列只在 `__init__` 建立一次、不會重複重繪，沒有「清空舊 widget」這個步驟，所以沒有受影響，不需要額外修正。**未做**：沒有在跑起來的完整 App 裡用滑鼠實際點選清單項目觸發（已知 DPI 落差，見更早條目），但獨立測試已經是原樣複製容器建構程式碼＋呼叫真實的 `_on_stock_selected` 會呼叫的同一批函式（`_populate_trend_badge_row`／`_clear_layout`／`load_local_technical`），不是另外寫一套簡化邏輯測試。
+
+---
+
 ## 2026-09-15（續8）`SignalBadge` 推廣到「個股概覽」（`StockDetailDialog`）
 
 **動機**：續6/續7 都把「`SignalBadge` 推廣到個股概覽」列為候選但沒做，理由是當時程式裡沒有任何「趨勢判斷」邏輯可以驅動徽章內容。這輪 user 直接要求做這件事，所以先補上最小可行的 rule-based 判斷，再接上徽章。

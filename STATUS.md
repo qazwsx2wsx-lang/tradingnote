@@ -53,9 +53,9 @@ tradingnote/
 
 ## GUI 現況：六個分頁（左側導覽列，2026-09-14 由上方分頁改版）
 1. **資金流向分析**（預設頁）：pyqtgraph 泡泡圖（大小＝資金比重%，泡泡綠／紅／灰表達當日量價推估的偏流入／偏流出／中性），可觸控板/滾輪縮放平移，點擊泡泡看該產業前十大成分股；工具列「泡泡圖模式」可切換「動能」（X＝N日累積漲跌%、Y＝量比）／「估值」（X＝最新一筆 PER/PBR 加權中位數、Y＝近5日均額÷近20日均額）；兩種模式都有四象限淡色底與 hover 解讀。下方按分類切換：資金動向清單、產業熱度排行、個股資金流入前50、個股量比異常清單。另有「法人方向」子頁：從 TWSE T86、TPEx `tpex_3insti_daily_trading` 取得全市場真實淨買賣股數，依族群聚合後以三張左右發散圖顯示外資／投信／自營商（真實買賣超，淨額為股數×收盤價估算）。日期選擇一律用日曆式起始日期選擇器，沒有歷史資料的日期反白不能選，結束日固定今天／最新資料。
-2. **部位紀錄**：`QTableWidget`（含族群／概念股欄位），新增/刪除/查價/重新整理；下方詳細資訊區塊選取部位時背景查 FinMind 顯示本益比/殖利率/股價淨值比＋三大法人 120 日累計買賣超趨勢圖。概念股清單來自 `concepts.json`（人工維護，見 `tradingnote_concepts.py`）。
+2. **部位紀錄**：`QTableWidget`（含族群／概念股欄位），新增/刪除/查價/重新整理；下方詳細資訊區塊選取部位時背景查 FinMind，跟「個股」頁 `StockDetailDialog` 共用同一套 8 張趨勢圖（歷史股價／三大法人／法人分別／融資融券／VPT／MFI／借券賣出餘額／借券成交）。概念股清單來自 `concepts.json`（人工維護，見 `tradingnote_concepts.py`）。
 3. **交易週誌**（2026-09-10 新增）：週一至週日七張卡片顯示持股合計金額變化、絕對變動最大前三檔與日誌摘要；選取日期可看全部持股並編輯自由文字日誌；前/後週、本週、日期跳轉、Ctrl+S、切換日期與關閉程式時自動保存；未來日期不可編輯。
-4. **個股**：`QTreeWidget` 依產業族群列出全市場約1700檔股票，雙擊叫 FinMind API 查本益比/殖利率/股價淨值比/三大法人（`StockDetailDialog`）。彈窗「顯示完整籌碼面資訊」按鈕點下去才查跟部位紀錄頁相同的詳細資料＋分頁（歷史股價／三大法人／融資融券／VPT／MFI／技術分析），技術分析可切換 KD／MACD／均線／RSI 等 24 類指標（純本地 SQLite 計算，不額外呼叫 API）。
+4. **個股**：`QTreeWidget` 依產業族群列出全市場約1700檔股票，選取項目即時顯示右側摘要卡（含趨勢/動能/量能徽章），雙擊叫 FinMind API 查本益比/殖利率/股價淨值比/三大法人（`StockDetailDialog`，同樣有趨勢徽章）。彈窗「顯示完整籌碼面資訊」按鈕點下去才查跟部位紀錄頁相同的詳細資料＋分頁（歷史股價／三大法人／法人分別／融資融券／VPT／MFI／借券賣出餘額／借券成交／技術分析，共 8 張圖），技術分析可切換 KD／MACD／均線／RSI 等 24 類指標（純本地 SQLite 計算，不額外呼叫 API）。
 5. **期貨**：預設列出 TAIFEX 全部期貨商品盤後行情，搜尋框輸入才篩選。「標的」欄對照股票期貨標的、大額前10買/賣/淨/買佔比摘要欄；點選某列看完整大額未沖銷部位明細＋趨勢圖，雙擊開大彈窗。大額歷史由背景自動回補（綁定「設定」頁回補天數）。細節較多，見 `CHANGELOG.md` 2026-08-14 那幾則。
 6. **設定**：自動檢測開關、回補天數（TWSE／TPEX／期貨大額交易人歷史共用）、回補按鈕。**沒有 FinMind API Token 輸入欄**（見下方「已知缺口」）。
 
@@ -78,19 +78,17 @@ user 提出完整規格：把 `tradingnote_gui.py` 拆成 `ui/theme.py`＋`ui/co
 - `ui/components/section_card.py`（`SectionCard`，標題＋描述＋`body_layout` 讓呼叫端塞內容，沿用 `summaryCard` 卡片樣式）。用法：「法人方向」子頁整個包進一張卡（原本是頁面上直接鋪標題+提示+三張圖，沒有卡片邊界）。
 - `ui/components/insight_card.py`（`InsightCard`，headline＋detail，rule-based 不接 LLM）。用法：`tradingnote_gui._flow_momentum_insight()`——從族群資金流向資料（量比≥1.5 且當日漲跌 |%|≥0.5 才夠格參與）挑出當天最極端的一筆量價訊號，生成一句話（例如「資金動能增強：{族群}今日成交量為近期均量的X倍，且價格同步走強」），沒有夠格的族群時顯示中性的「暫無明顯資金訊號」，不留白。放在「資金流向」分頁 StatCard 下方。
 - **正綠負紅→正紅負綠**（2026-09-15 續7，已拍板並套用）：`COLOR_GAIN`/`COLOR_LOSS`（含對應的 `_TINT`）兩組 hex 直接對調，改成台灣市場「漲紅跌綠」慣例。因為所有呼叫端都是透過 `gain_loss_color()`／常數名稱取色，不是寫死 RGB，這次全部自動套用到全部畫面（個股漲跌、三大法人買賣超、大額交易人淨部位、資金流向徽章、泡泡圖四象限），沒有另外改任何呼叫端程式碼。
-- **`SignalBadge` 推廣到「個股概覽」**（2026-09-15 續8）：`StockDetailDialog`（雙擊個股彈出的視窗）hero 下方新增「趨勢／動能／量能」三個徽章，`tradingnote_gui._stock_trend_badges()` 純粹解讀既有本地技術指標（`tradingnote_technical.calculate_indicators`，MA20／RSI(14)／量比 20），沒有新增指標計算。資料不足（新股/剛上市）時顯示「歷史資料不足，暫無法判斷趨勢／動能／量能」而不是留白或錯誤資料。
+- **`SignalBadge` 推廣到「個股概覽」**（2026-09-15 續8／續9）：`tradingnote_gui._stock_trend_badges()` 純粹解讀既有本地技術指標（`tradingnote_technical.calculate_indicators`，MA20／RSI(14)／量比 20），沒有新增指標計算，資料不足時顯示一致的「歷史資料不足...」空狀態文字。用在兩處：(1) `StockDetailDialog`（雙擊個股彈出的視窗）hero 下方；(2)「個股查詢」分頁右側 `stock_preview` 摘要面板，選取清單項目時即時更新。兩處共用 `_populate_trend_badge_row()`／`_clear_layout()` 兩個 helper，不是各自重複一份 build/clear 邏輯。
 
 **還沒做**（下一輪候選，任選其一即可，不用照順序）：
 - `SectionCard`／`InsightCard` 目前都只各用在一處，還沒推廣到其他頁面。
 - 泡泡圖／VPT／MFI／融資融券等 pyqtgraph 圖表系列色（`tradingnote_gui.py` 裡還有一批 `#1f77b4`／`#2ca02c` 之類的分類色，屬於資料序列配色，不是介面底色，這次刻意沒動）。
 - Sidebar 分組（市場／分析／交易／資料）、Dashboard／個股頁的 progressive disclosure 重做——規格中風險較高、影響面較大的部分，建議等 component 庫更完整再做。
 
-## 目前實際尚未 commit 的異動（2026-09-15）
-以 `git status` 為準，這裡只是提示去哪找細節：
-1. 個股本地技術線圖擴充（`tradingnote_technical.py`，24類指標圖表目錄）——見 `CHANGELOG.md` 2026-09-10。
-2. 全新交易週誌功能（`tradingnote_journal.py` + 3 個測試檔，測試檔尚未 `git add`）——見 `CHANGELOG.md` 2026-09-10。
-3. 架構重複整理＋文件重整（新增 `tradingnote_api_config.py`／`STATUS.md`／`CHANGELOG.md`，重寫 `ARCHITECTURE.md`，修改 `tradingnote_core.py`／`tradingnote_history.py`／`tradingnote_institutional.py`／`tradingnote_taifex.py`／`tradingnote_finmind.py`／`tradingnote_cache.py`／`refresh_concepts.py`，`tradingnote_gui.py` 拿掉左側導覽列圖示）——見 `CHANGELOG.md` 2026-09-15。
-4. GUI design system 啟動＋dark mode 套用（新增 `ui/` 目錄、`assets/chevron-*-dark.svg`）——見上方「GUI Design System 重構」與 `CHANGELOG.md` 2026-09-15（續3／續4）。
+## 目前實際尚未 commit 的異動
+以 `git status` 為準，這份清單只是提示去哪找細節，不是完整列表：
+- 融資／借券歷史圖表（`tradingnote_finmind.py`／`tradingnote_gui.py`）——見 `CHANGELOG.md` 2026-09-15（續10）。
+- **Codex 同時間在同一份 working tree 上的異動**（`tradingnote_flow.py`／`tradingnote_history.py`／`tradingnote_institutional.py` 修改、新增 `ANALYSIS_CONSISTENCY.md`／`test_tradingnote_flow.py`／`test_tradingnote_flow_gui.py`）：Claude 這邊沒有動過這些檔案，內容跟脈絡不明，**不要不看內容就一起 commit**——先確認是 Codex 正在進行中的工作還是已經做完，跟 Codex／user 確認過再決定怎麼處理，避免把還沒驗證過的變更跟未理解的內容一起打包進同一個 commit。
 
 ## 如果要繼續開發，建議先讀
 1. 這份 `STATUS.md`（現況最新）

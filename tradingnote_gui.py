@@ -39,6 +39,7 @@ from tradingnote_history import (
     get_industry_map,
     get_latest_ticker_record,
     record_snapshot,
+    get_data_revision,
     record_valuation_snapshot,
     trading_days_between,
 )
@@ -146,6 +147,7 @@ from ui.theme import (  # noqa: E402
     COLOR_SELECTED_BG,
     COLOR_DISABLED_BG,
     COLOR_DISABLED_TEXT,
+    COLOR_SPECIAL,
     FONT_FAMILY,
     STYLESHEET,
 )
@@ -277,6 +279,39 @@ def _stock_trend_badges(technical):
             badges.append(("量能：平穩", "neutral"))
 
     return badges
+
+
+def _clear_layout(layout):
+    """移除 layout 裡目前所有 widget，給要重複重繪同一列徽章／標籤的地方用
+    （例如切換選取股票時），避免每次都往下疊加舊的 widget。`takeAt()` 只是讓
+    layout 不再管這個 widget 的版面配置，widget 本身仍是同一個 parent 底下的
+    子物件，還會留在原地疊圖，所以要先 `setParent(None)` 把它整個拔出父子關係
+    立刻讓它從畫面上消失，`deleteLater()` 才是排隊真正刪除底層 Qt 物件。
+    """
+    while layout.count():
+        child = layout.takeAt(0)
+        widget = child.widget()
+        if widget is not None:
+            widget.setParent(None)
+            widget.deleteLater()
+
+
+def _populate_trend_badge_row(layout, technical, empty_text="歷史資料不足，暫無法判斷趨勢／動能／量能。"):
+    """清空並重繪一列「趨勢／動能／量能」SignalBadge；沒有夠格的資料時改顯示
+    empty_text 的 muted 提示，維持跟其他空狀態一致的呈現方式。共用給
+    `StockDetailDialog` 與「個股查詢」分頁的 `stock_preview` 摘要面板。
+    """
+    _clear_layout(layout)
+    badges = _stock_trend_badges(technical)
+    if badges:
+        for text, tone in badges:
+            layout.addWidget(SignalBadge(text, tone=tone))
+    else:
+        hint = QtWidgets.QLabel(empty_text)
+        hint.setProperty("muted", True)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+    layout.addStretch(1)
 
 
 def _screen_fit_size(widget, preferred_width=None, preferred_height=None, ratio=0.85):
@@ -710,15 +745,7 @@ class StockDetailDialog(QtWidgets.QDialog):
 
         trend_row = QtWidgets.QHBoxLayout()
         trend_row.setSpacing(6)
-        trend_badges = _stock_trend_badges(technical)
-        if trend_badges:
-            for text, tone in trend_badges:
-                trend_row.addWidget(SignalBadge(text, tone=tone))
-        else:
-            trend_hint = QtWidgets.QLabel("歷史資料不足，暫無法判斷趨勢／動能／量能。")
-            trend_hint.setProperty("muted", True)
-            trend_row.addWidget(trend_hint)
-        trend_row.addStretch(1)
+        _populate_trend_badge_row(trend_row, technical)
 
         self.status_label = QtWidgets.QLabel("查詢中...")
         self.status_label.setWordWrap(True)
@@ -825,6 +852,8 @@ class StockDetailDialog(QtWidgets.QDialog):
         self.full_detail_margin_chart = pg.PlotWidget()
         self.full_detail_vpt_chart = pg.PlotWidget()
         self.full_detail_mfi_chart = pg.PlotWidget()
+        self.full_detail_sbl_chart = pg.PlotWidget()
+        self.full_detail_lending_chart = pg.PlotWidget()
         for chart in (
             self.full_detail_price_chart,
             self.full_detail_flow_chart,
@@ -832,6 +861,8 @@ class StockDetailDialog(QtWidgets.QDialog):
             self.full_detail_margin_chart,
             self.full_detail_vpt_chart,
             self.full_detail_mfi_chart,
+            self.full_detail_sbl_chart,
+            self.full_detail_lending_chart,
         ):
             chart.setBackground(COLOR_SURFACE)
             chart.showGrid(x=True, y=True, alpha=0.08)
@@ -846,6 +877,8 @@ class StockDetailDialog(QtWidgets.QDialog):
         self.full_detail_tabs.addTab(self.full_detail_margin_chart, "融資融券")
         self.full_detail_tabs.addTab(self.full_detail_vpt_chart, "VPT")
         self.full_detail_tabs.addTab(self.full_detail_mfi_chart, "MFI")
+        self.full_detail_tabs.addTab(self.full_detail_sbl_chart, "借券賣出餘額")
+        self.full_detail_tabs.addTab(self.full_detail_lending_chart, "借券成交")
         self.full_detail_technical_widget = TechnicalAnalysisWidget()
         self.full_detail_tabs.addTab(self.full_detail_technical_widget, "技術分析")
 
@@ -880,6 +913,8 @@ class StockDetailDialog(QtWidgets.QDialog):
                 self.full_detail_margin_chart,
                 self.full_detail_vpt_chart,
                 self.full_detail_mfi_chart,
+                self.full_detail_sbl_chart,
+                self.full_detail_lending_chart,
                 header,
                 cached,
                 note,
@@ -912,6 +947,8 @@ class StockDetailDialog(QtWidgets.QDialog):
             self.full_detail_margin_chart,
             self.full_detail_vpt_chart,
             self.full_detail_mfi_chart,
+            self.full_detail_sbl_chart,
+            self.full_detail_lending_chart,
             header,
             data,
             technical_widget=self.full_detail_technical_widget,
@@ -936,6 +973,8 @@ class StockDetailDialog(QtWidgets.QDialog):
                 self.full_detail_margin_chart,
                 self.full_detail_vpt_chart,
                 self.full_detail_mfi_chart,
+                self.full_detail_sbl_chart,
+                self.full_detail_lending_chart,
                 header,
                 cached,
                 note,
@@ -969,6 +1008,12 @@ class IndustryTopStocksDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 12)
 
+        if top_stocks:
+            first = top_stocks[0]
+            layout.addWidget(QtWidgets.QLabel(
+                f"分析期間：{first.get('start_date', '')} ～ {first.get('end_date', '')}；"
+                "1 日採當日漲跌，量比均量不含截止日。"
+            ))
         table = QtWidgets.QTableWidget(len(top_stocks), 9)
         table.setHorizontalHeaderLabels(
             [
@@ -989,19 +1034,19 @@ class IndustryTopStocksDialog(QtWidgets.QDialog):
         table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
         for row, stock in enumerate(top_stocks):
             change_pct = stock["change_pct"]
-            change_str = f"{change_pct:+.2f}%" if change_pct is not None else "N/A"
+            change_str = f"{change_pct:+.2f}%" if change_pct is not None else f"實際有 {stock.get('actual_days', 0)}／需要 {stock.get('required_days', days)} 個交易日（價格不足）"
             color = gain_loss_color(change_pct or 0)
             avg_volume = stock["avg_volume"]
             per = stock["per"]
-            eps = stock["close"] / per if per else None
+            eps = stock["close"] / per if per and stock["close"] is not None else None
             values = [
                 stock["ticker"],
                 stock["name"] or "-",
-                f"{stock['close']:.2f}",
+                f"{stock['close']:.2f}" if stock["close"] is not None else "資料不足",
                 change_str,
                 f"{stock['trading_value'] / 1e8:,.2f}",
                 f"{stock['today_volume'] / 1000:,.0f}" if stock["today_volume"] is not None else "-",
-                f"{avg_volume / 1000:,.0f}" if avg_volume is not None else "-",
+                f"{avg_volume / 1000:,.0f}" if avg_volume is not None else f"實際有 {stock.get('actual_volume_days', 0)}／需要 {stock.get('required_volume_days', days)} 個歷史交易日",
                 f"{per:.2f}" if per is not None else "N/A",
                 f"{eps:.2f}" if eps is not None else "N/A",
             ]
@@ -1629,6 +1674,9 @@ def populate_flow_chart(
             f"成交活躍度：{turnover_ratio:.2f} 倍\n"
             if turnover_ratio is not None else "成交活躍度：—\n"
         )
+        if dashboard is not None:
+            dates = dashboard.period.actual_dates
+            tip += f"分析期間：{dates[0] if dates else '—'} ～ {dashboard.period.end_date}\n"
         tip += (
             f"所在象限：{quadrant_name}（{quadrant_detail}）\n"
             f"成交佔比：{f.capital_share_pct:.1f}%\n"
@@ -1983,6 +2031,48 @@ def _populate_mfi_chart(chart, vpt_mfi_history):
     _mark_latest_value(chart, x, dates, series, "#bcbd22", "{:.1f}")
 
 
+def _populate_short_sale_balance_chart(chart, sbl_balance):
+    """借券賣出餘額（股）趨勢圖：跟 _populate_margin_chart 一樣是「餘額」，直接
+    畫原始值。這是證券商辦理有價證券借貸的餘額，單位是股，跟融資融券頁籤的
+    「張」不是同一個量級，所以是獨立分頁，不是加進融資融券那張圖。"""
+    chart.clear()
+    if sbl_balance is None or not sbl_balance.get("dates"):
+        return
+
+    dates = sbl_balance["dates"]
+    x = list(range(len(dates)))
+    step = max(1, len(dates) // 8)
+    chart.getPlotItem().getAxis("bottom").setTicks(
+        [[(i, dates[i]) for i in range(0, len(dates), step)]]
+    )
+
+    series = sbl_balance["series"]["借券賣出餘額"]
+    chart.plot(x, series, pen=pg.mkPen(COLOR_ACCENT, width=2), name="借券賣出餘額")
+    chart.setLabel("left", "餘額（股）", color=COLOR_TEXT)
+    chart.setTitle(f"借券賣出餘額｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
+
+
+def _populate_lending_volume_chart(chart, lending):
+    """借券成交量（張）趨勢圖：借券市場的每日成交量，跟借券賣出餘額是不同性質
+    的數字（一個是累積餘額，一個是當日流量），單位也不同（股 vs 張），所以
+    分開兩張圖，不合併成一張雙軸圖。"""
+    chart.clear()
+    if lending is None or not lending.get("dates"):
+        return
+
+    dates = lending["dates"]
+    x = list(range(len(dates)))
+    step = max(1, len(dates) // 8)
+    chart.getPlotItem().getAxis("bottom").setTicks(
+        [[(i, dates[i]) for i in range(0, len(dates), step)]]
+    )
+
+    series = lending["series"]["借券成交量"]
+    chart.plot(x, series, pen=pg.mkPen(COLOR_SPECIAL, width=2), name="借券成交量")
+    chart.setLabel("left", "成交量（張）", color=COLOR_TEXT)
+    chart.setTitle(f"借券成交量｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
+
+
 def _plot_technical_series(chart, dates, series, color, name):
     points = [
         (index, value)
@@ -2107,24 +2197,27 @@ def _render_detail_block(
     margin_chart,
     vpt_chart,
     mfi_chart,
+    sbl_chart,
+    lending_chart,
     header,
     data,
     note=None,
     technical_widget=None,
 ):
-    """畫「個股籌碼面詳細資訊」文字摘要＋六張趨勢圖與技術分析（歷史股價／三大法人／
-    法人分別／融資融券／VPT／MFI）。data 是 fetch_position_detail() 的回傳值（不管是剛
-    查到的，還是 position_detail_cache.json 讀出來的上次結果，shape 都相同，見
-    tradingnote_finmind.POSITION_DETAIL_FIELDS）；「部位紀錄」頁跟「個股」頁的
-    StockDetailDialog 共用這份畫面邏輯，畫在各自傳入的 label／圖表 widget 上。
-    note 非 None 時插在 header 下面一行，用來標示「這是上次的快取，背景更新中」
-    或「背景更新失敗，顯示上次結果」。"""
+    """畫「個股籌碼面詳細資訊」文字摘要＋八張趨勢圖與技術分析（歷史股價／三大法人／
+    法人分別／融資融券／VPT／MFI／借券賣出餘額／借券成交量）。data 是
+    fetch_position_detail() 的回傳值（不管是剛查到的，還是 position_detail_cache.json
+    讀出來的上次結果，shape 都相同，見 tradingnote_finmind.POSITION_DETAIL_FIELDS）；
+    「部位紀錄」頁跟「個股」頁的 StockDetailDialog 共用這份畫面邏輯，畫在各自
+    傳入的 label／圖表 widget 上。note 非 None 時插在 header 下面一行，用來標示
+    「這是上次的快取，背景更新中」或「背景更新失敗，顯示上次結果」。"""
     valuation = data["valuation"]
     history = data["institutional_history"]
     margin_history = data["margin_history"]
     foreign_shareholding = data["foreign_shareholding"]
     lending = data["lending"]
     suspension = data["suspension"]
+    sbl_balance = data.get("sbl_short_balance")
 
     lines = [header] if header else []
     if note:
@@ -2170,7 +2263,6 @@ def _render_detail_block(
             "※非券商真實成本，僅由歷史融資量反推近似值"
         )
 
-    sbl_balance = data.get("sbl_short_balance")
     if sbl_balance is None:
         lines.append("借券賣出餘額：查無資料")
     else:
@@ -2233,6 +2325,8 @@ def _render_detail_block(
     _populate_margin_chart(margin_chart, margin_history)
     _populate_vpt_chart(vpt_chart, data.get("vpt_mfi_history"))
     _populate_mfi_chart(mfi_chart, data.get("vpt_mfi_history"))
+    _populate_short_sale_balance_chart(sbl_chart, sbl_balance)
+    _populate_lending_volume_chart(lending_chart, lending)
     if technical_widget is not None:
         technical_widget.set_data(calculate_indicators([dict(date=r["date"], open=r.get("open"), max=r.get("high"), min=r.get("low"), close=r.get("close"), Trading_Volume=r.get("volume"), Trading_money=r.get("trading_value")) for r in data.get("price_history", [])]) or data.get("technical_indicators"))
 
@@ -2487,6 +2581,10 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             # 歷史。「最新一筆」資料靠每次「重新整理」／啟動都會呼叫的
             # _record_valuation_snapshot_best_effort 存一筆快照即可，足夠這個模式使用。
 
+        self._flow_revision_timer = QtCore.QTimer(self)
+        self._flow_revision_timer.timeout.connect(self._refresh_flow_on_revision)
+        self._flow_revision_timer.start(1000)
+
         self._new_data_check_timer = QtCore.QTimer(self)
         self._new_data_check_timer.timeout.connect(self._check_for_new_data)
         self._new_data_check_timer.start(NEW_DATA_CHECK_INTERVAL_MS)
@@ -2627,7 +2725,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(10, 10, 10, 10)
 
         self.flow_period = FlowPeriod(
-            default_start_date_for_days(HISTORY_DB_PATH, 5), 5
+            "0001-01-01", 5
         )
 
         toolbar = QtWidgets.QHBoxLayout()
@@ -2815,8 +2913,14 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.flow_chart, 1)
 
     def _update_flow_date_button(self):
+        period = self.flow_period.resolve(HISTORY_DB_PATH, self.snapshot)
+        start = period.actual_dates[0] if period.actual_dates else period.start_date
         self.flow_date_button.setText(
-            f"{self.flow_period.start_date} 起（近 {self.flow_period.trading_days} 個交易日） · 選日期"
+            f"{start} ～ {period.end_date} · 近 {period.trading_days} 日"
+        )
+
+        self.flow_date_button.setToolTip(
+            f"實際有 {len(period.actual_dates)}／需要 {period.trading_days} 個交易日；點擊選日期"
         )
 
     def _on_flow_bubble_mode_changed(self, _index):
@@ -2839,18 +2943,22 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.refresh_flow_tab()
 
     def _open_flow_date_picker(self):
-        # 可選的起始日只到「今天以前」——avg_days 的語意本來就是「今天以前 N 個交易日」
-        # （見 compute_industry_flow），選今天當起始日沒有意義（等同 0 天，永遠資料不足）。
-        today_iso = date.today().isoformat()
-        valid_dates = [d for d in get_available_dates(HISTORY_DB_PATH) if d < today_iso]
+        end_date = max((p.date for p in self.snapshot.values() if p.date), default=date.today().isoformat())
+        valid_dates = sorted(set(d for d in get_available_dates(HISTORY_DB_PATH) if d <= end_date)
+                             | {p.date for p in self.snapshot.values() if p.date and p.date <= end_date})
         dialog = TradingDateDialog(self, valid_dates, "選擇流向區間起始日期")
         if dialog.exec() == QtWidgets.QDialog.Accepted and dialog.selected_date:
-            days = max(1, trading_days_between(HISTORY_DB_PATH, dialog.selected_date))
+            days = max(1, sum(d >= dialog.selected_date for d in valid_dates))
             self.flow_period = FlowPeriod(dialog.selected_date, days)
             self._update_flow_date_button()
             self.refresh_flow_tab()
 
+    def _refresh_flow_on_revision(self):
+        if get_data_revision(HISTORY_DB_PATH) != getattr(self, "_flow_data_revision", None):
+            self.refresh_flow_tab()
+
     def refresh_flow_tab(self):
+        self._flow_data_revision = get_data_revision(HISTORY_DB_PATH)
         period = self.flow_period
         classification_mode = self._flow_classification_mode()
         classification_scope = self._flow_classification_scope()
@@ -2864,7 +2972,10 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             classification_mode=classification_mode,
             classification_scope=classification_scope,
         )
-        data_date = _snapshot_date(self.snapshot) or "資料日期未明"
+        period = dashboard.period
+        self._display_flow_period = period
+        self._update_flow_date_button()
+        data_date = period.end_date or "資料日期未明"
         self.flow_chart_header.setText(
             f"{classification_label}資金流向圖　·　{data_date}"
         )
@@ -2878,6 +2989,13 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
                 "先看淡色象限判斷區間狀態，再看泡泡大小（成交佔比）與當日紅綠；"
                 "滑鼠移至泡泡可看完整數值與象限解讀。"
             )
+        if not period.sufficient:
+            self.flow_chart_hint.setText(self.flow_chart_hint.text() +
+                f" 實際有 {len(period.actual_dates)}／需要 {period.trading_days} 個交易日。")
+        stale_count = sum(p.date != period.end_date for p in self.snapshot.values())
+        if stale_count:
+            self.flow_chart_hint.setText(self.flow_chart_hint.text() +
+                f" {stale_count} 檔來源日期與截止日不同，未混用其價格計算。")
         populate_flow_chart(
             self.flow_chart,
             HISTORY_DB_PATH,
@@ -3024,10 +3142,10 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         ranked_count = 0
         for f in flow:
             if f.avg_change_pct is None:
-                change_text = "資料不足"
+                change_text = f"實際有 {f.actual_days}／需要 {f.required_days} 個交易日（價格不足）"
             else:
                 change_text = f"{f.avg_change_pct:+.2f}%"
-            volume_text = f"{f.volume_ratio:.2f}" if f.volume_ratio is not None else "資料不足"
+            volume_text = f"{f.volume_ratio:.2f}" if f.volume_ratio is not None else f"實際有 {f.actual_volume_days}／需要 {f.required_days} 個歷史交易日（量比不足）"
             score_texts = [
                 f"{score:.0f}" if score is not None else "資料不足"
                 for score in (
@@ -3125,7 +3243,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.stock_capital_flow_list.clear()
         for rank, stock in enumerate(stocks, start=1):
             change_text = (
-                f"{stock.change_pct:+.2f}%" if stock.change_pct is not None else "-"
+                f"{stock.change_pct:+.2f}%" if stock.change_pct is not None else f"實際有 {stock.actual_days}／需要 {stock.required_days} 個交易日（價格不足）"
             )
             volume_ratio_text = (
                 f"{stock.volume_ratio:.2f}" if stock.volume_ratio is not None else "-"
@@ -3420,6 +3538,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.position_margin_chart = pg.PlotWidget()
         self.position_vpt_chart = pg.PlotWidget()
         self.position_mfi_chart = pg.PlotWidget()
+        self.position_sbl_chart = pg.PlotWidget()
+        self.position_lending_chart = pg.PlotWidget()
         for chart in (
             self.position_price_chart,
             self.position_flow_chart,
@@ -3427,6 +3547,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self.position_margin_chart,
             self.position_vpt_chart,
             self.position_mfi_chart,
+            self.position_sbl_chart,
+            self.position_lending_chart,
         ):
             chart.setBackground(COLOR_SURFACE)
             chart.showGrid(x=True, y=True, alpha=0.08)
@@ -3441,6 +3563,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         position_detail_tabs.addTab(self.position_margin_chart, "融資融券")
         position_detail_tabs.addTab(self.position_vpt_chart, "VPT")
         position_detail_tabs.addTab(self.position_mfi_chart, "MFI")
+        position_detail_tabs.addTab(self.position_sbl_chart, "借券賣出餘額")
+        position_detail_tabs.addTab(self.position_lending_chart, "借券成交")
         self.position_technical_widget = TechnicalAnalysisWidget()
         position_detail_tabs.addTab(self.position_technical_widget, "技術分析")
         outer_layout.addWidget(position_detail_tabs)
@@ -3528,6 +3652,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self.position_margin_chart.clear()
             self.position_vpt_chart.clear()
             self.position_mfi_chart.clear()
+            self.position_sbl_chart.clear()
+            self.position_lending_chart.clear()
             self.position_technical_widget.set_data(None)
             return
         pos = find_position(self.positions, position_id)
@@ -3560,6 +3686,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self.position_margin_chart.clear()
             self.position_vpt_chart.clear()
             self.position_mfi_chart.clear()
+            self.position_sbl_chart.clear()
+            self.position_lending_chart.clear()
             self.position_technical_widget.set_data(None)
 
         token = self.settings.get("finmind_token", "")
@@ -3587,7 +3715,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.update_finmind_count_label()
 
     def _render_position_detail(self, header, data, note=None):
-        """畫「部位詳細資訊」文字摘要＋六張趨勢圖與技術分析。實際畫面邏輯是模組層級的
+        """畫「部位詳細資訊」文字摘要＋八張趨勢圖與技術分析。實際畫面邏輯是模組層級的
         _render_detail_block（跟「個股」頁 StockDetailDialog 的「顯示完整籌碼
         面資訊」按鈕共用同一份），這裡只是把部位紀錄頁自己的 label／圖表
         widget 傳進去。"""
@@ -3599,6 +3727,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self.position_margin_chart,
             self.position_vpt_chart,
             self.position_mfi_chart,
+            self.position_sbl_chart,
+            self.position_lending_chart,
             header,
             data,
             note,
@@ -3630,6 +3760,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.position_margin_chart.clear()
         self.position_vpt_chart.clear()
         self.position_mfi_chart.clear()
+        self.position_sbl_chart.clear()
+        self.position_lending_chart.clear()
         self.position_technical_widget.set_data(None)
         self.update_finmind_count_label()
 
@@ -4122,10 +4254,13 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             "開啟完整個股分析",
         )
         self.stock_preview_button.setEnabled(False)
+        self.stock_preview_trend_row = QtWidgets.QHBoxLayout()
+        self.stock_preview_trend_row.setSpacing(6)
         preview_layout.addWidget(preview_caption)
         preview_layout.addWidget(self.stock_preview_title)
         preview_layout.addSpacing(8)
         preview_layout.addWidget(self.stock_preview_price)
+        preview_layout.addLayout(self.stock_preview_trend_row)
         preview_layout.addWidget(self.stock_preview_meta)
         preview_layout.addStretch(1)
         preview_layout.addWidget(self.stock_preview_button)
@@ -4241,12 +4376,16 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self.stock_preview_price.set_value("—")
             self.stock_preview_meta.setText("雙擊股票可開啟完整估值與法人資訊。")
             self.stock_preview_button.setEnabled(False)
+            _clear_layout(self.stock_preview_trend_row)
             return
         price = self.snapshot.get(ticker)
         name = item.text(0)
         market = item.data(0, QtCore.Qt.UserRole + 1) or "—"
         industry = item.data(0, QtCore.Qt.UserRole + 2) or "未分類"
         self.stock_preview_title.setText(f"{name}　{ticker}")
+        _populate_trend_badge_row(
+            self.stock_preview_trend_row, load_local_technical(HISTORY_DB_PATH, ticker)
+        )
         if price is not None and price.close is not None:
             change_pct = _change_pct(price)
             change_text = f"{change_pct:+.2f}%" if change_pct is not None else "—"
