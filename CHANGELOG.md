@@ -6,6 +6,22 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 
 ---
 
+## 2026-09-15（續8）`SignalBadge` 推廣到「個股概覽」（`StockDetailDialog`）
+
+**動機**：續6/續7 都把「`SignalBadge` 推廣到個股概覽」列為候選但沒做，理由是當時程式裡沒有任何「趨勢判斷」邏輯可以驅動徽章內容。這輪 user 直接要求做這件事，所以先補上最小可行的 rule-based 判斷，再接上徽章。
+
+**改法**：
+1. `tradingnote_gui._stock_trend_badges(technical)`：純函式，輸入是 `tradingnote_technical.calculate_indicators()`（透過 `load_local_technical` 取得）既有的輸出，**沒有新增任何指標計算**，只是解讀已經算好的數字：
+   - 趨勢：最新收盤價相對 MA20 的乖離（≥1% 偏多、≤-1% 偏空，中間留一段中性帶過濾貼線雜訊）。
+   - 動能：RSI(14) 最新值（≥55 偏強、≤45 偏弱）。
+   - 量能：今日成交量 ÷ 均量20（≥1.2x 放大、≤0.8x 萎縮）——量能本身沒有天生多空傾向（爆量可能噴出也可能出貨），tone 刻意不用 positive/negative，放大用 warning（提醒注意），萎縮用 neutral，避免暗示「量增=好事」這種沒有根據的判斷。
+   任一項所需資料不存在（例如新股不到 20 個交易日）就跳過該項，不用預設值假裝有結論；三項都不足時回傳空 list。
+2. `StockDetailDialog.__init__`：原本 `load_local_technical(...)` 的結果只丟給 `TechnicalAnalysisWidget`，這次改成先存成區域變數 `technical`，同一份資料同時餵給徽章邏輯跟技術分析元件（不重複查兩次 DB）。在 hero（股價/漲跌）下方、狀態文字上方插入一列 `SignalBadge`；`_stock_trend_badges` 回傳空 list 時顯示 muted 文字「歷史資料不足，暫無法判斷趨勢／動能／量能。」而不是留白——跟已有的技術分析圖表本身的「尚無足夠歷史價格資料」空狀態文字風格一致。
+
+**驗證**：`.venv` python `import tradingnote_gui` 成功、`py_compile` 過關。用 `load_local_technical` 對真實 `2330`（`data/history.db` 既有資料）跑一次 `_stock_trend_badges`，人工核對算出來的門檻判斷（收盤 2385.0 vs MA20 2410.25，乖離 -1.05% → 偏空；RSI 46.7 → 中性）是對的，不是憑感覺看結果"順眼"就通過。用獨立測試腳本建構真實 `StockDetailDialog`（`fake_parent` 帶 `.snapshot`）截圖驗證兩種情境：(a) `2330` 真實資料 → 三個徽章「趨勢：偏空」「動能：中性」「量能：萎縮」都正確顯示且顏色跟同一列的漲跌%（同樣是綠色，續7 翻轉後負值＝綠）一致；(b) 一個不存在於 `history.db` 的假 ticker `9999` → 正確顯示「歷史資料不足...」的空狀態文字，沒有拋例外或顯示錯誤數字。**未做**：沒有在跑起來的完整 App 裡雙擊真實清單項目觸發這條路徑（滑鼠座標/截圖已知 DPI 落差，見更早條目）——但這條路徑只在 `__init__` 內部新增程式碼，沒有動任何事件連線邏輯，風險低；「個股查詢」分頁右側的 `stock_preview` 摘要面板這次沒有一起加徽章（規格裡沒明確要求那裡也要，且該面板空間較小，之後有需要再加）。
+
+---
+
 ## 2026-09-15（續7）`SectionCard`＋`InsightCard`＋正紅負綠拍板，一次做完
 
 **動機**：user 對「接下來做 SectionCard、InsightCard、還是先決定紅漲綠跌」的提問回答「都做」，一次把三件事都做完並要求 push 到遠端。

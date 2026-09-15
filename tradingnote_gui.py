@@ -218,6 +218,67 @@ def _flow_momentum_insight(rows):
     )
 
 
+def _latest_valid(values):
+    """從指標數列取最後一個非 None 的值（序列尾端通常是最新交易日）。"""
+    for value in reversed(values or ()):
+        if value is not None:
+            return value
+    return None
+
+
+def _stock_trend_badges(technical):
+    """rule-based（不接 LLM）：從既有的本地技術指標（tradingnote_technical.
+    calculate_indicators 的既有輸出，不新增任何指標計算）萃取「趨勢／動能／量能」
+    三個方向性標籤，給「個股概覽」的 SignalBadge 用。純粹是「怎麼解讀已經算好的
+    數字」：
+    - 趨勢：收盤價相對 MA20 的乖離（>=1% 偏多、<=-1% 偏空，用來過濾貼著均線
+      上下的雜訊）。
+    - 動能：RSI(14)（>=55 偏強、<=45 偏弱，50 上下不特別有意義所以留一段中性帶）。
+    - 量能：今日成交量相對均量20 的倍數（>=1.2x 放大、<=0.8x 萎縮）；量能本身
+      沒有天生的多空傾向（爆量可能是噴出也可能是出貨），tone 刻意不用
+      positive/negative，避免暗示「量增=好事」。
+    某一項資料不足（例如新股不到 20 個交易日）時該項直接跳過，不用預設值假裝
+    有結論；三項全部不足時回傳空 list，呼叫端應顯示「資料不足」的空狀態文字。
+    """
+    if not technical:
+        return []
+    badges = []
+
+    close = _latest_valid(technical.get("close"))
+    ma20 = _latest_valid(technical.get("ma", {}).get("ma20"))
+    if close is not None and ma20:
+        diff_pct = (close / ma20 - 1) * 100
+        if diff_pct >= 1:
+            badges.append(("趨勢：偏多", "positive"))
+        elif diff_pct <= -1:
+            badges.append(("趨勢：偏空", "negative"))
+        else:
+            badges.append(("趨勢：中性", "neutral"))
+
+    rsi = _latest_valid(technical.get("rsi"))
+    if rsi is not None:
+        if rsi >= 55:
+            badges.append(("動能：偏強", "positive"))
+        elif rsi <= 45:
+            badges.append(("動能：偏弱", "negative"))
+        else:
+            badges.append(("動能：中性", "neutral"))
+
+    volume_series = technical.get("charts", {}).get("volume", {}).get("series", {})
+    volume = _latest_valid(volume_series.get("成交量"))
+    volume_ma20 = _latest_valid(volume_series.get("均量20"))
+    if volume is not None and volume_ma20:
+        ratio = volume / volume_ma20
+        if ratio >= 1.2:
+            badges.append(("量能：放大", "warning"))
+        elif ratio <= 0.8:
+            badges.append(("量能：萎縮", "neutral"))
+        else:
+            badges.append(("量能：平穩", "neutral"))
+
+    return badges
+
+
 def _screen_fit_size(widget, preferred_width=None, preferred_height=None, ratio=0.85):
     """算出 widget 開啟時的合理尺寸，讓視窗／對話框自動符合目前螢幕大小，不會
     在小螢幕（筆電、遠端桌面）上比可視範圍還大而被裁到看不見。有給
@@ -644,6 +705,21 @@ class StockDetailDialog(QtWidgets.QDialog):
         self.hero_stat.set_value(price_text, change=change_text, status=status)
         hero_layout.addWidget(self.hero_stat)
 
+        cached = load_position_detail_cache(POSITION_DETAIL_CACHE_PATH, ticker) or {}
+        technical = load_local_technical(HISTORY_DB_PATH, ticker, cached.get("price_history"))
+
+        trend_row = QtWidgets.QHBoxLayout()
+        trend_row.setSpacing(6)
+        trend_badges = _stock_trend_badges(technical)
+        if trend_badges:
+            for text, tone in trend_badges:
+                trend_row.addWidget(SignalBadge(text, tone=tone))
+        else:
+            trend_hint = QtWidgets.QLabel("歷史資料不足，暫無法判斷趨勢／動能／量能。")
+            trend_hint.setProperty("muted", True)
+            trend_row.addWidget(trend_hint)
+        trend_row.addStretch(1)
+
         self.status_label = QtWidgets.QLabel("查詢中...")
         self.status_label.setWordWrap(True)
         self.status_label.setTextFormat(QtCore.Qt.RichText)
@@ -651,10 +727,10 @@ class StockDetailDialog(QtWidgets.QDialog):
         self._layout = QtWidgets.QVBoxLayout(self)
         self._layout.setContentsMargins(20, 20, 20, 16)
         self._layout.addWidget(self.hero)
+        self._layout.addLayout(trend_row)
         self._layout.addWidget(self.status_label)
         self.local_technical_widget = TechnicalAnalysisWidget()
-        cached = load_position_detail_cache(POSITION_DETAIL_CACHE_PATH, ticker) or {}
-        self.local_technical_widget.set_data(load_local_technical(HISTORY_DB_PATH, ticker, cached.get("price_history")))
+        self.local_technical_widget.set_data(technical)
         self._layout.addWidget(self.local_technical_widget)
         self.resize(900, 650)
 

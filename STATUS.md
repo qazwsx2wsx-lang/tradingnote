@@ -78,9 +78,10 @@ user 提出完整規格：把 `tradingnote_gui.py` 拆成 `ui/theme.py`＋`ui/co
 - `ui/components/section_card.py`（`SectionCard`，標題＋描述＋`body_layout` 讓呼叫端塞內容，沿用 `summaryCard` 卡片樣式）。用法：「法人方向」子頁整個包進一張卡（原本是頁面上直接鋪標題+提示+三張圖，沒有卡片邊界）。
 - `ui/components/insight_card.py`（`InsightCard`，headline＋detail，rule-based 不接 LLM）。用法：`tradingnote_gui._flow_momentum_insight()`——從族群資金流向資料（量比≥1.5 且當日漲跌 |%|≥0.5 才夠格參與）挑出當天最極端的一筆量價訊號，生成一句話（例如「資金動能增強：{族群}今日成交量為近期均量的X倍，且價格同步走強」），沒有夠格的族群時顯示中性的「暫無明顯資金訊號」，不留白。放在「資金流向」分頁 StatCard 下方。
 - **正綠負紅→正紅負綠**（2026-09-15 續7，已拍板並套用）：`COLOR_GAIN`/`COLOR_LOSS`（含對應的 `_TINT`）兩組 hex 直接對調，改成台灣市場「漲紅跌綠」慣例。因為所有呼叫端都是透過 `gain_loss_color()`／常數名稱取色，不是寫死 RGB，這次全部自動套用到全部畫面（個股漲跌、三大法人買賣超、大額交易人淨部位、資金流向徽章、泡泡圖四象限），沒有另外改任何呼叫端程式碼。
+- **`SignalBadge` 推廣到「個股概覽」**（2026-09-15 續8）：`StockDetailDialog`（雙擊個股彈出的視窗）hero 下方新增「趨勢／動能／量能」三個徽章，`tradingnote_gui._stock_trend_badges()` 純粹解讀既有本地技術指標（`tradingnote_technical.calculate_indicators`，MA20／RSI(14)／量比 20），沒有新增指標計算。資料不足（新股/剛上市）時顯示「歷史資料不足，暫無法判斷趨勢／動能／量能」而不是留白或錯誤資料。
 
 **還沒做**（下一輪候選，任選其一即可，不用照順序）：
-- `SignalBadge`／`SectionCard`／`InsightCard` 目前都只各用在一處，還沒推廣到其他頁面（例如個股概覽的「技術面：偏多」之類——這些「趨勢判斷」邏輯目前程式裡還沒有，需要先設計規則，不是單純套用元件）。
+- `SectionCard`／`InsightCard` 目前都只各用在一處，還沒推廣到其他頁面。
 - 泡泡圖／VPT／MFI／融資融券等 pyqtgraph 圖表系列色（`tradingnote_gui.py` 裡還有一批 `#1f77b4`／`#2ca02c` 之類的分類色，屬於資料序列配色，不是介面底色，這次刻意沒動）。
 - Sidebar 分組（市場／分析／交易／資料）、Dashboard／個股頁的 progressive disclosure 重做——規格中風險較高、影響面較大的部分，建議等 component 庫更完整再做。
 
