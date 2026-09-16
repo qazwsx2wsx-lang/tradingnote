@@ -104,7 +104,7 @@
 
 ## 跨模組共用慣例
 
-- **背景執行緒**：GUI 一律用 `tradingnote_tasks.run_background_task()`，不要自己刻 `threading.Thread` + 手動輪詢。
+- **背景執行緒**：GUI 一律用 `tradingnote_tasks.run_background_task()`，不要自己刻 `threading.Thread` + 手動輪詢。**一定要把回傳值存到一個會存活到任務完成的地方**（慣例是 `self._xxx_timer = run_background_task(...)`，這個名字沿用的是舊版實作，現在存的其實是 `BackgroundTask` 物件本身，不是 timer）——`BackgroundTask` 內部用來輪詢佇列的 `QTimer` 是它自己的屬性，如果呼叫端不留住回傳值，這個物件在背景執行緒做完之前就可能被 Python 回收，`on_done`／`on_error` 永遠不會被呼叫，而且不會拋例外、不會有任何錯誤訊息，是純粹的靜默失敗（2026-09-16 效能修正時實測發現：在事件迴圈裡直接寫 `run_background_task(self, work, on_done, on_error)` 而不接回傳值，`work_fn` 明明跑完了，`on_done` 卻永遠不會觸發）。現有每一處呼叫都遵守這個慣例，新增呼叫點時比照辦理。
 - **檔案快取 fallback**：新的「打 API、寫入快取、失敗退回舊快取」需求，先看 `tradingnote_cache.fetch_with_file_cache()` 能不能直接用；只有像 `get_market_snapshot()` 那種需要多階段 progress callback 的特例才手刻。
 - **LIFO 存取**：查詢單一股票的最新歷史資料，一律 `ORDER BY date DESC` + 專屬的 `(ticker, date DESC)` 索引，不要對 `(date, ticker)` 主鍵索引做「依 ticker 查」的查詢（會退化成全表掃描）。
 - **一個模組管一張表**：見上方「資料儲存」——新增 SQLite 表時，schema 跟讀寫函式要放在邏輯上擁有這份資料的模組裡，不要因為「剛好在改哪個檔案」就近放。

@@ -6,6 +6,32 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 
 ---
 
+## 2026-09-16 修正介面卡頓：高頻互動路徑改走背景執行緒
+
+**動機**：user 回報 GUI「非常卡頓」，要求檢查架構文件跟實際執行之間的矛盾點。派 Explore agent 檢查後確認：`ARCHITECTURE.md:107` 明文規定「GUI 一律用 `run_background_task()`」，但好幾處會被高頻觸發的重運算（個股選取即時查技術指標、資金流向全市場約1700檔聚合）完全繞過這條路徑，直接同步跑在 Qt 主執行緒——選取股票、打字篩選、甚至每秒一次的 `_flow_revision_timer` 都可能讓主執行緒卡住。
+
+**改法**（分四階段，逐階段驗證）：
+1. `_filter_stocks_tree`（搜尋框逐鍵觸發、對約1700個 `QTreeWidgetItem` 做 `setHidden`）：加 150ms debounce（`QTimer.singleShot`），迴圈包 `setUpdatesEnabled(False)` 批次更新；`refresh_stocks_tab`（建樹）同樣包 `setUpdatesEnabled`。
+2. `_on_stock_selected`：原本同步呼叫 `load_local_technical`（SQLite 查詢＋全歷史技術指標運算），改成 120ms debounce＋`run_background_task` 背景執行緒，並用 `tradingnote_cache.TTLCache`（5分鐘）依 ticker 快取。背景完成時比對 `_stock_trend_expected_ticker` 是否仍是目前選取的股票，避免使用者已切換到別檔時舊結果覆蓋畫面。
+3. `refresh_flow_tab`：`self.flow_service.analyze()`（全市場約1700檔聚合）改走 `run_background_task`。因為 `FlowAnalysisService` 內部快取字典不是 thread-safe，改成「同一時間只讓一份分析在跑，跑的期間若又有新請求就只記下最新一份、等目前這份跑完再接著跑」（`_flow_refresh_in_flight`／`_flow_refresh_pending_request`），不讓多個背景執行緒同時呼叫 `analyze()`。`_refresh_flow_on_revision` 每秒輪詢維持不變，但觸發的 `refresh_flow_tab()` 已經不會卡住主執行緒。
+4. `_on_futures_row_selected`：`get_large_traders_history_series`（SQLite 查詢）改成 100ms debounce＋背景執行緒，仿照 `_on_position_row_selected` 既有的背景化模式。
+
+**過程中發現的真實 bug（不是這次才引入，是 `tradingnote_tasks.run_background_task` API 的既有陷阱）**：實作階段2時，用 `QT_QPA_PLATFORM=offscreen` + 真實 `QEventLoop.exec()` 寫獨立驗證腳本，發現我自己新增的三個呼叫點全部沒有把 `run_background_task()` 的回傳值存起來（`run_background_task(self, work, on_done, on_error)`，沒有 `xxx = `）——結果就是背景執行緒明明跑完了，`on_done` 卻永遠不會被呼叫，且完全不拋例外、不留任何錯誤訊息，純靜默失敗。回頭檢查發現：現有全部 5 處既有呼叫點（`tradingnote_gui.py` 內 `self._xxx_timer = run_background_task(...)` 或 `run_task_in_thread(...)`）無一例外都有存回傳值，是一個必須遵守但沒被明文寫進 `ARCHITECTURE.md` 的隱性慣例。已補上 `self._stock_trend_task`／`self._flow_refresh_task`／`self._futures_trend_task` 三個屬性存住回傳值，並在 `ARCHITECTURE.md`「跨模組共用慣例」補一筆說明這個陷阱。
+
+**驗證**：
+- `python -m py_compile tradingnote_gui.py` 每階段都過關。
+- `python -m unittest test_tradingnote_flow test_tradingnote_technical`：13 個測試全過（這次只改 `tradingnote_gui.py`，核心模組邏輯不受影響，用來確認沒有意外波及）。
+- 用 `.venv` python、`QT_QPA_PLATFORM=offscreen`，實際 `import tradingnote_gui` 並建構 `TradingNoteWindow`，寫獨立驗證腳本（真實 `QEventLoop.exec()`，不是手動 `processEvents()` 忙輪詢——後者在這個 Qt 版本下對「重複觸發」的 `QTimer` 表現不穩定，會誤判成「卡住」，改用真正的事件迴圈才量得準）：
+  - `setCurrentItem`（觸發 `_on_stock_selected`）本身在 0.0000s 內回傳（原本同步查詢會卡在這一行）；trend badges 於 0.234s 後透過背景執行緒正確填入 4 個徽章 widget。
+  - 連續快速切換 5 檔股票（模擬方向鍵快速瀏覽），debounce 正確只在最後一檔穩定後才觸發一次背景查詢。
+  - `refresh_flow_tab()` 呼叫本身 0.0000s 回傳；背景分析於 2.562s 後完成並正確套用到畫面（`flow_list`／`stock_capital_flow_list`／`volume_outliers_list`／泡泡圖）。
+  - 連續呼叫 5 次 `refresh_flow_tab()`（模擬使用者快速切換日期／分類），驗證只有最新一份請求真正被執行、`_flow_refresh_pending_request` 最後正確清空成 `None`，沒有多個背景執行緒同時呼叫 `analyze()`。
+  - 「期貨」頁選列同樣驗證 debounce＋背景執行緒觸發正確。
+
+**未做**：沒有在真正跑起來的桌面 App（有實體視窗、真人滑鼠鍵盤）裡手動操作驗證主觀「有沒有感覺變不卡」——這次驗證都是離線腳本＋計時斷言，量到的是「主執行緒呼叫本身是否近乎瞬間回傳」跟「背景結果最終有沒有正確套用」，不是真人操作的主觀流暢度；且測試用的 `snapshot={}`（沒有真實報價），`flow_service.analyze()` 在真實約1700檔非空 snapshot 下的實際背景運算時間可能比測試量到的 2.5 秒更長，但無論多長都不會再卡住主執行緒，這是這次修正的核心目標。全域 `pg.setConfigOptions(antialias=True, ...)` 沒開 `useOpenGL` 這點（會放大每次圖表重繪的成本）這次刻意沒動，風險較高（深色主題才剛調好，改動全域繪圖設定有連帶視覺風險），留待後續視情況評估。
+
+---
+
 ## 2026-09-15（續10）融資／借券歷史趨勢圖（借券賣出餘額、借券成交量）
 
 **動機**：user 要求「融資、借券、券賣要有歷史紀錄顯示」。先評估現況：融資餘額／融券餘額其實已經有 120 天歷史＋趨勢圖（`fetch_margin_short_sale_history`），真正缺的是借券賣出餘額（SBL，證券商辦理有價證券借貸的餘額）跟借券成交（借券市場實際成交量／費率）——這兩個原本只顯示最新一天文字，沒有歷史圖。

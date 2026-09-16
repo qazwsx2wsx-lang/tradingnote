@@ -86,9 +86,9 @@ user 提出完整規格：把 `tradingnote_gui.py` 拆成 `ui/theme.py`＋`ui/co
 - Sidebar 分組（市場／分析／交易／資料）、Dashboard／個股頁的 progressive disclosure 重做——規格中風險較高、影響面較大的部分，建議等 component 庫更完整再做。
 
 ## 目前實際尚未 commit 的異動
-以 `git status` 為準，這份清單只是提示去哪找細節，不是完整列表：
-- 融資／借券歷史圖表（`tradingnote_finmind.py`／`tradingnote_gui.py`）——見 `CHANGELOG.md` 2026-09-15（續10）。
-- **Codex 同時間在同一份 working tree 上的異動**（`tradingnote_flow.py`／`tradingnote_history.py`／`tradingnote_institutional.py` 修改、新增 `ANALYSIS_CONSISTENCY.md`／`test_tradingnote_flow.py`／`test_tradingnote_flow_gui.py`）：Claude 這邊沒有動過這些檔案，內容跟脈絡不明，**不要不看內容就一起 commit**——先確認是 Codex 正在進行中的工作還是已經做完，跟 Codex／user 確認過再決定怎麼處理，避免把還沒驗證過的變更跟未理解的內容一起打包進同一個 commit。
+以 `git status` 為準，這份清單只是提示去哪找細節，不是完整列表（2026-09-16 更新：先前這裡記錄的「Codex 同時間在同一份 working tree 上的異動」已經不在 `git status` 裡，研判已經處理完並 commit 掉了，見 `7a6b19a fix: unify flow analysis periods and invalidate stale results`，移除該筆過時記錄）：
+- 介面卡頓修正：`_filter_stocks_tree`／`refresh_stocks_tab`（debounce＋批次更新）、`_on_stock_selected`（技術指標查詢改背景執行緒＋TTLCache）、`refresh_flow_tab`（全市場資金流向分析改背景執行緒，含 in-flight／pending 佇列避免同時呼叫）、`_on_futures_row_selected`（大額交易人歷史查詢改背景執行緒）。連帶在 `ARCHITECTURE.md` 補了 `run_background_task()` 回傳值必須留住的陷阱說明。見 `CHANGELOG.md` 2026-09-16。
+- `ui/stock_charts.py`／`test_stock_charts.py`（未追蹤）＋ `tradingnote_gui.py` 裡對應的 `StockChart`／`ComparisonWidget`／`chart_page` 使用：把圖表元件從 `tradingnote_gui.py` 抽到獨立模組、新增雙資料比較分頁，進行中、尚未驗證完成（不是這次卡頓修正的一部分，是先前就在進行的另一項工作）。
 
 ## 如果要繼續開發，建議先讀
 1. 這份 `STATUS.md`（現況最新）
