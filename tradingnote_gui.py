@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """tradingnote - 圖形介面版本（PySide6 + pyqtgraph）"""
 
+import hashlib
 import html
 import statistics
 from collections import Counter
@@ -1423,6 +1424,13 @@ def _flow_quadrant_specs(mode):
             (False, False): ("低估觀望", "估值較低・資金降溫", COLOR_NEUTRAL_TINT),
             (True, False): ("高估降溫", "估值較高・資金降溫", COLOR_LOSS_TINT),
         }
+    if mode == "institutional_sync":
+        return {
+            (False, True): ("訊號不一致", "同步偏賣・金額卻偏買超", COLOR_WARNING_TINT),
+            (True, True): ("主力同步買超", "同步偏買・買超金額大", COLOR_GAIN_TINT),
+            (False, False): ("主力同步賣超", "同步偏賣・賣超金額大", COLOR_LOSS_TINT),
+            (True, False): ("訊號不一致", "同步偏買・金額卻偏賣超", COLOR_WARNING_TINT),
+        }
     return {
         (False, True): ("放量承壓", "區間下跌・今日放量", COLOR_LOSS_TINT),
         (True, True): ("強勢吸金", "區間上漲・今日放量", COLOR_GAIN_TINT),
@@ -1535,6 +1543,47 @@ def _populate_institutional_direction_chart(chart, rows, value_attr, title):
     chart.setLabel("bottom", "← 賣超　估算淨額（億）　買超 →", color=COLOR_MUTED)
 
 
+def _sign(value):
+    return (value > 0) - (value < 0)
+
+
+def _institutional_sync_score(institutional_row):
+    """三大法人（外資／投信／自營商）同一族群的方向一致性分數，範圍 -3～+3：
+    每家淨買超記 +1、淨賣超記 -1、淨額剛好是 0 記 0，三家加總。+3＝三家全部
+    買超（主力同步買超）、-3＝三家全部賣超、其餘＝方向不一致。"""
+    return (
+        _sign(institutional_row.foreign_value)
+        + _sign(institutional_row.trust_value)
+        + _sign(institutional_row.dealer_value)
+    )
+
+
+def _category_color(name):
+    """依分類名稱決定穩定的泡泡填色／清單色塊：同一個分類名稱永遠對應同一個
+    顏色，且不依賴「這次畫面上還有哪些其他分類」（不是用排序索引分配色相），
+    才能保證泡泡圖跟下方清單用同一個名稱查出來的顏色永遠一致。用雜湊值決定
+    色相（0-359°），固定飽和度/明度（針對深色底調校），支援任意數量的分類——
+    官方產業（約35個）到概念主題/價值鏈細分類（數百個）都適用，不需要為不同
+    分類模式另外設計。"""
+    digest = hashlib.md5(name.encode("utf-8")).digest()
+    hue = int.from_bytes(digest[:4], "big") % 360
+    return QtGui.QColor.fromHsv(hue, 140, 225)
+
+
+def _color_swatch_icon(color, size=10):
+    """畫一個實心色塊小圖示，給 QTreeWidgetItem.setIcon() 用，讓清單列跟
+    泡泡圖用同一個 _category_color() 產生視覺上可以直接比對的顏色。"""
+    pixmap = QtGui.QPixmap(size, size)
+    pixmap.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing)
+    painter.setBrush(QtGui.QBrush(color))
+    painter.setPen(QtCore.Qt.NoPen)
+    painter.drawEllipse(0, 0, size, size)
+    painter.end()
+    return QtGui.QIcon(pixmap)
+
+
 def populate_flow_chart(
     chart,
     db_path,
@@ -1596,6 +1645,33 @@ def populate_flow_chart(
         xs_for_ref = [xs_of(f) for f in plotted]
         x_ref_line = statistics.median(xs_for_ref) if xs_for_ref else 0
         y_ref_line = 1
+    elif mode == "institutional_sync":
+        # 三大法人資料只有最新一筆（get_cached_institutional_snapshot，30分鐘
+        # TTL，沒有歷史 DB 表），不像動能/估值模式有「N日流向區間」可選，這裡
+        # 如實呈現這個限制，不做歷史回補。dashboard.institutional_flow 由
+        # FlowAnalysisService.analyze() 無條件算好（見 tradingnote_flow.py），
+        # 用 group 名稱對應 dashboard.industry_flow 的 f.industry。
+        institutional_by_group = {
+            row.group: row
+            for row in (dashboard.institutional_flow if dashboard is not None else ())
+        }
+        flow = dashboard.industry_flow if dashboard is not None else ()
+        plotted = [
+            f for f in flow
+            if f.industry in institutional_by_group
+            and institutional_by_group[f.industry].covered_stocks > 0
+        ]
+        xs_of = lambda f: _institutional_sync_score(institutional_by_group[f.industry])  # noqa: E731
+        ys_of = lambda f: institutional_by_group[f.industry].total_value / 1e8  # noqa: E731
+        empty_hint = (
+            "尚無三大法人資料可繪製（需要當日三大法人買賣超資料，見「法人方向」"
+            "子頁；資料每30分鐘更新一次，僅反映最新一筆，不受上方「流向區間」影響）"
+        )
+        empty_title = f"{classification_label}主力同步買超"
+        x_label = "三大法人同步方向（-3=全部賣超　0=不一致　+3=全部買超）"
+        y_label = "三大法人合計買賣超金額（億元，正買超負賣超）"
+        title_prefix = f"{classification_label}主力同步買超｜三大法人方向一致性（僅最新一筆資料）"
+        x_ref_line, y_ref_line = 0, 0
     else:
         flow = (
             dashboard.industry_flow
@@ -1658,43 +1734,74 @@ def populate_flow_chart(
             (x >= x_ref_line, y >= y_ref_line)
         ]
         size = max(14.0, (f.capital_share_pct / max_share) ** 0.5 * 55.0)
-        daily_change, turnover_ratio, directional_value = direction_by_group.get(
-            f.industry, (None, None, None)
-        )
-        if daily_change is None or abs(daily_change) < 0.05:
-            color = QtGui.QColor(COLOR_MUTED)
-            direction_text = "中性"
-        elif daily_change > 0:
-            color = QtGui.QColor(COLOR_GAIN)
-            direction_text = "偏流入"
+        if mode == "institutional_sync":
+            # 這個模式的「方向」不是當日漲跌，是三大法人的同步一致性——外框顏色
+            # 改用一致性分數（+3～-3），不沿用其他模式共用的 daily_change_pct。
+            row = institutional_by_group[f.industry]
+            sync_score = xs_of(f)
+            if sync_score >= 2:
+                direction_color = QtGui.QColor(COLOR_GAIN)
+                direction_text = "主力同步買超"
+            elif sync_score <= -2:
+                direction_color = QtGui.QColor(COLOR_LOSS)
+                direction_text = "主力同步賣超"
+            else:
+                direction_color = QtGui.QColor(COLOR_MUTED)
+                direction_text = "方向不一致"
+            tip = (
+                f"{f.industry}｜{direction_text}\n"
+                f"外資：{_compact_money(row.foreign_value)}　"
+                f"投信：{_compact_money(row.trust_value)}　"
+                f"自營商：{_compact_money(row.dealer_value)}\n"
+                f"合計：{_compact_money(row.total_value)}　涵蓋 {row.covered_stocks} 檔\n"
+                f"資料日：{row.date}（僅最新一筆，不受上方「流向區間」影響）\n"
+                f"所在象限：{quadrant_name}（{quadrant_detail}）\n"
+                f"成交佔比：{f.capital_share_pct:.1f}%\n"
+                f"{x_label}：{x:.0f}\n{y_label}：{y:.2f}\n點擊查看成分股"
+            )
         else:
-            color = QtGui.QColor(COLOR_LOSS)
-            direction_text = "偏流出"
-        tip = (
-            f"{f.industry}｜當日{direction_text}\n"
-            f"方向推估：{_compact_money(directional_value)}　"
-            f"當日漲跌：{daily_change:+.2f}%\n" if daily_change is not None else
-            f"{f.industry}｜當日方向資料不足\n"
-        )
-        tip += (
-            f"成交活躍度：{turnover_ratio:.2f} 倍\n"
-            if turnover_ratio is not None else "成交活躍度：—\n"
-        )
-        if dashboard is not None:
-            dates = dashboard.period.actual_dates
-            tip += f"分析期間：{dates[0] if dates else '—'} ～ {dashboard.period.end_date}\n"
-        tip += (
-            f"所在象限：{quadrant_name}（{quadrant_detail}）\n"
-            f"成交佔比：{f.capital_share_pct:.1f}%\n"
-            f"{x_label}：{x:.2f}\n{y_label}：{y:.2f}\n點擊查看成分股"
-        )
+            daily_change, turnover_ratio, directional_value = direction_by_group.get(
+                f.industry, (None, None, None)
+            )
+            if daily_change is None or abs(daily_change) < 0.05:
+                direction_color = QtGui.QColor(COLOR_MUTED)
+                direction_text = "中性"
+            elif daily_change > 0:
+                direction_color = QtGui.QColor(COLOR_GAIN)
+                direction_text = "偏流入"
+            else:
+                direction_color = QtGui.QColor(COLOR_LOSS)
+                direction_text = "偏流出"
+            tip = (
+                f"{f.industry}｜當日{direction_text}\n"
+                f"方向推估：{_compact_money(directional_value)}　"
+                f"當日漲跌：{daily_change:+.2f}%\n" if daily_change is not None else
+                f"{f.industry}｜當日方向資料不足\n"
+            )
+            tip += (
+                f"成交活躍度：{turnover_ratio:.2f} 倍\n"
+                if turnover_ratio is not None else "成交活躍度：—\n"
+            )
+            if dashboard is not None:
+                dates = dashboard.period.actual_dates
+                tip += f"分析期間：{dates[0] if dates else '—'} ～ {dashboard.period.end_date}\n"
+            tip += (
+                f"所在象限：{quadrant_name}（{quadrant_detail}）\n"
+                f"成交佔比：{f.capital_share_pct:.1f}%\n"
+                f"{x_label}：{x:.2f}\n{y_label}：{y:.2f}\n點擊查看成分股"
+            )
+        # 填色＝分類（_category_color，同一分類永遠同一顏色，對照下方清單色塊）；
+        # 外框＝方向（direction_color，加粗讓辨識度更高）——兩種資訊分開兩個
+        # 視覺通道，不會互相蓋掉（2026-09-16 改版，原本填色跟外框都只有方向色，
+        # 沒有分類資訊）。
+        fill_color = _category_color(f.industry)
         spots.append(
             {
                 "pos": (x, y),
                 "size": size,
                 "data": {"industry": f.industry, "tip": tip},
-                "brush": pg.mkBrush(color.red(), color.green(), color.blue(), 185),
-                "pen": pg.mkPen(color.darker(125), width=1),
+                "brush": pg.mkBrush(fill_color.red(), fill_color.green(), fill_color.blue(), 195),
+                "pen": pg.mkPen(direction_color, width=2.5),
             }
         )
         if f.industry not in prominent:
@@ -1710,11 +1817,16 @@ def populate_flow_chart(
 
     # 所有泡泡共用單一 ScatterPlotItem，避免每次更新建立數十個 GraphicsObject。
     # 點擊仍可由 point.data() 找回群組，因此效能改善不犧牲互動。
+    # antialias=False：全域 pg.setConfigOptions(antialias=True) 套用到這顆
+    # scatter 後，搭配 hoverable=True 會讓滑鼠移動時每次 hover 重繪都要重新
+    # 光柵化抗鋸齒圓形，是泡泡圖互動卡頓的主因；只關掉這一個 widget 的抗鋸齒，
+    # 不動全域設定，不影響其他已經調好的深色主題視覺。
     scatter = pg.ScatterPlotItem(
         spots=spots,
         hoverable=True,
         tip=lambda _x, _y, data: data["tip"],
         hoverPen=pg.mkPen(COLOR_ACCENT, width=2),
+        antialias=False,
     )
     if on_industry_click is not None:
         scatter.sigClicked.connect(
@@ -2850,6 +2962,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.flow_bubble_mode_combo = QtWidgets.QComboBox()
         self.flow_bubble_mode_combo.addItem("動能象限（漲跌% × 量比）", "momentum")
         self.flow_bubble_mode_combo.addItem("估值象限（PER/PBR × 資金熱度）", "valuation")
+        self.flow_bubble_mode_combo.addItem("主力同步買超（三大法人方向一致）", "institutional_sync")
         self.flow_bubble_mode_combo.currentIndexChanged.connect(self._on_flow_bubble_mode_changed)
         toolbar.addWidget(self.flow_bubble_mode_combo)
 
@@ -2970,15 +3083,21 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
         legend_row = QtWidgets.QHBoxLayout()
         legend_row.setSpacing(6)
-        legend_row.addWidget(SignalBadge("偏流入", tone="positive"))
-        legend_row.addWidget(SignalBadge("偏流出", tone="negative"))
-        legend_row.addWidget(SignalBadge("中性", tone="neutral"))
+        # 圖例徽章文字依泡泡圖模式而變（見 _on_flow_bubble_mode_changed）：
+        # 動能/估值模式代表當日量價方向，主力同步買超模式代表三大法人一致性。
+        self.flow_direction_badge_positive = SignalBadge("偏流入", tone="positive")
+        self.flow_direction_badge_negative = SignalBadge("偏流出", tone="negative")
+        self.flow_direction_badge_neutral = SignalBadge("中性", tone="neutral")
+        legend_row.addWidget(self.flow_direction_badge_positive)
+        legend_row.addWidget(self.flow_direction_badge_negative)
+        legend_row.addWidget(self.flow_direction_badge_neutral)
         legend_row.addStretch(1)
         layout.addLayout(legend_row)
         layout.addSpacing(4)
 
         self.flow_chart_hint = QtWidgets.QLabel(
-            "顏色＝當日量價方向（見上方圖例）；標示成交佔比前五大族群，滑鼠移至泡泡查看數值。"
+            "泡泡填色＝所屬分類（對照下方清單色塊）；外框顏色＝方向（見上方圖例）；"
+            "標示成交佔比前五大族群，滑鼠移至泡泡查看數值。"
         )
         self.flow_chart_hint.setProperty("muted", True)
         self.flow_chart_hint.setWordWrap(True)
@@ -3002,6 +3121,14 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
     def _on_flow_bubble_mode_changed(self, _index):
         is_valuation = self.flow_bubble_mode_combo.currentData() == "valuation"
         self.flow_valuation_metric_combo.setVisible(is_valuation)
+        if self.flow_bubble_mode_combo.currentData() == "institutional_sync":
+            self.flow_direction_badge_positive.set_text_and_tone("主力同步買超", "positive")
+            self.flow_direction_badge_negative.set_text_and_tone("主力同步賣超", "negative")
+            self.flow_direction_badge_neutral.set_text_and_tone("方向不一致", "neutral")
+        else:
+            self.flow_direction_badge_positive.set_text_and_tone("偏流入", "positive")
+            self.flow_direction_badge_negative.set_text_and_tone("偏流出", "negative")
+            self.flow_direction_badge_neutral.set_text_and_tone("中性", "neutral")
         self.refresh_flow_tab()
 
     def _flow_classification_mode(self):
@@ -3097,17 +3224,25 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.flow_chart_header.setText(
             f"{classification_label}資金流向圖　·　{data_date}"
         )
-        if overlapping_groups:
+        if bubble_mode == "institutional_sync":
             self.flow_chart_hint.setText(
-                "先看淡色象限判斷區間狀態，再看泡泡大小與當日紅綠。概念可重疊；"
-                "泡泡大小為成交涵蓋率，各群組合計可能超過 100%。"
+                "泡泡填色＝所屬分類（對照下方清單色塊）；外框顏色＝三大法人同步方向"
+                "（見上方圖例）。僅反映最新一筆三大法人資料，不受「流向區間」影響；"
+                "滑鼠移至泡泡可看外資／投信／自營商個別金額。"
+            )
+        elif overlapping_groups:
+            self.flow_chart_hint.setText(
+                "泡泡填色＝所屬分類（對照下方清單色塊）；外框顏色＝當日量價方向"
+                "（見上方圖例）；泡泡大小為成交涵蓋率。概念可重疊，各群組合計可能"
+                "超過 100%。先看淡色象限判斷區間狀態，滑鼠移至泡泡可看完整數值。"
             )
         else:
             self.flow_chart_hint.setText(
-                "先看淡色象限判斷區間狀態，再看泡泡大小（成交佔比）與當日紅綠；"
+                "泡泡填色＝所屬分類（對照下方清單色塊）；外框顏色＝當日量價方向"
+                "（見上方圖例）；泡泡大小為成交佔比。先看淡色象限判斷區間狀態，"
                 "滑鼠移至泡泡可看完整數值與象限解讀。"
             )
-        if not period.sufficient:
+        if bubble_mode != "institutional_sync" and not period.sufficient:
             self.flow_chart_hint.setText(self.flow_chart_hint.text() +
                 f" 實際有 {len(period.actual_dates)}／需要 {period.trading_days} 個交易日。")
         stale_count = sum(p.date != period.end_date for p in self.snapshot.values())
@@ -3292,6 +3427,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
                 ]
             )
             item.setData(0, QtCore.Qt.UserRole, f.industry)
+            # 分類欄加色塊 icon，跟泡泡圖共用 _category_color()，讓清單列跟
+            # 泡泡圖的顏色可以直接對照，不新增欄位（避免牽動既有欄位索引）。
+            item.setIcon(1, _color_swatch_icon(_category_color(f.industry)))
             for col in (0, 2, 3, 4, 5, 6, 7, 8, 9, 10):
                 item.setTextAlignment(col, QtCore.Qt.AlignCenter)
             if f.avg_change_pct is not None:

@@ -184,8 +184,8 @@ class FlowAnalysisService:
         """產生資金流向頁完整資料；四個子分類共用同一個 period。"""
         if not isinstance(period, FlowPeriod):
             raise TypeError("period 必須是 FlowPeriod")
-        if bubble_mode not in ("momentum", "valuation"):
-            raise ValueError("bubble_mode 必須是 momentum 或 valuation")
+        if bubble_mode not in ("momentum", "valuation", "institutional_sync"):
+            raise ValueError("bubble_mode 必須是 momentum、valuation 或 institutional_sync")
         groups, classification_scope = self._groups(
             classification_mode, classification_scope
         )
@@ -267,7 +267,9 @@ class FlowAnalysisService:
             institutional_flow=institutional_flow,
         )
 
-        if bubble_mode == "momentum":
+        if bubble_mode != "valuation":
+            # momentum／institutional_sync 都不需要 valuation_flow：
+            # institutional_flow 已經在上面無條件算好、放進 cached。
             return cached
 
         valuation_key = (group_key, valuation_metric)

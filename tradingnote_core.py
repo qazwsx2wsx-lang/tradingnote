@@ -264,10 +264,17 @@ def fetch_tpex_valuation_all():
 
 
 def fetch_twse_valuation_all():
-    """打一次 BWIBBU_ALL，回傳今日全部上市股票的 {ticker: {"per":, "pbr":,
+    """打一次 BWIBBU_ALL，回傳今日全部上市股票的 {ticker: {"date":, "per":, "pbr":,
     "dividend_yield":}}（跟 fetch_tpex_valuation_all 同精神，一次拿全市場，
     不用逐檔查、不吃 FinMind 額度）。虧損公司算不出本益比的欄位是空字串，
-    `to_float` 已經會轉成 None，不用特別處理。"""
+    `to_float` 已經會轉成 None，不用特別處理。
+
+    2026-09-16 修正：先前這裡沒有讀 "Date" 欄位，`record_valuation_snapshot()`
+    因此收到的每筆資料都沒有來源日期、又沒有傳入 as_of_date，全部被過濾掉，
+    導致 valuation_observations／有效的 valuation_history 從來沒有任何上市股票
+    的資料（見 CHANGELOG.md 2026-09-16 條目）。實測 BWIBBU_ALL 其實跟
+    fetch_tpex_valuation_all 一樣有 "Date" 欄位（ROC 格式，例如 "1150915"），
+    只是先前沒有讀取，不是端點真的沒提供——不需要用 as_of_date 猜日期。"""
     rows = http_get_json(TWSE_VALUATION_URL)
     result = {}
     for rec in rows:
@@ -275,6 +282,7 @@ def fetch_twse_valuation_all():
         if not code:
             continue
         result[code] = {
+            "date": _roc_to_iso(rec.get("Date", "")),
             "per": to_float(rec.get("PEratio")),
             "pbr": to_float(rec.get("PBratio")),
             "dividend_yield": to_float(rec.get("DividendYield")),

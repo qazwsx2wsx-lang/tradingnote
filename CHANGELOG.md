@@ -6,6 +6,50 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 
 ---
 
+## 2026-09-16（續3）修正上市（TWSE）股票完全沒有本益比資料的 bug
+
+**動機**：user 回報點擊泡泡圖「數位雲端」分類，伊雲谷（6689）等成分股沒有本益比資料，要求檢查資料庫架構。
+
+**根因**（追查到具體到一行程式碼，不是憑空臆測）：`get_group_top_stocks_range()`（[tradingnote_history.py:1176-1179](tradingnote_history.py:1176)，被點擊泡泡彈出的 `IndustryTopStocksDialog` 使用）只查 `valuation_observations` 表，不查舊的 `valuation_history` 表。實際查本地 `data/history.db` 發現 `valuation_observations` 裡**完全沒有任何一檔上市（TWSE）股票**，只有 887 檔上櫃（TPEX）股票；`valuation_history`（舊表）裡雖然有 1084 檔上市股票的資料，但**全部 `retrieved_at IS NULL`**——這些是更早期、現在的程式碼已經不會再寫入的舊資料，日期停在 2026-09-15，之後不會再更新。追查發現 `compute_valuation_flow()`（[tradingnote_history.py:1067-1072](tradingnote_history.py:1067)，泡泡圖「估值」模式）同樣只查 `valuation_observations`——也就是說這個 bug 不只影響點泡泡看成分股的本益比欄，**整個「估值」泡泡圖模式先前對全部上市股票（族群）都是啞的，只能顯示上櫃股票**，影響範圍比一開始看到的「伊雲谷沒有本益比」更大。
+
+往回追：唯一寫入路徑 `_record_valuation_snapshot_best_effort()`（[tradingnote_gui.py:412-426](tradingnote_gui.py:412)）呼叫 `record_valuation_snapshot(HISTORY_DB_PATH, fetch_twse_valuation_all(), "TWSE")`，**沒有傳 `as_of_date`**；而 `record_valuation_snapshot()`（[tradingnote_history.py:369-375](tradingnote_history.py:369)）的邏輯是 `if v.get("date") or as_of_date` 才收這筆資料——`fetch_twse_valuation_all()`（[tradingnote_core.py:266-282](tradingnote_core.py:266)）原本只讀 `Code`/`PEratio`/`PBratio`/`DividendYield`，**沒有讀 `Date` 欄位**，所以每一筆上市股票的 `v.get("date")` 恆為 `None`，篩選條件恆假，**這條路徑從 2026-09-15 的 `7a6b19a`（`fix: unify flow analysis periods...`）commit 以來，上市股票的估值資料就從來沒有寫進資料庫過**。
+
+那個 commit 的訊息記錄了一句「TWSE's valuation reader still doesn't expose a source date... This is a known limitation, not fixed here」——**這個前提是錯的**：實際直接打一次 `https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL` 端點，回傳的每一筆資料本來就有 `"Date": "1150915"`（ROC 格式，等同 2026-09-15），跟 `fetch_tpex_valuation_all()` 已經在用的 `"Date"` 欄位是同一種格式、同一個 `_roc_to_iso()` 轉換方式——只是先前寫 `fetch_twse_valuation_all()` 的人沒有去讀這個欄位，不是端點真的沒提供。
+
+**改法**：`fetch_twse_valuation_all()`（tradingnote_core.py）比照 `fetch_tpex_valuation_all()` 加一行 `"date": _roc_to_iso(rec.get("Date", ""))`。不需要改 `record_valuation_snapshot()`／呼叫端的 `as_of_date`，既有的過濾邏輯本來就是為了「等有真正來源日期才收」設計的，現在給它真正的來源日期即可，不是用今天日期去猜。
+
+**驗證**：
+- `py_compile tradingnote_core.py` 過關；`python -m unittest test_tradingnote_flow test_tradingnote_technical test_stock_charts`（15 個測試）全過。
+- 對真實 TWSE 端點即時測試：`fetch_twse_valuation_all()` 回傳 1080 檔，全部 1080 檔都有 `date` 欄位（例：`6689` → `{'date': '2026-09-15', 'per': 31.64, ...}`）。
+- 在暫存複本資料庫上跑 `record_valuation_snapshot()`：`valuation_observations` 的上市股票數從 0 → 1080；6689 正確寫入 `(date='2026-09-15', per=31.64, retrieved_at=...)`。
+- 端到端呼叫 `get_industry_top_stocks_range(db, snapshot, '數位雲端', days=5, top_n=30)`：6689 正確回傳 `per: 31.64`（原本是 `None`）；「數位雲端」30 檔成分股中 25 檔有本益比（其餘 5 檔虧損公司本來就算不出本益比，是正常的空值，不是 bug）。
+- **已對使用者本機真實 `data/history.db` 執行同一次修正過的 `_record_valuation_snapshot_best_effort()`**（不是只在暫存複本測試）：上市股票數從 0 → 1080，立即生效，不用等下次「重新整理」或重開程式；之後每次自然的背景快照（`_record_valuation_snapshot_best_effort` 既有呼叫點，見 [tradingnote_gui.py:505,533](tradingnote_gui.py:505)）都會繼續正常累積。
+
+**未做**：沒有處理 `valuation_history`（舊表）裡那 23,803 筆 `retrieved_at IS NULL` 的舊資料——確認過現有分析程式碼（`get_group_top_stocks_range`／`compute_valuation_flow`）只讀 `valuation_observations`，不會讀到 `valuation_history`，這批舊資料純粹是歷史殘留，不影響修好後的行為，這次沒有刻意清除（維持現狀比較保守，之後如果確定不再需要可以另外清）。也沒有在真正跑起來的桌面 App 裡用滑鼠實際點開「數位雲端」泡泡確認畫面文字——用的是直接呼叫 `get_industry_top_stocks_range` 驗證回傳資料，邏輯跟畫面呼叫的是同一個函式，風險低。
+
+---
+
+## 2026-09-16（續2）資金流向泡泡圖：分類配色、卡頓修正、新增「主力同步買超」模式
+
+**動機**：user 對泡泡圖提出四點——(1) 介面順暢是第一守則、(2) 泡泡圖分類不清楚、顏色區分要明顯、清單要明顯、(3) 泡泡圖本身容易卡頓、(4) 新增「主力同步買超」泡泡圖模式。派三個 Explore agent 平行調查確認：泡泡顏色原本只有 3 種（紅=偏流入/綠=偏流出/灰=中性，依當日漲跌%），跟產業分類完全無關，圖例也只解釋這 3 色，只有前 5 大泡泡有文字標籤；卡頓根因是全域 `antialias=True` 套用到泡泡 `ScatterPlotItem` 疊加 `hoverable=True` 造成滑鼠移動時逐點重繪抗鋸齒圓形；三大法人資料（`InstitutionalGroupFlow`，逐族群 `foreign_value`/`trust_value`/`dealer_value`）已經透過 `FlowAnalysisService.analyze()` 無條件算好放在 `dashboard.institutional_flow`，足以支撐新模式，不需要新的抓取邏輯。配色方案（泡泡填色＝分類、外框＝方向）先用 `AskUserQuestion` 跟使用者確認過再動工。
+
+**改法**（分三步驟，每步都個別驗證）：
+1. **卡頓**：`populate_flow_chart` 建立泡泡 `ScatterPlotItem` 時加 `antialias=False`（只針對這一個 widget，不動全域 `pg.setConfigOptions`，風險跟先前刻意不動全域設定的顧慮不同）。
+2. **分類配色**：新增 `_category_color(name)`（`hashlib.md5` 雜湊取色相 0-359°，固定飽和度/明度，同一分類名稱永遠同一顏色、不依賴當次畫面上還有哪些其他分類，因此泡泡圖跟清單用同一個名稱查到的顏色保證一致，支援任意分類數量）。泡泡 `brush`（填色）改用 `_category_color(f.industry)`，原本的 3 色邏輯改放到 `pen`（外框，加粗到 width=2.5，不再用 `.darker(125)` 淡化）。圖例／hint 文字同步更新說明新的填色/外框語意；「資金動向清單」（`refresh_flow_list`）不新增欄位，改用 `item.setIcon(1, _color_swatch_icon(...))` 在「分類」欄加色塊，跟泡泡圖共用同一個 `_category_color()`。
+3. **新增「主力同步買超」模式**：`tradingnote_flow.py` `FlowAnalysisService.analyze()` 驗證清單加入 `"institutional_sync"`；把 `if bubble_mode == "momentum": return cached` 改成 `if bubble_mode != "valuation": return cached`（`institutional_flow` 本來就無條件算好，新模式不需要 `valuation_flow`，這個條件自然涵蓋）。`populate_flow_chart` 新增 `elif mode == "institutional_sync":` 分支：X＝三大法人方向一致性分數 `sign(foreign_value)+sign(trust_value)+sign(dealer_value)`（-3～+3，新增 `_institutional_sync_score()` helper）、Y＝三大法人合計買賣超金額（億元）、泡泡大小沿用其他模式的「資金比重%」語意。外框顏色改依一致性分數（≥2 主力同步買超／≤-2 主力同步賣超／其餘方向不一致），不沿用當日漲跌；`_flow_quadrant_specs()` 新增這個模式的四象限名稱與底色；圖例徽章文字依模式切換（`_on_flow_bubble_mode_changed` 呼叫 `SignalBadge.set_text_and_tone()`）；tooltip 改顯示外資/投信/自營商個別金額＋合計＋涵蓋檔數＋資料日期，並註明「僅反映最新一筆三大法人資料，不受流向區間影響」（這份資料沒有歷史 DB 表，`get_cached_institutional_snapshot` 只有 30 分鐘 TTL 的最新一筆快照）。
+
+**驗證**：
+- 每步驟 `py_compile tradingnote_gui.py tradingnote_flow.py` 過關；`python -m unittest test_tradingnote_flow test_tradingnote_technical test_stock_charts`（15 個測試）全過，確認 `analyze()` 的早退條件改寫沒有回歸既有 momentum/valuation 行為。
+- 用真實本地資料驗證（`QT_QPA_PLATFORM=offscreen` + 真實 `QEventLoop.exec()`，從本地 `price_cache.json` 直接讀快取建構真實 snapshot，不需要網路）：
+  - `_category_color`：同名稱兩次呼叫顏色一致；官方產業 35 個分類中 34 個顏色可區分（1 組撞色，屬於雜湊配色的已知取捨，已記在 STATUS.md「已知缺口」）。
+  - 動能模式：35 顆泡泡，填色跟清單色塊一致、外框正確對應漲跌方向（例：半導體業 外框 `#ef4444` COLOR_GAIN、電腦及週邊設備業 外框 `#22c55e` COLOR_LOSS）；`flow_list` 35/35 列都有色塊 icon。
+  - 主力同步買超模式：切換後 35 顆泡泡正確 populate，X/Y／象限／tooltip 內容跟 `InstitutionalGroupFlow` 實際數值吻合（例：半導體業三大法人同步方向 +3、合計買超 88.31 億，外框正確顯示 COLOR_GAIN；電子零組件業一致性分數 -1，落在「賣超」象限但外框正確顯示 MUTED 灰色，因為只是 2 比 1 而非三家全部同向，象限用粗略的正負號分界、外框用較嚴格的 ≥2/≤-2 門檻，兩者故意不同精細度，tooltip 有完整數字不會誤導）；圖例徽章文字正確切換成「主力同步買超/主力同步賣超/方向不一致」。
+  - 截圖（`window.flow_chart.grab()`／`window.flow_list.grab()`）三張畫面（動能模式泡泡圖、主力同步買超泡泡圖、清單色塊）已傳給使用者目視確認。
+
+**未做**：沒有在真正跑起來的桌面 App 裡用滑鼠實際操作驗證主觀「順不順、看不看得清楚」——這次驗證用離線腳本斷言＋截圖，使用者收到截圖後如果覺得配色/易讀性不理想，可以再迭代調整 `_category_color()` 的飽和度/明度參數或撞色處理方式。「主力同步買超」模式沒有歷史回補，僅最新一筆快照，已在畫面文字跟 STATUS.md 明確標註這個限制。
+
+---
+
 ## 2026-09-16（續）「雙資料比較」加入全部 24 類技術分析指標
 
 **動機**：`ui/stock_charts.py`（先前工作，未 commit）已經有 `ComparisonWidget`——「個股」詳細資訊彈窗新增的「雙資料比較」分頁，可選兩項既有資料（股價／三大法人累計／法人分別累計／融資融券／VPT／MFI／借券餘額／借券成交）畫在同一張圖比較。但「技術分析」分頁另外算的 24 類本地指標（KD／MACD／均線／RSI／布林通道／乖離率…，見 `tradingnote_technical.build_chart_catalog`）完全沒被納入可比較的來源——user 要求把這些也加進去。
