@@ -87,6 +87,66 @@ user 提出完整規格：把 `tradingnote_gui.py` 拆成 `ui/theme.py`＋`ui/co
 - 泡泡圖／VPT／MFI／融資融券等 pyqtgraph 圖表系列色（`tradingnote_gui.py` 裡還有一批 `#1f77b4`／`#2ca02c` 之類的分類色，屬於資料序列配色，不是介面底色，這次刻意沒動）。
 - Sidebar 分組（市場／分析／交易／資料）、Dashboard／個股頁的 progressive disclosure 重做——規格中風險較高、影響面較大的部分，建議等 component 庫更完整再做。
 
+## 圖表架構統整：第一~三階段（2026-09-17，已完成，暫停在此重新評估）
+使用者提出 7 階段圖表架構統整計畫（共用生命週期、延遲建立、統一資料模型…），
+雙方同意先做到第三階段（延遲建立／延遲繪製）就停下來重新量測，**已完成**；
+第四階段以後（統一資料模型、搬移全部繪圖函式、納入泡泡圖/期貨圖表）先不做，
+除非之後發現還有必要。完整計畫見
+`C:\Users\Evan\.claude\plans\read-tradingnote-handoff-md-virtual-hopcroft.md`。
+
+**第一階段（效能基準）**：新增 `bench_chart_loading.py`（repo 根目錄，
+`QT_QPA_PLATFORM=offscreen`＋合成資料，不打任何 API）。量到「個股完整籌碼」
+／「部位紀錄」詳細資訊當時都是一次建立＋populate 全部 8 張明細圖＋技術分析＋
+雙資料比較（共 10 個 `StockChart` 實例），`PositionRecordPage`（其實是
+`TradingNoteWindow._build_position_detail_section`）完全沒有延遲，一開部位
+紀錄頁就建立，不管使用者有沒有選取任何一筆部位；且**光是 10 個空白
+`StockChart()` 的建構就佔總成本 7 成左右**，填圖只佔約 3 成——確立階段三
+的重點必須是「延遲建立 widget 本身」，不能只延遲填圖。
+
+**第二階段（共用小工具）**：`ui/stock_charts.py` 新增 `apply_chart_theme()`／
+`set_date_ticks()`，取代 `tradingnote_gui.py` 裡 6+／9+ 處逐字重複的主題設定
+／日期軸 tick 計算；新增 8 個 `_xxx_chart_series(data)`（比照既有
+`_technical_comparison_sources()` 寫法），直接從原始資料算「雙資料比較」可用
+的序列，不依賴對應的 `StockChart` 是否已建立——這是階段三讓「雙資料比較」
+分頁能獨立於其他 8 個分頁的前提。新增測試
+`test_chart_series_helpers_match_populated_chart_series`（`test_stock_charts.py`）
+驗證這 8 個函式跟「先 populate 真正的 StockChart 再讀 `.series()`」逐一比對
+完全一致。
+
+**第三階段（延遲建立＋延遲繪製）**：`ui/stock_charts.py` 新增通用
+`LazyTabBuilder`（包裝 `QTabWidget`：分頁標籤一次建好，每個分頁的內容延遲到
+第一次切到才建立，換資料源時 `reset()`＋`activate_current()` 只重新
+populate 目前作用中的分頁，不強迫重建全部）。`tradingnote_gui.py` 新增
+`DetailChartPanel`（8 明細圖＋技術分析＋雙資料比較共 10 分頁，`StockDetailDialog`
+與 `TradingNoteWindow` 的部位詳細區塊共用同一份），取代原本的
+`_render_detail_block`（拆成純文字的 `_render_detail_summary` ＋
+`DetailChartPanel.set_data()`）。新增測試 `LazyTabBuilderTests`／
+`DetailChartPanelTests`（`test_stock_charts.py`）驗證：只有作用中分頁建立
+widget、切分頁不重建、`reset()` 後已建立的 widget 只重新 populate 不重建、
+「雙資料比較」在其他 8 個分頁都沒被造訪過的情況下依然正確。另外用一支
+一次性 smoke script（未保留，僅本次驗證用）以合成資料端到端跑過
+`StockDetailDialog`（monkeypatch 掉 FinMind 網路呼叫與快取檔案 I/O），確認
+真正接線（按鈕點擊→建立面板→背景資料回來→切分頁→雙資料比較）沒有問題。
+
+**效能基準數字對照**（150 個交易日合成資料，每項 20 次取平均，本機量測，
+不同機器絕對值會不同，僅供相對比較）：
+| 量測項目 | 第一階段（改前） | 第三階段（改後） |
+|---|---|---|
+| 完整籌碼／部位詳細單次「開啟並顯示資料」總成本 | 335.03ms | **29.93ms**（`DetailChartPanel` 只建立目前作用中分頁） |
+| 如果使用者依序切過全部 10 個分頁 | （同上，全部一次做完） | 370.31ms（跟改前總成本量級相近，符合預期——只是把成本從「開啟當下」延到「使用者實際切過去的當下」，沒有魔法省掉工作量，但大多數時候使用者不會切完全部 10 個分頁） |
+
+「開啟並顯示資料」的成本降到約原本的 1/11——`PositionRecordPage` 這邊影響
+最大：原本不管有沒有選部位都要付出約 335ms 建立全部 10 張圖，現在只有真的
+被選取、且使用者切到的分頁才建立。原始數字存在 `bench_results_baseline.json`
+／`bench_results_after_phase3.json`（未進 git，重跑
+`python bench_chart_loading.py <label>` 會覆寫/新增同名檔案）。
+
+**未做（誠實揭露）**：沒有在這個環境用滑鼠實際操作驗證主觀「順不順」，改用
+offscreen 腳本斷言＋一次性 smoke script 確認接線正確；`PositionRecordPage`
+在同一次視窗開啟期間反覆切換部位的長時間穩定性（例如切 50 次會不會有殘留
+物件／記憶體成長）沒有驗證；第四階段以後（統一資料模型、搬移繪圖函式、
+納入泡泡圖/期貨圖表）維持原樣，沒有動。
+
 ## 目前實際尚未 commit 的異動
 以 `git status` 為準，這份清單只是提示去哪找細節，不是完整列表（2026-09-16 更新：先前這裡記錄的「Codex 同時間在同一份 working tree 上的異動」已經不在 `git status` 裡，研判已經處理完並 commit 掉了，見 `7a6b19a fix: unify flow analysis periods and invalidate stale results`，移除該筆過時記錄）：
 - 介面卡頓修正：`_filter_stocks_tree`／`refresh_stocks_tab`（debounce＋批次更新）、`_on_stock_selected`（技術指標查詢改背景執行緒＋TTLCache）、`refresh_flow_tab`（全市場資金流向分析改背景執行緒，含 in-flight／pending 佇列避免同時呼叫）、`_on_futures_row_selected`（大額交易人歷史查詢改背景執行緒）。連帶在 `ARCHITECTURE.md` 補了 `run_background_task()` 回傳值必須留住的陷阱說明。見 `CHANGELOG.md` 2026-09-16。

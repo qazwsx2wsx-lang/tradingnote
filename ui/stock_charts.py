@@ -7,6 +7,27 @@ from PySide6 import QtCore, QtWidgets
 from ui.theme import COLOR_ACCENT, COLOR_SPECIAL, COLOR_SURFACE, COLOR_TEXT, COLOR_MUTED
 
 
+def apply_chart_theme(chart, *, min_height=240):
+    """套用 `StockChart`／`FlowChartWidget` 等 `pg.PlotWidget` 共用的深色主題
+    設定（背景／格線／圖例／最小高度）。取代原本在 `tradingnote_gui.py` 多處
+    逐字重複的 setBackground／showGrid／addLegend／setMinimumHeight 四行。"""
+    chart.setBackground(COLOR_SURFACE)
+    chart.showGrid(x=True, y=True, alpha=.08)
+    chart.addLegend()
+    chart.setMinimumHeight(min_height)
+
+
+def set_date_ticks(chart, dates, axis="bottom", max_labels=8):
+    """把 `dates`（依時間排序的日期字串清單）等距抽樣成軸刻度標籤，取代原本
+    在每個 `_populate_*_chart` 與 `ComparisonWidget.refresh` 裡逐字重複的
+    「算 step、組 tick 清單」邏輯。"""
+    if not dates:
+        chart.getAxis(axis).setTicks([])
+        return
+    step = max(1, len(dates) // max_labels)
+    chart.getAxis(axis).setTicks([[(i, dates[i]) for i in range(0, len(dates), step)]])
+
+
 class StockChart(pg.PlotWidget):
     cleared = QtCore.Signal()
 
@@ -79,6 +100,54 @@ def chart_page(chart):
     return page
 
 
+class LazyTabBuilder(QtCore.QObject):
+    """包裝一個 `QTabWidget`：分頁標籤／順序一次建好（使用者一開始就看到完整
+    分頁列表），但每個分頁背後真正的內容延遲到第一次切到該分頁才建立——建立
+    好的分頁不會因為切走再切回來就重建。換股票／換部位等資料來源改變時呼叫
+    `reset()`：不會立刻重建任何分頁，只把全部分頁標成「下次被切到時要重新
+    `build()`」，讓沒被造訪過的分頁維持延遲、已經造訪過的分頁下次切回去才
+    看到新資料；呼叫端通常接著呼叫 `activate_current()`，確保目前作用中的
+    分頁不會停在舊資料。
+
+    `build(container)` 是否要重建 widget 或只重新 populate 既有 widget，由
+    呼叫端自己決定（`container` 是這個分頁固定不變的容器，`build` 每次被呼叫
+    都拿到同一個），`LazyTabBuilder` 本身不管內容、只管「什麼時候該呼叫」。"""
+
+    def __init__(self, tabs, parent=None):
+        super().__init__(parent or tabs)
+        self._tabs = tabs
+        self._entries = []
+        tabs.currentChanged.connect(self._on_current_changed)
+
+    def add_tab(self, label, build):
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        index = self._tabs.addTab(container, label)
+        self._entries.append({"container": container, "build": build, "dirty": True})
+        if index == self._tabs.currentIndex():
+            self._maybe_build(index)
+        return index
+
+    def _on_current_changed(self, index):
+        self._maybe_build(index)
+
+    def _maybe_build(self, index):
+        if not (0 <= index < len(self._entries)):
+            return
+        entry = self._entries[index]
+        if entry["dirty"]:
+            entry["dirty"] = False
+            entry["build"](entry["container"])
+
+    def activate_current(self):
+        self._maybe_build(self._tabs.currentIndex())
+
+    def reset(self):
+        for entry in self._entries:
+            entry["dirty"] = True
+
+
 class ComparisonWidget(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
@@ -91,10 +160,7 @@ class ComparisonWidget(QtWidgets.QWidget):
             combo.currentIndexChanged.connect(self.refresh)
         layout.addLayout(controls)
         self.chart = StockChart()
-        self.chart.setBackground(COLOR_SURFACE)
-        self.chart.showGrid(x=True, y=True, alpha=.08)
-        self.chart.addLegend()
-        self.chart.setMinimumHeight(240)
+        apply_chart_theme(self.chart)
         layout.addWidget(chart_page(self.chart))
         self.right = pg.ViewBox()
         self.chart.scene().addItem(self.right)
@@ -165,8 +231,7 @@ class ComparisonWidget(QtWidgets.QWidget):
                 self.chart.addItem(curve)
             if i == 0:
                 self.chart.setLabel("left", unit if dual else " / ".join(dict.fromkeys(s[1] for s in selected)), color=color if dual else COLOR_TEXT)
-        step = max(1, len(dates) // 6)
-        self.chart.getAxis("bottom").setTicks([[(i, dates[i]) for i in range(0, len(dates), step)]])
+        set_date_ticks(self.chart, dates, max_labels=6)
         self.chart.setTitle("雙資料比較｜點擊查看同日數值", color=COLOR_TEXT)
         self._resize()
         self.chart.enableAutoRange()

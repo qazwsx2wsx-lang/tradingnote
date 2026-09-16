@@ -5,3 +5,4 @@ data/
 .venv/
 .claude/
 _qa*/
+bench_results_*.json

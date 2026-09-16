@@ -6,6 +6,76 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 
 ---
 
+## 2026-09-17 圖表架構統整第一~三階段：效能基準、共用小工具、延遲建立
+
+**動機**：這個 session 前面幾輪對 `tradingnote_gui.py` 陸續做了背景執行緒／
+debounce／泡泡圖配色等小幅效能補丁後，user 提出一份 7 階段圖表架構統整計畫，
+目標是解決 GUI 圖表相關程式碼重複與「介面卡頓」的根本原因，而不是繼續逐一貼
+OK 繃。雙方同意先做到第三階段（延遲建立／延遲繪製）就停下來重新量測，第四
+階段以後（統一資料模型、搬移全部繪圖函式、納入泡泡圖/期貨圖表）先不做。完整
+計畫存在 `C:\Users\Evan\.claude\plans\read-tradingnote-handoff-md-virtual-hopcroft.md`。
+
+**第一階段（效能基準）**：新增 `bench_chart_loading.py`（`QT_QPA_PLATFORM=offscreen`
+＋合成資料，不打任何 API），量到「個股完整籌碼」（`StockDetailDialog`）／
+「部位紀錄」詳細資訊當時都是一次建立＋populate 全部 8 張明細圖＋技術分析＋
+雙資料比較（10 個 `StockChart` 實例），其中 `TradingNoteWindow.
+_build_position_detail_section` 完全沒有延遲，一開部位紀錄頁就建立，不管
+使用者有沒有選取任何一筆部位；且光是 10 個空白 `StockChart()` 的建構就佔總
+成本 7 成左右，填圖只佔約 3 成。
+
+**第二階段（共用小工具）**：`ui/stock_charts.py` 新增 `apply_chart_theme()`／
+`set_date_ticks()`，取代 `tradingnote_gui.py` 裡多處逐字重複的主題設定／日期
+軸 tick 計算（純替換，輸出跟原本逐字相同）。新增 8 個
+`_xxx_chart_series(data)`（比照既有 `_technical_comparison_sources()` 寫法），
+直接從原始資料算「雙資料比較」可用的序列，不依賴對應的 `StockChart` 是否已
+建立——這是階段三讓「雙資料比較」分頁能獨立於其他 8 個分頁的前提。
+
+**第三階段（延遲建立＋延遲繪製）**：`ui/stock_charts.py` 新增通用
+`LazyTabBuilder`（包裝 `QTabWidget`：分頁標籤一次建好，內容延遲到第一次切到
+才建立；`reset()`＋`activate_current()` 讓換資料源時只重新 populate 目前
+作用中的分頁，不強迫重建全部）。`tradingnote_gui.py` 新增 `DetailChartPanel`
+（8 明細圖＋技術分析＋雙資料比較共 10 分頁，`StockDetailDialog` 與部位紀錄
+詳細區塊共用），取代原本的 `_render_detail_block`（拆成純文字的
+`_render_detail_summary` ＋ `DetailChartPanel.set_data()`）。
+
+**效能結果**：完整籌碼／部位詳細單次「開啟並顯示資料」總成本從 335.03ms
+降到 29.93ms（約 1/11）——`PositionRecordPage` 受益最大，原本不管有沒有選
+部位都要付出約 335ms 建立全部 10 張圖，現在只有真的被選取、且使用者切到的
+分頁才建立；如果使用者依序切過全部 10 個分頁，總成本 370.31ms，跟改前量級
+相近（符合預期，只是把成本從「開啟當下」延到「使用者實際切過去的當下」，
+沒有魔法省掉工作量）。數字詳見 `STATUS.md`「圖表架構統整」一節。
+
+**驗證**：`python -m py_compile tradingnote_gui.py ui/stock_charts.py
+bench_chart_loading.py` 全過；`test_stock_charts.py` 新增
+`test_chart_series_helpers_match_populated_chart_series`（驗證 8 個
+`_xxx_chart_series` 函式跟「先 populate 真正的 StockChart 再讀 `.series()`」
+逐一比對完全一致）、`LazyTabBuilderTests`（只有作用中分頁建立、切分頁不重建、
+`reset()` 後才會在下次切到時重新 populate）、`DetailChartPanelTests`（只有
+作用中分頁建立 widget、`reset()` 後已建立的 widget 只重新 populate 不重建
+同一個物件、「雙資料比較」在其他 8 個分頁都沒被造訪過的情況下依然正確、
+`clear()` 讓目前分頁顯示空狀態）；另外用一支一次性 smoke script（monkeypatch
+掉 FinMind 網路呼叫與快取檔案 I/O，未保留在 repo）以合成資料端到端跑過
+`StockDetailDialog`（按鈕點擊→建立面板→背景資料回來→切分頁→雙資料比較），
+確認真正接線沒問題。既有 `test_stock_charts`／`test_tradingnote_flow`／
+`test_tradingnote_technical` 全過，無回歸。
+
+**順便發現但確認無關的既有問題**：`python -m unittest discover` 跑全部測試檔時
+`test_tradingnote_journal_gui.test_responsive_density_and_larger_icons` 會失敗
+（92 != 132），單獨執行該檔案則通過——確認是共用 `QApplication` 單例＋跨測試
+檔案 `setFont`/`setStyleSheet` 汙染（`test_stock_charts.py` 的 `setUpClass` 先
+跑到會影響後面測試的字型量測）造成的既有測試隔離問題，跟這次改動無關（改動
+前用 `git stash` 驗證過同樣會在 discover 模式下失敗）。`test_tradingnote_flow_gui.
+test_full_window_six_pages_and_revision_refresh` 也是既有的日期相依 flaky 測試
+（依 `date.today()` 判斷可用交易日數量），改動前後皆失敗，同樣跟這次改動無關；
+`TradingNoteWindow.__init__`（含這次改過的 `_build_position_detail_section`）
+在這個測試裡有成功完整建構，沒有拋例外，只是後面的資料斷言因為日期而失敗。
+
+**未做**：沒有在這個環境用滑鼠實際操作驗證主觀「順不順」；`PositionRecordPage`
+在同一次視窗開啟期間反覆切換部位的長時間穩定性（記憶體／殘留物件）沒有驗證；
+第四階段以後（統一資料模型、搬移繪圖函式、納入泡泡圖/期貨圖表）維持原樣。
+
+---
+
 ## 2026-09-16（續3）修正上市（TWSE）股票完全沒有本益比資料的 bug
 
 **動機**：user 回報點擊泡泡圖「數位雲端」分類，伊雲谷（6689）等成分股沒有本益比資料，要求檢查資料庫架構。
