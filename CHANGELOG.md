@@ -6,6 +6,25 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 
 ---
 
+## 2026-09-16（續）「雙資料比較」加入全部 24 類技術分析指標
+
+**動機**：`ui/stock_charts.py`（先前工作，未 commit）已經有 `ComparisonWidget`——「個股」詳細資訊彈窗新增的「雙資料比較」分頁，可選兩項既有資料（股價／三大法人累計／法人分別累計／融資融券／VPT／MFI／借券餘額／借券成交）畫在同一張圖比較。但「技術分析」分頁另外算的 24 類本地指標（KD／MACD／均線／RSI／布林通道／乖離率…，見 `tradingnote_technical.build_chart_catalog`）完全沒被納入可比較的來源——user 要求把這些也加進去。
+
+**改法**：
+1. `ui/stock_charts.py` `ComparisonWidget.set_sources(sources)`：原本假設每個來源都是「已經畫好資料的 `StockChart`」、用 `.series()` 讀出目前畫的曲線。改成 duck-typing：有 `.series()` 就照舊呼叫，沒有的話直接把該項目當成已經算好的 `[(name, unit, values), ...]` 序列清單用——因為技術分析的 24 種指標畫面上同一時間只會顯示使用者選的其中一種（`TechnicalAnalysisWidget.chart` 是單一 `StockChart`），沒辦法像其他 8 種資料一樣「從畫出來的曲線讀」，只能直接從 `calculate_indicators()` 的計算結果取。
+2. `tradingnote_gui.py` 新增 `_technical_comparison_sources(technical_data)`：把 `technical_data["charts"]`（24 個指標類別）逐一轉成 `(組名, 序列清單)`。**每個指標類別各自成一組**（組名帶類別標題，例如「技術分析－KD（9／3／3）」），不是全部塞進同一組「技術分析」——不同類別常常剛好用同樣的序列名稱（例如「均線」跟「布林通道」都有「收盤」、「乖離率」跟「量比」都可能撞名的風險），全部塞同一組會在 `set_sources` 內部的 `{組／名稱: ...}` dict 建構時互相蓋掉，分開組別才能讓全部 24 種、加總 46 條序列都選得到，一個都不漏。
+3. `_render_detail_block`：原本 `technical_widget.set_data(calculate_indicators(...))` 算完就丟掉那份結果，只拿去畫技術分析分頁；改成先存到區域變數 `technical_data` 再分別用於 `technical_widget.set_data(...)` 跟 `comparison.set_sources([..., *_technical_comparison_sources(technical_data)])`，不重複計算。
+
+**驗證**：
+- `py_compile` 兩檔（`tradingnote_gui.py`／`ui/stock_charts.py`）過關。
+- `python -m unittest test_tradingnote_flow test_tradingnote_technical test_stock_charts`：15 個測試全過，包含 `test_stock_charts.py` 既有兩個測試（純圖表來源、不含技術指標）確認沒有因為 `set_sources` 改寫而回歸。
+- 用真實本地資料（`load_local_technical(HISTORY_DB_PATH, "2323")`）呼叫 `_technical_comparison_sources`：正確產出 24 組來源；接上 `ComparisonWidget.set_sources` 後下拉選單共 47 個選項（8 種既有資料裡股價的「收盤價」1 條＋技術指標 24 類共 46 條序列，數字跟 `build_chart_catalog` 逐類別序列數手算加總一致，沒有因為同名互相蓋掉而漏選項）；選「股價／收盤價」vs「技術分析－RSI（Wilder）／RSI14」畫出來雙軸正確切換（RSI 是 0-100 的「數值」，跟股價的「價格」單位不同，右軸正確顯示）。
+- 端到端模擬 `_render_detail_block` 完整呼叫路徑（比照 `StockDetailDialog`／部位詳細資訊實際呼叫方式，傳入真實技術指標資料而非假資料）：`comparison.catalog` 正確產出 47 筆、其中包含 RSI 相關選項，跟前一步的獨立測試結果一致。
+
+**未做**：沒有在真正跑起來的桌面 App 裡手動點開「雙資料比較」分頁、用滑鼠實際選兩個技術指標比較後截圖確認畫面——這次驗證都是離線腳本直接呼叫 `ComparisonWidget`／`_render_detail_block`，不是走 GUI 點擊路徑。`ui/stock_charts.py`／`test_stock_charts.py` 本身（`StockChart`／`ComparisonWidget`／`chart_page` 這個模組抽出＋雙資料比較分頁的完整功能，不是這次新增的 24 類指標整合）從先前工作沿用，其餘部分沒有重新一併驗證。
+
+---
+
 ## 2026-09-16 修正介面卡頓：高頻互動路徑改走背景執行緒
 
 **動機**：user 回報 GUI「非常卡頓」，要求檢查架構文件跟實際執行之間的矛盾點。派 Explore agent 檢查後確認：`ARCHITECTURE.md:107` 明文規定「GUI 一律用 `run_background_task()`」，但好幾處會被高頻觸發的重運算（個股選取即時查技術指標、資金流向全市場約1700檔聚合）完全繞過這條路徑，直接同步跑在 Qt 主執行緒——選取股票、打字篩選、甚至每秒一次的 `_flow_revision_timer` 都可能讓主執行緒卡住。

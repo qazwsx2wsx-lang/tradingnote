@@ -2213,6 +2213,27 @@ class TechnicalAnalysisWidget(QtWidgets.QWidget):
         return f"{value:.2f}" if value is not None else "N/A"
 
 
+def _technical_comparison_sources(technical_data):
+    """把 calculate_indicators() 的全部 24 類指標轉成「雙資料比較」
+    （ComparisonWidget）可選的來源。技術分析分頁畫面上一次只會顯示使用者選取
+    的其中一種指標，但比較功能要能選到全部 24 種，所以直接從計算結果取序列，
+    不透過畫在 TechnicalAnalysisWidget 上的那份曲線。每個指標類別各自成一組
+    （組名帶類別標題），不是全部塞進同一組「技術分析」——不同類別剛好用了
+    同樣的序列名稱很常見（例如「均線」跟「布林通道」都有「收盤」），同一組
+    會互相蓋掉，分開組別才能保留全部 24 種都選得到。"""
+    if not technical_data or not technical_data.get("dates"):
+        return []
+    dates = technical_data["dates"]
+    sources = []
+    for spec in technical_data.get("charts", {}).values():
+        unit = spec["unit"]
+        series_list = [
+            (name, unit, {day: value for day, value in zip(dates, values) if value is not None})
+            for name, values in spec["series"].items()
+        ]
+        sources.append((f"技術分析－{spec['title']}", series_list))
+    return sources
+
 
 def _render_detail_block(
     label,
@@ -2352,8 +2373,10 @@ def _render_detail_block(
     _populate_mfi_chart(mfi_chart, data.get("vpt_mfi_history"))
     _populate_short_sale_balance_chart(sbl_chart, sbl_balance)
     _populate_lending_volume_chart(lending_chart, lending)
+    technical_data = None
     if technical_widget is not None:
-        technical_widget.set_data(calculate_indicators([dict(date=r["date"], open=r.get("open"), max=r.get("high"), min=r.get("low"), close=r.get("close"), Trading_Volume=r.get("volume"), Trading_money=r.get("trading_value")) for r in data.get("price_history", [])]) or data.get("technical_indicators"))
+        technical_data = calculate_indicators([dict(date=r["date"], open=r.get("open"), max=r.get("high"), min=r.get("low"), close=r.get("close"), Trading_Volume=r.get("volume"), Trading_money=r.get("trading_value")) for r in data.get("price_history", [])]) or data.get("technical_indicators")
+        technical_widget.set_data(technical_data)
     comparison = getattr(price_chart, "comparison", None)
     if comparison is not None:
         comparison.set_sources([
@@ -2361,6 +2384,7 @@ def _render_detail_block(
             ("法人分別累計", institutional_detail_chart), ("融資融券", margin_chart),
             ("VPT", vpt_chart), ("MFI", mfi_chart),
             ("借券餘額", sbl_chart), ("借券成交", lending_chart),
+            *_technical_comparison_sources(technical_data),
         ])
 
 
