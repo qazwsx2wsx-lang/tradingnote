@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """tradingnote - 圖形介面版本（PySide6 + pyqtgraph）"""
 
+import gc
 import hashlib
 import html
 import statistics
@@ -87,7 +88,7 @@ from tradingnote_institutional import get_cached_institutional_snapshot
 from tradingnote_http import PriceFetchError
 from tradingnote_paths import APP_PATHS
 from tradingnote_cache import TTLCache
-from tradingnote_tasks import run_background_task
+from tradingnote_tasks import run_background_task, wait_for_background_tasks
 from tradingnote_technical import load_local_technical, calculate_indicators
 from tradingnote_journal import (
     initialize_journal,
@@ -698,6 +699,19 @@ class PriceLookupDialog(QtWidgets.QDialog):
         )
 
 
+def _detail_summary_scroll(label):
+    """限制摘要佔用高度，長資料保留捲動閱讀，避免擠壓圖表。"""
+    label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+    label.setTextFormat(QtCore.Qt.RichText)
+    label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+    scroll = QtWidgets.QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+    scroll.setFixedHeight(110)
+    scroll.setWidget(label)
+    return scroll
+
+
 class StockDetailDialog(QtWidgets.QDialog):
     """雙擊「個股」分頁裡的股票時彈出：查本益比／殖利率／股價淨值比，以及最新一個
     交易日的三大法人買賣超。上櫃（TPEX）股票的本益比／殖利率改查 TPEX 官方端點
@@ -764,7 +778,7 @@ class StockDetailDialog(QtWidgets.QDialog):
         self._layout.addWidget(self.status_label)
         self.local_technical_widget = TechnicalAnalysisWidget()
         self.local_technical_widget.set_data(technical)
-        self._layout.addWidget(self.local_technical_widget)
+        self._layout.addWidget(self.local_technical_widget, 1)
         self.resize(900, 650)
 
         self.full_detail_button = QtWidgets.QPushButton("顯示完整籌碼面資訊（同部位紀錄）")
@@ -847,7 +861,6 @@ class StockDetailDialog(QtWidgets.QDialog):
         一行狀態文字時不需要這麼大）。"""
         self.full_detail_label = QtWidgets.QLabel("")
         self.full_detail_label.setWordWrap(True)
-        self.full_detail_label.setMaximumHeight(170)
         # 完整摘要已包含基本估值與法人資訊，展開後收起上方簡版以免重複並節省高度。
         self.status_label.setVisible(False)
         self.local_technical_widget.setVisible(False)
@@ -855,10 +868,10 @@ class StockDetailDialog(QtWidgets.QDialog):
         self.full_detail_panel = DetailChartPanel()
 
         insert_at = self._layout.indexOf(self.full_detail_button) + 1
-        self._layout.insertWidget(insert_at, self.full_detail_label)
-        self._layout.insertWidget(insert_at + 1, self.full_detail_panel.tabs)
+        self._layout.insertWidget(insert_at, _detail_summary_scroll(self.full_detail_label))
+        self._layout.insertWidget(insert_at + 1, self.full_detail_panel.tabs, 1)
         self._full_detail_widgets_built = True
-        width, height = _screen_fit_size(self, preferred_width=700, preferred_height=620, ratio=0.9)
+        width, height = _screen_fit_size(self, preferred_width=1100, preferred_height=820, ratio=0.9)
         self.setMinimumSize(min(640, width), min(300, height))
         self.resize(width, height)
         _center_on_screen(self)
@@ -1748,7 +1761,12 @@ def populate_flow_chart(
     scatter = pg.ScatterPlotItem(
         spots=spots,
         hoverable=True,
-        tip=lambda _x, _y, data: data["tip"],
+        # 2026-09-17：目前裝的 pyqtgraph 版本用關鍵字引數呼叫
+        # tip(x=, y=, data=)（見 ScatterPlotItem.hoverEvent），參數名稱一定要
+        # 叫 x/y 才接得到——原本命名成 _x/_y 會直接 TypeError（拿
+        # PYTHONFAULTHANDLER=1 實機跑才發現：hover 泡泡圖時 stderr 一直噴
+        # RuntimeWarning，導致這個功能從來沒真的顯示過提示文字）。
+        tip=lambda x, y, data: data["tip"],
         hoverPen=pg.mkPen(COLOR_ACCENT, width=2),
         antialias=False,
     )
@@ -3159,7 +3177,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.flow_chart_hint)
         layout.addSpacing(8)
         self.flow_chart = FlowChartWidget()
-        self.flow_chart.setMinimumHeight(280)
+        self.flow_chart.setMinimumHeight(420)
         layout.addWidget(self.flow_chart, 1)
 
     def _update_flow_date_button(self):
@@ -3817,8 +3835,10 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         splitter.addWidget(self.table)
         splitter.addWidget(self._build_position_detail_section())
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([180, 540])
         layout.addWidget(splitter)
 
     def _build_position_detail_section(self):
@@ -3843,10 +3863,10 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
         self.position_detail_label = QtWidgets.QLabel("尚未選取部位。")
         self.position_detail_label.setWordWrap(True)
-        outer_layout.addWidget(self.position_detail_label)
+        outer_layout.addWidget(_detail_summary_scroll(self.position_detail_label))
 
         self.position_panel = DetailChartPanel()
-        outer_layout.addWidget(self.position_panel.tabs)
+        outer_layout.addWidget(self.position_panel.tabs, 1)
 
         return container
 
@@ -5207,10 +5227,31 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         event.accept()
 
 def main():
+    # 2026-09-17：用 PYTHONFAULTHANDLER=1 重現反覆出現的原生層級當機（Fatal
+    # Python error: Aborted）發現，兩次抓到的堆疊都停在「Garbage-collecting」
+    # 這一步，且都同時有一個背景 daemon thread（run_background_task()）正在
+    # 跑 sqlite3／解析報價這類 C extension 呼叫——不只發生在關閉視窗那一刻
+    # （直譯器 finalize 會強制跑一次 GC），一次是在正常操作中（雙擊個股跳出
+    # StockDetailDialog 那當下）就撞上了，代表只要背景執行緒還在跑，CPython
+    # 週期性自動觸發的 GC 隨時都可能跟它互撞。這個 app 幾乎不會用到需要 GC
+    # 才能回收的循環參照（一般 refcounting 就夠了），關掉自動 GC 换取穩定性
+    # 是合理的取捨；gc.freeze() 把目前（含所有模組層級物件）先凍結進
+    # permanent generation，避免之後萬一手動呼叫 gc.collect() 要重新掃過這些
+    # 早就穩定不變的物件。
+    gc.disable()
+    gc.freeze()
+
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     app.setStyle("Fusion")
     app.setStyleSheet(STYLESHEET)
     pg.setConfigOptions(antialias=True, background=COLOR_SURFACE, foreground=COLOR_TEXT)
+    # 關閉視窗時，run_background_task() 開的 daemon thread 不會被 CPython 等待
+    # 就直接進入直譯器關閉流程；上面的 gc.disable() 擋不掉直譯器 finalize
+    # 自己強制觸發的最後一次 GC，所以這裡另外用 aboutToQuit（事件迴圈真正
+    # 停止前觸發）等在跑的背景執行緒收尾（有限時間內），逾時仍未結束就直接
+    # os._exit()，跳過會跟它們互撞的 finalize／GC（見
+    # tradingnote_tasks.wait_for_background_tasks）。
+    app.aboutToQuit.connect(wait_for_background_tasks)
 
     splash = StartupProgressDialog()
     splash.show()

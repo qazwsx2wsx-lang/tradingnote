@@ -1,5 +1,33 @@
 # tradingnote 現況（STATUS.md）
 
+## 必讀簡介（2026-09-17）
+- 本次開始時工作目錄乾淨，HEAD 為 `c6a5f47`；以下兩批改動都還沒 commit，是
+  Codex 跟 Claude 同時在同一份 working tree 上做的（跟 2026-09-15 之前記錄
+  的情況一樣），彼此沒有衝突，可以一起 commit。
+- **Codex（圖表版面調整）**：`tradingnote_gui.py`、`ui/stock_charts.py`。
+  部位／完整籌碼摘要改為 110px 可捲動區；圖表優先伸展，最低高度 320px，
+  泡泡圖最低 420px；完整籌碼視窗預設放大至 1100×820（依螢幕可用範圍縮小）；
+  部位上下分隔預設偏重明細。8 項圖表測試通過；150 行摘要 offscreen 驗證
+  圖表不縮小。尚未實機目視驗證。
+- **Claude（反覆閃退根因追查＋修復）**：`tradingnote_gui.py`、
+  `tradingnote_tasks.py`（新）、`ui/stock_charts.py`、`test_tradingnote_tasks.py`
+  （新）、`test_stock_charts.py`。user 回報「剛剛的閃退」，查到 Windows
+  CrashDumps 資料夾有 10 筆同樣簽章（`0xC0000409`／`ucrtbase.dll`）的當機、
+  從 2026-09-01 就開始，用 `PYTHONFAULTHANDLER=1` 直接跑真正的 app 重現了 3
+  次，抓到根因：背景執行緒（`run_background_task`）還在跑 sqlite3 之類的 C
+  extension 時，CPython 自動觸發的 GC（不限關閉視窗，正常操作中也會發生）
+  跟它互撞，導致原生層級當機（`Fatal Python error: Aborted`）。修法：
+  `main()` 開頭 `gc.disable()`＋`gc.freeze()`（這個 app 幾乎用不到循環式
+  GC 才能回收的物件）；`app.aboutToQuit` 接
+  `tradingnote_tasks.wait_for_background_tasks()`，等背景執行緒收尾（逾時
+  未結束就 `os._exit(0)`，跳過會跟它們互撞的直譯器 finalize／GC）。順便
+  修了兩個在追查過程中發現的獨立 bug：資金流向泡泡圖 hover 提示文字因為
+  pyqtgraph 版本關鍵字引數不合而從沒真的顯示過（`_x,_y` → `x,y`）；「雙資料
+  比較」切到雙軸模式的圖例項目永遠不會被清掉、越切越多。24 項測試通過；
+  用同一支重現流程連續跑 4 次真正的 app（含實際操作、hover 泡泡圖），最後
+  一次完全乾淨（沒有任何錯誤/警告輸出）。詳見 `CHANGELOG.md` 2026-09-17
+  （續4）。
+
 跟 Codex 共用這個專案資料夾。這份文件是**唯一的當前狀態來源**：只保留現在為真的事實，過時的內容直接刪掉／改寫，不要加註「已過時」保留對照——歷史脈絡、某次改動當時的驗證細節去 `CHANGELOG.md` 查。**每次交接前，把最新、最需要注意的事更新到這份文件，並保持精簡**；細節寫進 `CHANGELOG.md`，不要塞在這裡。
 
 **開始工作前，Git 狀態一律以實際指令為準，不要只看這份文件的文字敘述**（這份文件的前身 HANDOFF.md 曾經因為手寫 commit hash／未 commit 清單，跟實際狀態脫節，見 `CHANGELOG.md` 2026-09-15 條目）：
@@ -68,6 +96,7 @@ tradingnote/
 - **`_category_color()` 用雜湊值決定色相，不保證任意兩個分類色相距離夠遠**：官方產業約35個分類時實測約 34/35 顏色可視覺區分（1 組偶爾撞色），分類數更多（概念主題/價值鏈細分類數百個）時撞色機率更高；如果使用者回饋易讀性不夠，可以調整 `_category_color()` 的飽和度/明度參數，或改成依實際出現的分類數量動態分配色相。
 - 只有 EOD（收盤）/ 盤後資料，非即時報價——刻意選擇，見 `CHANGELOG.md`。
 - 一批「已驗證邏輯，但未實機開 GUI 目視驗證」的歷史紀錄散落在 `CHANGELOG.md` 各條目裡（EPS 欄位、視窗放大鈕、泡泡圖近N日修正等），是驗證債務，不是功能缺口，需要時去 `CHANGELOG.md` 逐條找。
+- **`gc.disable()` 是根據兩次實機重現的證據（都停在「Garbage-collecting」）做出的緩解措施，不是 100% 證實的根因**：如果之後還是遇到閃退（`PYTHONFAULTHANDLER=1` 執行 `tradingnote_gui.py` 可以重現堆疊），代表還有別的觸發路徑，需要繼續查；見 `CHANGELOG.md` 2026-09-17（續4）。
 
 ## GUI Design System 重構（進行中，2026-09-15 啟動）
 user 提出完整規格：把 `tradingnote_gui.py` 拆成 `ui/theme.py`＋`ui/components/`＋`ui/pages/`＋`ui/widgets/`，建立 StatCard／SectionCard／SignalBadge／InsightCard／StockHeader 等 reusable component，最終讓首頁變成 progressive-disclosure 的現代分析 dashboard。明確要求**不要一次全部重寫**，小步進行，每輪都要確認 GUI 仍可啟動、既有功能不變。
@@ -148,9 +177,7 @@ offscreen 腳本斷言＋一次性 smoke script 確認接線正確；`PositionRe
 納入泡泡圖/期貨圖表）維持原樣，沒有動。
 
 ## 目前實際尚未 commit 的異動
-以 `git status` 為準，這份清單只是提示去哪找細節，不是完整列表（2026-09-16 更新：先前這裡記錄的「Codex 同時間在同一份 working tree 上的異動」已經不在 `git status` 裡，研判已經處理完並 commit 掉了，見 `7a6b19a fix: unify flow analysis periods and invalidate stale results`，移除該筆過時記錄）：
-- 介面卡頓修正：`_filter_stocks_tree`／`refresh_stocks_tab`（debounce＋批次更新）、`_on_stock_selected`（技術指標查詢改背景執行緒＋TTLCache）、`refresh_flow_tab`（全市場資金流向分析改背景執行緒，含 in-flight／pending 佇列避免同時呼叫）、`_on_futures_row_selected`（大額交易人歷史查詢改背景執行緒）。連帶在 `ARCHITECTURE.md` 補了 `run_background_task()` 回傳值必須留住的陷阱說明。見 `CHANGELOG.md` 2026-09-16。
-- `ui/stock_charts.py`／`test_stock_charts.py`（未追蹤）＋ `tradingnote_gui.py` 裡對應的 `StockChart`／`ComparisonWidget`／`chart_page` 使用：把圖表元件從 `tradingnote_gui.py` 抽到獨立模組、新增「雙資料比較」分頁。2026-09-16：`ComparisonWidget.set_sources()` 擴充成同時接受既有畫好的圖表（`.series()`）跟直接給的序列清單，`_technical_comparison_sources()`（`tradingnote_gui.py`）把技術分析全部 24 類指標（KD／MACD／均線／RSI／布林通道…）也變成可選的比較來源，每個指標類別各自成一組避免同名序列互相蓋掉；`test_stock_charts.py` 既有 2 個測試＋新的整合驗證皆通過。詳見 `CHANGELOG.md` 2026-09-16（續）。
+以 `git status` 為準。本次未 commit 的圖表空間調整見最上方必讀簡介及 `CHANGELOG.md` 2026-09-17「增加圖表空間」。先前圖表抽離、雙資料比較與延遲建立已在現有提交內。
 
 ## 如果要繼續開發，建議先讀
 1. 這份 `STATUS.md`（現況最新）

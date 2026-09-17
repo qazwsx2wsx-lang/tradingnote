@@ -220,6 +220,36 @@ class DetailChartPanelTests(unittest.TestCase):
         self.assertEqual(chart.dates, ["2026-09-12", "2026-09-13", "2026-09-14"])
         panel.tabs.close()
 
+    def test_comparison_legend_does_not_accumulate_across_dual_axis_switches(self):
+        """2026-09-17 實機操作發現：切換「雙資料比較」的下拉選單到不同單位
+        （觸發雙軸模式）好幾次後，左邊圖例越長越多，但圖上其實只畫 2 條線
+        ——因為雙軸那條線的圖例是手動塞進 legend（不是透過
+        self.chart.addItem()），StockChart.clear() 的 removeItem() 迴圈看不到
+        它，永遠不會被移除。這裡驗證切換過幾輪不同單位的資料之後，圖例項目
+        數量還是固定 2 個，不會累積殘留。"""
+        panel = gui.DetailChartPanel()
+        dates = ["2026-09-10", "2026-09-11"]
+        panel.set_data({
+            "price_history": [dict(date=d, close=100.0 + i) for i, d in enumerate(dates)],
+            "institutional_history": {"dates": dates, "series": {"外資": [10, -3]}},
+            "vpt_mfi_history": {"dates": dates, "vpt": [5.0, 9.0], "mfi": [40.0, 55.0]},
+        })
+        comparison_index = panel.tabs.count() - 1
+        panel.tabs.setCurrentIndex(comparison_index)
+        self.app.processEvents()
+        compare = panel._comparison_state["widget"]
+
+        # 資料 A 固定「收盤價」（單位跟其他都不同，逼雙軸模式），資料 B 輪流
+        # 切到幾種不同單位的序列，每次都會經過「雙軸」那個手動塞圖例的分支。
+        combo_a, combo_b = compare.selectors
+        combo_a.setCurrentText("股價／收盤價")
+        for label in ("三大法人累計／外資", "VPT／VPT", "MFI／MFI", "三大法人累計／外資"):
+            combo_b.setCurrentText(label)
+            self.app.processEvents()
+
+        self.assertEqual(len(compare.chart.plotItem.legend.items), 2)
+        panel.tabs.close()
+
     def test_clear_shows_empty_state_on_active_tab(self):
         panel = gui.DetailChartPanel()
         panel.set_data(self._sample_data(["2026-09-10", "2026-09-11"]))

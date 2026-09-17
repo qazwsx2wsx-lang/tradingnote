@@ -7,7 +7,7 @@ from PySide6 import QtCore, QtWidgets
 from ui.theme import COLOR_ACCENT, COLOR_SPECIAL, COLOR_SURFACE, COLOR_TEXT, COLOR_MUTED
 
 
-def apply_chart_theme(chart, *, min_height=240):
+def apply_chart_theme(chart, *, min_height=320):
     """套用 `StockChart`／`FlowChartWidget` 等 `pg.PlotWidget` 共用的深色主題
     設定（背景／格線／圖例／最小高度）。取代原本在 `tradingnote_gui.py` 多處
     逐字重複的 setBackground／showGrid／addLegend／setMinimumHeight 四行。"""
@@ -202,6 +202,14 @@ class ComparisonWidget(QtWidgets.QWidget):
         self.chart.clear()
         self.right.clear()
         self.chart.hideAxis("right")
+        # 雙軸模式（見下方 dual 分支）把右軸那條線手動塞進
+        # self.chart.plotItem.legend，不是透過 self.chart.addItem()，所以
+        # StockChart.clear() → PlotItem.clear() 的 removeItem() 迴圈看不到它、
+        # 也就不會連帶把它從圖例移除——每次切換到雙軸的資料都會多留一筆圖例，
+        # 越切越多（2026-09-17 實機操作發現）。這裡直接清空整個圖例，兩條線
+        # 的圖例都在下面重新加回來，不管走哪個分支都不會累積殘留項目。
+        if self.chart.plotItem.legend is not None:
+            self.chart.plotItem.legend.clear()
         selected = [self.catalog.get(combo.currentText()) for combo in self.selectors]
         if not all(selected):
             self.chart.setTitle("尚無可比較資料", color=COLOR_TEXT)

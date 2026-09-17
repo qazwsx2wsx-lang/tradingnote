@@ -6,6 +6,86 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 
 ---
 
+## 2026-09-17（續4）反覆閃退根因追查與修復＋順便修掉的兩個小 bug
+
+**動機**：user 問「有剛剛的閃退紀錄嗎」。查了 `%LOCALAPPDATA%\CrashDumps`，
+找到 `python.exe.11036.dmp`（7 分鐘前產生），解析後是 `0xC0000409`
+（fail-fast）、當機位置在 `ucrtbase.dll`（native 層級，非一般可 catch 的
+Python 例外）。把資料夾裡另外 9 筆歷史 dump 也解析一遍，發現**同樣的簽章從
+2026-09-01 就開始重複出現**（09-01、09-02、09-06、09-08、09-09×2、09-15×2、
+今天兩次），是長期存在、反覆發生的問題，不是今天才有的。
+
+**重現**：user 同意後，直接用 `.venv` 的 python 跑真正的 `tradingnote_gui.py`
+（不經過 `啟動TradingNote.bat`），設定 `PYTHONFAULTHANDLER=1`＋
+`PYTHONUNBUFFERED=1`，輸出導到 `data/crash_debug.log`（未進 git）。**第一次
+就重現成功**，拿到完整 Python 堆疊：`Fatal Python error: Aborted`，背景
+daemon thread（`run_background_task`）正在跑
+`FlowAnalysisService.analyze()` 的 SQLite 查詢
+（`tradingnote_history.load_analysis_history`），當下主執行緒正在
+「Garbage-collecting」，位置是 `main()` 執行完、直譯器開始收尾的階段。
+
+**第一版修法（不夠）**：加 `tradingnote_tasks.wait_for_background_tasks()`，
+追蹤所有 `BackgroundTask` 開的執行緒，`app.aboutToQuit` 觸發時等它們收尾
+（bounded join，預設 5 秒）。重新用同一套流程跑真正的 app 驗證，**又當機了
+一次**——這次是 `backfill_twse_history`（TWSE 歷史回補，網路請求）還在跑，
+超過 5 秒逾時，代表只 wait 不夠：網路任務可能撐過任何合理的逾時時間。
+**加碼**：逾時後如果還有執行緒沒結束，直接 `os._exit(0)` 跳過 Python 的
+GC／finalize，不要放行讓它跟還在跑的執行緒互撞——sqlite3 的 WAL／rollback
+journal 設計成禁得起行程被砍掉，這個 app 的使用者資料也都是操作當下就同步
+寫檔（不是留到關閉才寫），跳過收尾不影響已完成的操作。
+
+**第三次驗證發現問題更大**：又重新跑一次，**這次當機發生在正常操作中**
+（`_on_stock_capital_flow_double_clicked`，雙擊個股跳出 `StockDetailDialog`
+那當下），不是關閉視窗。同一個「Garbage-collecting」訊號，代表只要背景
+執行緒還在跑 C extension，CPython 週期性自動觸發的 GC 隨時都可能撞上，不
+限關閉那一刻。**最終修法**：`main()` 最前面加 `gc.disable()`＋
+`gc.freeze()`——這個 app 幾乎不會用到需要循環式 GC 才能回收的物件（正常
+refcounting 就夠了），關掉自動 GC 換取穩定性是合理取捨；`gc.freeze()` 把
+啟動時已存在的物件先凍結進 permanent generation。原本 `aboutToQuit` 的
+`wait_for_background_tasks`／`os._exit` 修法保留，因為直譯器 finalize 自己
+還是會強制跑一次 GC，`gc.disable()` 擋不掉那次。
+
+**驗證**：`python -m py_compile` 全過；新增 `test_tradingnote_tasks.py`
+（`patch.object` 掉 `os._exit`，驗證準時結束不會走 force-exit、逾時未結束
+會走 force-exit，不會真的砍掉測試行程本身）；既有 `test_stock_charts`／
+`test_tradingnote_flow`／`test_tradingnote_technical` 全過，共 24 項。用同一
+套「真正的 app＋`PYTHONFAULTHANDLER=1`」流程**連續驗證 4 輪**（每次都是
+獨立一次全新啟動＋實際操作，非離線腳本）：第 1 輪重現閃退（根因確認）、
+第 2 輪重現閃退（第一版修法不足，發現逾時問題）、第 3 輪未閃退但發現正常
+操作中也會撞上（找到 gc.disable() 這個更根本的修法）、第 4 輪完全乾淨
+（`data/crash_debug.log` 0 行輸出，無任何錯誤/警告）。
+
+**順便修的兩個獨立 bug**（在跑重現流程時，靠 stderr 輸出發現的）：
+- **資金流向泡泡圖 hover 提示文字從沒真的顯示過**：目前裝的 pyqtgraph 版本用
+  關鍵字引數呼叫 `tip(x=, y=, data=)`（`ScatterPlotItem.hoverEvent`），但
+  `populate_flow_chart` 的 `tip=lambda _x, _y, data: ...` 參數名稱是
+  `_x`/`_y` 不是 `x`/`y`，每次 hover 都會噴 `TypeError`（被 pyqtgraph 包成
+  `RuntimeWarning`，不會讓程式崩潰，但提示文字永遠出不來）。改成
+  `lambda x, y, data: ...`。
+- **「雙資料比較」圖例項目會越切越多**：雙軸模式（兩個選取序列單位不同）
+  那條線的圖例是手動塞進 `self.chart.plotItem.legend`，不是透過
+  `self.chart.addItem()`，`StockChart.clear()` 看不到它，每切一次不同單位
+  的資料就多留一筆殘留圖例。改成 `refresh()` 一開始先
+  `self.chart.plotItem.legend.clear()`，兩條線都在下面重新加回來。新增
+  `test_comparison_legend_does_not_accumulate_across_dual_axis_switches`
+  鎖住這個行為。
+
+**未做**：`gc.disable()` 是根據兩次實機重現證據（都停在「Garbage-collecting」）
+歸納出的緩解措施，不是用原生除錯器（WinDbg 之類）逐行證實的根因，見
+`STATUS.md`「已知缺口」；`_check_for_new_data` 背景輪詢跟 GC 觸發時機的精確
+關係沒有進一步用工具量化（例如關掉輪詢單獨測試）；沒有做長時間（數小時）
+穩定性測試，只驗證了 4 輪各自數分鐘的手動操作。
+
+---
+
+## 2026-09-17 增加圖表空間
+
+- 部位與完整籌碼摘要使用 110px 高的獨立捲動區，長資料仍可完整閱讀，不再隨內容增長擠壓圖表。
+- 共用圖表最低高度由 240 改為 320px，泡泡圖由 280 改為 420px；部位上下分隔預設 1:3、保留拖曳調整且避免整區收合，圖表分頁取得剩餘高度。
+- 完整籌碼視窗偏好尺寸由 700×620 改為 1100×820，仍受可用螢幕大小限制。
+- 驗證：`python -m unittest test_stock_charts` 8 項通過；offscreen 1000×650 容器從短摘要換成 150 行資料後，圖表維持 441px，摘要捲軸可瀏覽剩餘內容；`git diff --check` 通過。
+- **未做**：未以實際桌面滑鼠操作／高 DPI 螢幕目視驗證。
+
 ## 2026-09-17 圖表架構統整第一~三階段：效能基準、共用小工具、延遲建立
 
 **動機**：這個 session 前面幾輪對 `tradingnote_gui.py` 陸續做了背景執行緒／
