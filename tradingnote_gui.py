@@ -53,6 +53,8 @@ from tradingnote_finmind import (
     FINMIND_HOURLY_LIMIT,
     backfill_tpex_history_via_finmind,
     fetch_institutional_investors,
+    fetch_institutional_investors_history,
+    fetch_margin_short_sale_history,
     fetch_position_detail,
     fetch_valuation,
     get_call_count,
@@ -238,20 +240,28 @@ def _latest_valid(values):
 def _stock_trend_badges(technical):
     """rule-based（不接 LLM）：從既有的本地技術指標（tradingnote_technical.
     calculate_indicators 的既有輸出，不新增任何指標計算）萃取「趨勢／動能／量能」
-    三個方向性標籤，給「個股概覽」的 SignalBadge 用。純粹是「怎麼解讀已經算好的
-    數字」：
+    三個方向性標籤，加上依前三者交叉判斷的「量價背離」標籤，給「個股概覽」的
+    SignalBadge 用。純粹是「怎麼解讀已經算好的數字」：
     - 趨勢：收盤價相對 MA20 的乖離（>=1% 偏多、<=-1% 偏空，用來過濾貼著均線
       上下的雜訊）。
     - 動能：RSI(14)（>=55 偏強、<=45 偏弱，50 上下不特別有意義所以留一段中性帶）。
     - 量能：今日成交量相對均量20 的倍數（>=1.2x 放大、<=0.8x 萎縮）；量能本身
       沒有天生的多空傾向（爆量可能是噴出也可能是出貨），tone 刻意不用
       positive/negative，避免暗示「量增=好事」。
+    - 量價背離：前面「趨勢」跟「量能」分開判斷、刻意不互相參照，所以量價背離
+      （價漲量縮、價跌量增）一直沒被標出來——這裡把兩者的判斷結果交叉比對，
+      只在真的出現背離時才多附一個標籤；趨勢中性或量價同步時不強行湊出第四
+      個標籤，維持跟其他三項一樣「沒有明顯訊號就不下結論」的原則。價跌量增
+      tone 刻意用 info 而非 positive/negative，因為可能是止跌訊號也可能是
+      逃命賣壓，方向不明確。
     某一項資料不足（例如新股不到 20 個交易日）時該項直接跳過，不用預設值假裝
-    有結論；三項全部不足時回傳空 list，呼叫端應顯示「資料不足」的空狀態文字。
+    有結論；全部不足時回傳空 list，呼叫端應顯示「資料不足」的空狀態文字。
     """
     if not technical:
         return []
     badges = []
+    diff_pct = None
+    volume_ratio = None
 
     close = _latest_valid(technical.get("close"))
     ma20 = _latest_valid(technical.get("ma", {}).get("ma20"))
@@ -277,13 +287,89 @@ def _stock_trend_badges(technical):
     volume = _latest_valid(volume_series.get("成交量"))
     volume_ma20 = _latest_valid(volume_series.get("均量20"))
     if volume is not None and volume_ma20:
-        ratio = volume / volume_ma20
-        if ratio >= 1.2:
+        volume_ratio = volume / volume_ma20
+        if volume_ratio >= 1.2:
             badges.append(("量能：放大", "warning"))
-        elif ratio <= 0.8:
+        elif volume_ratio <= 0.8:
             badges.append(("量能：萎縮", "neutral"))
         else:
             badges.append(("量能：平穩", "neutral"))
+
+    if diff_pct is not None and volume_ratio is not None:
+        if diff_pct >= 1 and volume_ratio <= 0.8:
+            badges.append(("量價背離：轉弱", "negative"))
+        elif diff_pct <= -1 and volume_ratio >= 1.2:
+            badges.append(("量價背離：留意止跌", "info"))
+
+    return badges
+
+
+def _chip_momentum_badges(institutional_history, margin_history):
+    """rule-based（不接 LLM）：從個股 120 日三大法人買賣超與融資融券餘額歷史
+    （tradingnote_finmind.fetch_institutional_investors_history／
+    fetch_margin_short_sale_history 既有輸出，不新增任何抓取邏輯）萃取「籌碼
+    方向／籌碼動能／融資動向」三個標籤，給「個股概覽」的 SignalBadge 用，跟
+    _stock_trend_badges 同一套設計原則：
+    - 籌碼方向：跟族群層級 _institutional_sync_score 同一套三家各自取正負號
+      加總的演算法（範圍 -3~+3），套用在單一個股「最新一天」的外資／投信／
+      自營商淨買賣超（股數）上——正負號判斷跟金額或股數無關，演算法可以直接
+      沿用；只有 +3／-3（三家方向完全一致）才算「同步」，其餘（含只有兩家
+      同向）都算「分歧」，跟 _institutional_sync_score 的既有定義一致。
+    - 籌碼動能：從最新一天往回數，三大法人合計淨額連續同號（同買或同賣）的
+      天數；未達 3 天視為訊號不明顯，不特別標出來（跟量能的「平穩」不同，
+      這裡選擇直接不顯示，因為「連 1～2 天」本來就稱不上動能）。
+    - 融資動向：最新融資餘額 vs 10 個交易日前的融資餘額變化率，未達 ±1% 視
+      為持平不特別標出。tone 刻意用 info：融資增加可能是散戶追價（偏空的
+      反指標）也可能是真的看好加碼，跟 _stock_trend_badges 的量能徽章一樣
+      不假設方向。
+    institutional_history／margin_history 任一為 None（例如沒設定 FinMind
+    token）就跳過對應項目；兩者都缺時回傳空 list，呼叫端顯示「資料不足」。
+    """
+    badges = []
+
+    if institutional_history:
+        series = institutional_history.get("series", {})
+        foreign = series.get("外資") or []
+        trust = series.get("投信") or []
+        dealer = series.get("自營商") or []
+        n = min(len(foreign), len(trust), len(dealer))
+        if n:
+            score = _sign(foreign[-1]) + _sign(trust[-1]) + _sign(dealer[-1])
+            if score == 3:
+                badges.append(("籌碼方向：三大法人同步買超", "positive"))
+            elif score == -3:
+                badges.append(("籌碼方向：三大法人同步賣超", "negative"))
+            else:
+                badges.append(("籌碼方向：三大法人分歧", "neutral"))
+
+            streak = 0
+            streak_sign = 0
+            for index in range(n - 1, -1, -1):
+                daily_sign = _sign(foreign[index] + trust[index] + dealer[index])
+                if daily_sign == 0:
+                    break
+                if streak == 0:
+                    streak_sign = daily_sign
+                    streak = 1
+                elif daily_sign == streak_sign:
+                    streak += 1
+                else:
+                    break
+            if streak >= 3:
+                if streak_sign > 0:
+                    badges.append((f"籌碼動能：連買 {streak} 日", "positive"))
+                else:
+                    badges.append((f"籌碼動能：連賣 {streak} 日", "negative"))
+
+    if margin_history:
+        margin_series = margin_history.get("series", {}).get("融資餘額") or []
+        if len(margin_series) > 10:
+            latest = margin_series[-1]
+            reference = margin_series[-11]
+            if reference:
+                change_pct = (latest / reference - 1) * 100
+                if abs(change_pct) >= 1:
+                    badges.append((f"融資動向：10 日變化 {change_pct:+.1f}%", "info"))
 
     return badges
 
@@ -303,13 +389,14 @@ def _clear_layout(layout):
             widget.deleteLater()
 
 
-def _populate_trend_badge_row(layout, technical, empty_text="歷史資料不足，暫無法判斷趨勢／動能／量能。"):
-    """清空並重繪一列「趨勢／動能／量能」SignalBadge；沒有夠格的資料時改顯示
-    empty_text 的 muted 提示，維持跟其他空狀態一致的呈現方式。共用給
-    `StockDetailDialog` 與「個股查詢」分頁的 `stock_preview` 摘要面板。
+def _populate_badge_row(layout, badges, empty_text):
+    """清空並重繪一列 SignalBadge；沒有夠格的資料（badges 為空）時改顯示
+    empty_text 的 muted 提示，維持跟其他空狀態一致的呈現方式。呼叫端自己算好
+    badges 列表（例如 _stock_trend_badges／_chip_momentum_badges 的回傳值）
+    再傳進來，這個函式只負責畫面呈現，共用給 `StockDetailDialog` 的趨勢／
+    籌碼徽章列與「個股查詢」分頁的 `stock_preview` 摘要面板。
     """
     _clear_layout(layout)
-    badges = _stock_trend_badges(technical)
     if badges:
         for text, tone in badges:
             layout.addWidget(SignalBadge(text, tone=tone))
@@ -765,7 +852,17 @@ class StockDetailDialog(QtWidgets.QDialog):
 
         trend_row = QtWidgets.QHBoxLayout()
         trend_row.setSpacing(6)
-        _populate_trend_badge_row(trend_row, technical)
+        _populate_badge_row(
+            trend_row,
+            _stock_trend_badges(technical),
+            empty_text="歷史資料不足，暫無法判斷趨勢／動能／量能。",
+        )
+
+        self.chip_row = QtWidgets.QHBoxLayout()
+        self.chip_row.setSpacing(6)
+        _populate_badge_row(
+            self.chip_row, [], empty_text="查詢中...（需設定 FinMind token 才有籌碼動能資料）"
+        )
 
         self.status_label = QtWidgets.QLabel("查詢中...")
         self.status_label.setWordWrap(True)
@@ -776,6 +873,7 @@ class StockDetailDialog(QtWidgets.QDialog):
         self._layout.addWidget(self.hero)
         self._layout.addLayout(trend_row)
         self._layout.addWidget(self.status_label)
+        self._layout.addLayout(self.chip_row)
         self.local_technical_widget = TechnicalAnalysisWidget()
         self.local_technical_widget.set_data(technical)
         self._layout.addWidget(self.local_technical_widget, 1)
@@ -794,12 +892,19 @@ class StockDetailDialog(QtWidgets.QDialog):
             return (
                 fetch_valuation(ticker, finmind_token, market=market),
                 fetch_institutional_investors(ticker, finmind_token),
+                fetch_institutional_investors_history(ticker, finmind_token, lookback_days=60),
+                fetch_margin_short_sale_history(ticker, finmind_token, lookback_days=20),
             )
 
         self._timer = run_task_in_thread(self, fetch_both, self._on_done, self._on_error)
 
     def _on_done(self, result):
-        valuation, institutional = result
+        valuation, institutional, institutional_history, margin_history = result
+        _populate_badge_row(
+            self.chip_row,
+            _chip_momentum_badges(institutional_history, margin_history),
+            empty_text="籌碼資料不足（可能尚未設定 FinMind token，或該股票暫無資料）。",
+        )
         metrics = []
         if valuation is None:
             valuation_date = "估值資料不足"
@@ -845,6 +950,9 @@ class StockDetailDialog(QtWidgets.QDialog):
             f"查詢失敗：{message}\n\n"
             "可能原因：FinMind token 未設定或已失效、"
             "已超過免費額度，或該股票暫無此資料。"
+        )
+        _populate_badge_row(
+            self.chip_row, [], empty_text="籌碼資料查詢失敗，暫無法判斷籌碼動能。"
         )
         self._notify_finmind_call()
 
@@ -1583,9 +1691,9 @@ def populate_flow_chart(
         x_ref_line = statistics.median(xs_for_ref) if xs_for_ref else 0
         y_ref_line = 1
     elif mode == "institutional_sync":
-        # 三大法人資料只有最新一筆（get_cached_institutional_snapshot，30分鐘
-        # TTL，沒有歷史 DB 表），不像動能/估值模式有「N日流向區間」可選，這裡
-        # 如實呈現這個限制，不做歷史回補。dashboard.institutional_flow 由
+        # 歷史法人表（tradingnote_institutional_history，scripts/backfill.py 回補）
+        # 涵蓋整個流向區間時是區間加總；否則退回最新一筆快照
+        # （get_cached_institutional_snapshot）。dashboard.institutional_flow 由
         # FlowAnalysisService.analyze() 無條件算好（見 tradingnote_flow.py），
         # 用 group 名稱對應 dashboard.industry_flow 的 f.industry。
         institutional_by_group = {
@@ -4701,7 +4809,11 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         def on_done(technical):
             if ticker != self._stock_trend_expected_ticker:
                 return
-            _populate_trend_badge_row(self.stock_preview_trend_row, technical)
+            _populate_badge_row(
+                self.stock_preview_trend_row,
+                _stock_trend_badges(technical),
+                empty_text="歷史資料不足，暫無法判斷趨勢／動能／量能。",
+            )
 
         def on_error(_message):
             if ticker != self._stock_trend_expected_ticker:
@@ -5008,29 +5120,45 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             all_products = list_all_products(rows)
             # 大額交易人未沖銷部位是另一支 TAIFEX 端點，抓失敗（且無舊快取）時
             # 不該讓整個期貨盤後表格跟著壞掉——退回空清單，雙擊時再提示稍後重試。
+            # 這裡多回傳一個 bool 記錄「是不是抓失敗才空的」，讓 on_done 能在
+            # 畫面上警示，不然使用者只會看到搜尋／大額部位悄悄失效，找不到原因。
             try:
                 large_traders_rows = get_cached_large_traders_futures_report(
                     FUTURES_LARGE_TRADERS_CACHE_PATH, force_refresh=force_refresh
                 )
+                large_traders_failed = False
             except PriceFetchError:
                 large_traders_rows = []
+                large_traders_failed = True
             # 股票期貨標的清單也是輔助資訊，抓失敗不該讓主行情表跟著壞——退回空 map，
-            # 個股期貨那幾列的「標的」欄暫時顯示 "-"、仍可用契約代碼搜尋。
+            # 個股期貨那幾列的「標的」欄暫時顯示 "-"、仍可用契約代碼搜尋，但用股票
+            # 代號／名稱搜尋會找不到任何股票期貨列，同樣需要警示原因。
             try:
                 ssf_map = build_ssf_map(
                     get_cached_ssf_list(FUTURES_SSF_CACHE_PATH, force_refresh=force_refresh)
                 )
+                ssf_failed = False
             except PriceFetchError:
                 ssf_map = {}
+                ssf_failed = True
             return (
                 all_products,
                 get_futures_snapshot(all_products, rows=rows),
                 large_traders_rows,
                 ssf_map,
+                large_traders_failed,
+                ssf_failed,
             )
 
         def on_done(result):
-            all_products, snapshot, large_traders_rows, ssf_map = result
+            (
+                all_products,
+                snapshot,
+                large_traders_rows,
+                ssf_map,
+                large_traders_failed,
+                ssf_failed,
+            ) = result
             self._futures_all_products = all_products
             self._futures_snapshot = snapshot
             self._futures_large_traders_rows = large_traders_rows
@@ -5046,7 +5174,15 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
                 if code in lt_name_map
             }
             data_date = _futures_snapshot_date(snapshot)
-            self.futures_status_label.setText(f"資料日期：{data_date}" if data_date else "")
+            status_text = f"資料日期：{data_date}" if data_date else ""
+            warnings = []
+            if ssf_failed:
+                warnings.append("股票期貨標的清單載入失敗，暫時無法用股票代號／名稱搜尋股票期貨")
+            if large_traders_failed:
+                warnings.append("大額交易人未沖銷部位載入失敗，暫無資料")
+            if warnings:
+                status_text = (f"{status_text}　" if status_text else "") + "⚠ " + "；".join(warnings)
+            self.futures_status_label.setText(status_text)
             self._rebuild_futures_table()
             self._refresh_data_freshness_label()
 
