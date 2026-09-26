@@ -1,32 +1,39 @@
 # tradingnote 現況（STATUS.md）
 
-## 必讀簡介（2026-09-17）
-- 本次開始時工作目錄乾淨，HEAD 為 `c6a5f47`；以下兩批改動都還沒 commit，是
-  Codex 跟 Claude 同時在同一份 working tree 上做的（跟 2026-09-15 之前記錄
-  的情況一樣），彼此沒有衝突，可以一起 commit。
-- **Codex（圖表版面調整）**：`tradingnote_gui.py`、`ui/stock_charts.py`。
-  部位／完整籌碼摘要改為 110px 可捲動區；圖表優先伸展，最低高度 320px，
-  泡泡圖最低 420px；完整籌碼視窗預設放大至 1100×820（依螢幕可用範圍縮小）；
-  部位上下分隔預設偏重明細。8 項圖表測試通過；150 行摘要 offscreen 驗證
-  圖表不縮小。尚未實機目視驗證。
-- **Claude（反覆閃退根因追查＋修復）**：`tradingnote_gui.py`、
-  `tradingnote_tasks.py`（新）、`ui/stock_charts.py`、`test_tradingnote_tasks.py`
-  （新）、`test_stock_charts.py`。user 回報「剛剛的閃退」，查到 Windows
-  CrashDumps 資料夾有 10 筆同樣簽章（`0xC0000409`／`ucrtbase.dll`）的當機、
-  從 2026-09-01 就開始，用 `PYTHONFAULTHANDLER=1` 直接跑真正的 app 重現了 3
-  次，抓到根因：背景執行緒（`run_background_task`）還在跑 sqlite3 之類的 C
-  extension 時，CPython 自動觸發的 GC（不限關閉視窗，正常操作中也會發生）
-  跟它互撞，導致原生層級當機（`Fatal Python error: Aborted`）。修法：
-  `main()` 開頭 `gc.disable()`＋`gc.freeze()`（這個 app 幾乎用不到循環式
-  GC 才能回收的物件）；`app.aboutToQuit` 接
-  `tradingnote_tasks.wait_for_background_tasks()`，等背景執行緒收尾（逾時
-  未結束就 `os._exit(0)`，跳過會跟它們互撞的直譯器 finalize／GC）。順便
-  修了兩個在追查過程中發現的獨立 bug：資金流向泡泡圖 hover 提示文字因為
-  pyqtgraph 版本關鍵字引數不合而從沒真的顯示過（`_x,_y` → `x,y`）；「雙資料
-  比較」切到雙軸模式的圖例項目永遠不會被清掉、越切越多。24 項測試通過；
-  用同一支重現流程連續跑 4 次真正的 app（含實際操作、hover 泡泡圖），最後
-  一次完全乾淨（沒有任何錯誤/警告輸出）。詳見 `CHANGELOG.md` 2026-09-17
-  （續4）。
+## 必讀簡介（2026-09-26）
+- 工作目錄**有未 commit 的改動**；HEAD 本身是乾淨的 `215f9a4`。
+- **Claude（2026-09-26，「法人資金流去哪？」網頁＋三大法人歷史）**：
+  新增 `tradingnote_institutional_history.py`（6 張自有表）、`scripts/`
+  （backfill／fetch_daily／recompute／launchd 範本）、`sector_overrides.json`、
+  `web/`（Next.js 唯讀顯示層）、`test_tradingnote_institutional_history.py`；
+  改 `tradingnote_history.py`（新增 `fetch_tpex_historical_day`，上櫃歷史收盤
+  不必再靠 FinMind）、`tradingnote_flow.py`（「主力同步買超」區間有歷史時用
+  區間加總）、`tradingnote_api_config.py`。用法見 `web/README.md`，細節見
+  `CHANGELOG.md` 2026-09-26。`test_tradingnote_flow_gui` 的 1 個失敗在 HEAD
+  版核心模組上同樣失敗，不是這次造成的。
+- **Claude（2026-09-23，個股籌碼動能徽章＋量價背離判斷）**：
+  `tradingnote_gui.py`（改）、`test_tradingnote_chip_badges.py`（新）。
+  `_stock_trend_badges` 新增「量價背離」標籤（趨勢/量能交叉比對）；新增
+  `_chip_momentum_badges`（籌碼方向／連買連賣天數／融資餘額變化），接到
+  `StockDetailDialog` 新的 `chip_row`；`_populate_trend_badge_row` 重構成
+  通用的 `_populate_badge_row(layout, badges, empty_text)`。13 項新測試
+  通過，既有測試無新增失敗。詳見 `CHANGELOG.md` 2026-09-23。
+- **Claude（2026-09-24，期貨頁 SSF／大額部位抓取失敗改為可見警示）**：
+  `tradingnote_gui.py`（`refresh_futures_tab`）。user 回報「期貨連動個股
+  查詢失效」——查到 `_filter_futures_table` 用股票代號／名稱搜尋股票期貨
+  完全靠 `self._futures_ssf_map`，但這個 map 抓取失敗時（`PriceFetchError`）
+  原本靜默退回空字典，沒有任何提示，搜尋悄悄找不到任何股票期貨列，看起來
+  就像功能整個壞掉；實測當下 TAIFEX `SSFLists` 端點本身資料／欄位正常，
+  推論是當次抓取遇到瞬斷。修法：`fetch()`／`on_done` 多帶
+  `ssf_failed`／`large_traders_failed` 兩個 bool，任一為真時在
+  `futures_status_label` 附加警告文字，不再完全靜默。沒有新增單元測試
+  （這個函式高度耦合 GUI dialog 狀態，跟既有慣例一致，其餘期貨頁邏輯也
+  沒有專屬測試）；`py_compile` 過、既有 test_*.py 無新增失敗。詳見
+  `CHANGELOG.md` 2026-09-24。**未做**：沒有實機重現「抓取失敗」情境驗證
+  警告文字實際顯示效果（本地無法穩定重現網路瞬斷）。
+- 系統 `python3` 是 3.9.6（不含 PySide6，也不支援本專案用到的 `X | None`
+  型別語法），這個環境要測試/跑 GUI 得用 `/opt/homebrew/bin/python3.12`
+  （已裝好 PySide6 0.14／pyqtgraph）。
 
 跟 Codex 共用這個專案資料夾。這份文件是**唯一的當前狀態來源**：只保留現在為真的事實，過時的內容直接刪掉／改寫，不要加註「已過時」保留對照——歷史脈絡、某次改動當時的驗證細節去 `CHANGELOG.md` 查。**每次交接前，把最新、最需要注意的事更新到這份文件，並保持精簡**；細節寫進 `CHANGELOG.md`，不要塞在這裡。
 
@@ -48,6 +55,10 @@ tradingnote/
 ├── tradingnote_history.py      # 核心：股票歷史 SQLite、產業分類、產業資金流向分析、個股量比異常清單
 ├── tradingnote_flow.py         # 核心：資金流向期間模型、儀表板結果集合、統一分析服務與快取
 ├── tradingnote_institutional.py # 核心：TWSE/TPEx 全市場三大法人買賣超與族群聚合（「法人方向」用）
+├── tradingnote_institutional_history.py # 核心：三大法人逐日歷史回補＋類股指標預先計算（web/ 與「主力同步買超」用）
+├── sector_overrides.json        # 「法人資金流去哪？」類股覆寫（人工維護）
+├── scripts/                     # backfill.py／fetch_daily.py／recompute.py／launchd 範本
+├── web/                         # Next.js「法人資金流去哪？」網頁（唯讀 history.db），說明見 web/README.md
 ├── tradingnote_technical.py    # 核心：由共用 OHLCV 計算 24 類技術指標（MA/EMA/KD/MACD/RSI/...）
 ├── tradingnote_journal.py      # 核心：交易週誌與持股週曆（2026-09-10 新增）
 ├── tradingnote_finmind.py      # 核心：FinMind API（本益比/殖利率/三大法人/融資融券等），僅 GUI 使用
@@ -92,7 +103,7 @@ tradingnote/
 - **CLI 沒有「個股」「期貨」模組的對應指令**，這兩個目前只有 GUI 在用。
 - **架構層級的技術債**（GUI 對話框樣板碼重複、紅綠上色邏輯重複、SQLite 連線邏輯重複等）：詳見 `ARCHITECTURE.md`「已知架構債務」一節。
 - **泡泡圖大小是「資金比重%」（絕對金額線性換算）**，還不是能凸顯「小市值但爆量」的相對指標；要做的話需要改用量比之類的相對值決定泡泡半徑。
-- **「主力同步買超」泡泡模式只反映最新一筆三大法人資料**（`get_cached_institutional_snapshot`，30分鐘 TTL，沒有歷史 DB 表），不像動能/估值模式有 N 日流向區間可選；要做歷史趨勢需要新增歷史回補與資料表，這次沒有做。
+- **「主力同步買超」泡泡模式只有在流向區間每一天都已回補（`scripts/backfill.py`）時才是區間加總**，否則退回最新一筆快照；GUI 畫面上沒有標示目前用的是哪一種。
 - **`_category_color()` 用雜湊值決定色相，不保證任意兩個分類色相距離夠遠**：官方產業約35個分類時實測約 34/35 顏色可視覺區分（1 組偶爾撞色），分類數更多（概念主題/價值鏈細分類數百個）時撞色機率更高；如果使用者回饋易讀性不夠，可以調整 `_category_color()` 的飽和度/明度參數，或改成依實際出現的分類數量動態分配色相。
 - 只有 EOD（收盤）/ 盤後資料，非即時報價——刻意選擇，見 `CHANGELOG.md`。
 - 一批「已驗證邏輯，但未實機開 GUI 目視驗證」的歷史紀錄散落在 `CHANGELOG.md` 各條目裡（EPS 欄位、視窗放大鈕、泡泡圖近N日修正等），是驗證債務，不是功能缺口，需要時去 `CHANGELOG.md` 逐條找。
@@ -109,7 +120,7 @@ user 提出完整規格：把 `tradingnote_gui.py` 拆成 `ui/theme.py`＋`ui/co
 - `ui/components/section_card.py`（`SectionCard`，標題＋描述＋`body_layout` 讓呼叫端塞內容，沿用 `summaryCard` 卡片樣式）。用法：「法人方向」子頁整個包進一張卡（原本是頁面上直接鋪標題+提示+三張圖，沒有卡片邊界）。
 - `ui/components/insight_card.py`（`InsightCard`，headline＋detail，rule-based 不接 LLM）。用法：`tradingnote_gui._flow_momentum_insight()`——從族群資金流向資料（量比≥1.5 且當日漲跌 |%|≥0.5 才夠格參與）挑出當天最極端的一筆量價訊號，生成一句話（例如「資金動能增強：{族群}今日成交量為近期均量的X倍，且價格同步走強」），沒有夠格的族群時顯示中性的「暫無明顯資金訊號」，不留白。放在「資金流向」分頁 StatCard 下方。
 - **正綠負紅→正紅負綠**（2026-09-15 續7，已拍板並套用）：`COLOR_GAIN`/`COLOR_LOSS`（含對應的 `_TINT`）兩組 hex 直接對調，改成台灣市場「漲紅跌綠」慣例。因為所有呼叫端都是透過 `gain_loss_color()`／常數名稱取色，不是寫死 RGB，這次全部自動套用到全部畫面（個股漲跌、三大法人買賣超、大額交易人淨部位、資金流向徽章、泡泡圖四象限），沒有另外改任何呼叫端程式碼。
-- **`SignalBadge` 推廣到「個股概覽」**（2026-09-15 續8／續9）：`tradingnote_gui._stock_trend_badges()` 純粹解讀既有本地技術指標（`tradingnote_technical.calculate_indicators`，MA20／RSI(14)／量比 20），沒有新增指標計算，資料不足時顯示一致的「歷史資料不足...」空狀態文字。用在兩處：(1) `StockDetailDialog`（雙擊個股彈出的視窗）hero 下方；(2)「個股查詢」分頁右側 `stock_preview` 摘要面板，選取清單項目時即時更新。兩處共用 `_populate_trend_badge_row()`／`_clear_layout()` 兩個 helper，不是各自重複一份 build/clear 邏輯。
+- **`SignalBadge` 推廣到「個股概覽」**（2026-09-15 續8／續9；2026-09-23 加量價背離＋籌碼徽章）：`tradingnote_gui._stock_trend_badges()` 解讀既有本地技術指標（`tradingnote_technical.calculate_indicators`，MA20／RSI(14)／量比 20），並交叉判斷第 4 個「量價背離」標籤，沒有新增指標計算，資料不足時顯示一致的「歷史資料不足...」空狀態文字。用在兩處：(1) `StockDetailDialog`（雙擊個股彈出的視窗）hero 下方；(2)「個股查詢」分頁右側 `stock_preview` 摘要面板，選取清單項目時即時更新。兩處共用 `_populate_badge_row()`／`_clear_layout()` 兩個 helper，不是各自重複一份 build/clear 邏輯（`_populate_badge_row` 原名 `_populate_trend_badge_row`，2026-09-23 改成接受已算好的 badges 列表，讓 `_chip_momentum_badges()` 也能共用同一個 render helper）。`StockDetailDialog` 另外新增 `chip_row`，顯示 `_chip_momentum_badges()`（籌碼方向同步分數／連買連賣天數／融資餘額變化），資料來自既有的 background fetch，沒有 FinMind token 時顯示空狀態。
 
 **還沒做**（下一輪候選，任選其一即可，不用照順序）：
 - `SectionCard`／`InsightCard` 目前都只各用在一處，還沒推廣到其他頁面。

@@ -24,6 +24,7 @@ from tradingnote_concepts import (
     CLASSIFICATION_INDUSTRY,
     CLASSIFICATION_VALUE_CHAIN_LEAF,
 )
+import tradingnote_institutional_history as institutional_history
 from tradingnote_institutional import (
     aggregate_institutional_by_group,
     load_cached_institutional_snapshot,
@@ -234,7 +235,20 @@ class FlowAnalysisService:
             self._group_cache.move_to_end(group_key)
 
         institutional_flow = ()
-        if self.institutional_cache_path is not None:
+        # 歷史法人表（tradingnote_institutional_history）涵蓋整個期間時，改用期間
+        # 加總，讓「主力同步買超」跟動能模式一樣反映流向區間；否則退回最新快照。
+        history_key = (group_key, "history", period.actual_dates,
+                       institutional_history.data_signature(self.db_path))
+        history_flow = self._institutional_group_cache.get(history_key)
+        if history_flow is None:
+            computed = institutional_history.aggregate_group_flow_for_dates(
+                self.db_path, groups, period.actual_dates
+            )
+            history_flow = tuple(computed) if computed is not None else False
+            self._remember(self._institutional_group_cache, history_key, history_flow)
+        if history_flow is not False:
+            institutional_flow = history_flow
+        elif self.institutional_cache_path is not None:
             institutional_rows = load_cached_institutional_snapshot(
                 self.institutional_cache_path
             )

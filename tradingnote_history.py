@@ -10,7 +10,9 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from tradingnote_api_config import TPEX_INDUSTRY_URL, TWSE_INDUSTRY_URL, TWSE_MI_INDEX_URL
+from tradingnote_api_config import (
+    TPEX_DAILY_QUOTES_URL, TPEX_INDUSTRY_URL, TWSE_INDUSTRY_URL, TWSE_MI_INDEX_URL,
+)
 from tradingnote_http import PriceFetchError, http_get_json, to_float, to_int
 
 INDUSTRY_MAP_MAX_AGE_DAYS = 7
@@ -490,6 +492,57 @@ def fetch_twse_historical_day(date_str):
             }
         )
     return records
+
+
+def parse_tpex_daily_quotes(payload):
+    """解析櫃買新版 dailyQuotes 回應（「上櫃股票行情」表），格式同
+    fetch_twse_historical_day 的 records；非交易日（表格為空）回傳 None。"""
+    if str(payload.get("stat", "")).lower() != "ok":
+        return None
+    table = next(
+        (t for t in payload.get("tables") or [] if (t.get("fields") or [None])[0] == "代號"),
+        None,
+    )
+    if table is None or not table.get("data"):
+        return None
+    records = []
+    for row in table["data"]:
+        try:
+            code, name = str(row[0]).strip(), str(row[1]).strip()
+            close = to_float(row[2])
+            change = to_float(row[3])
+            volume = to_int(row[8])
+            trading_value = to_float(row[9])
+        except IndexError:
+            continue
+        if not code or close is None:
+            continue
+        prev_close = close - change if change is not None else None
+        change_pct = change / prev_close * 100 if prev_close else None
+        records.append(
+            {
+                "ticker": code,
+                "name": name,
+                "market": "TPEX",
+                "close": close,
+                "change": change,
+                "change_pct": change_pct,
+                "volume": volume,
+                "trading_value": trading_value,
+            }
+        )
+    return records or None
+
+
+def fetch_tpex_historical_day(date_str):
+    """date_str 格式 YYYYMMDD。回傳當天全部上櫃證券紀錄；非交易日回傳 None。
+    跟 openapi 的 TPEX_URL 不同，這個端點可以查歷史日，不必依賴 FinMind 額度。"""
+    url = f"{TPEX_DAILY_QUOTES_URL}?date={date_str[:4]}/{date_str[4:6]}/{date_str[6:]}&type=EW&response=json"
+    try:
+        data = http_get_json(url, timeout=30)
+    except PriceFetchError:
+        return None
+    return parse_tpex_daily_quotes(data)
 
 
 def backfill_twse_history(

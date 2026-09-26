@@ -1,0 +1,6 @@
+{
+  "_readme": "「法人資金流去哪？」的類股對照覆寫檔。預設類股＝ industry_map 的官方產業別（上市 33／上櫃 28 類，已排除 ETF、權證）。stocks：把個股改歸到自訂類股（例如把半導體業拆成晶圓代工／IC設計）；rename_sectors：整個官方產業改名；exclude_sectors：不列入的類股。改完執行 python scripts/recompute.py 生效，不必重抓資料。",
+  "stocks": {},
+  "rename_sectors": {},
+  "exclude_sectors": ["臺灣存託憑證"]
+}

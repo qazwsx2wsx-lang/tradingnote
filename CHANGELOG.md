@@ -6,6 +6,150 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 
 ---
 
+## 2026-09-26 「法人資金流去哪？」網頁＋三大法人逐日歷史
+
+**動機**：user 要做一個仿 CMoney 主力動向頁的網頁（Next.js），每天盤後看三大法人在各類股的買賣超。
+先盤點既有程式碼：T86／TPEx 法人抓取、股數×收盤價的族群聚合、`industry_map`、上市 402 天
+`daily_prices` 都已經有了，缺的是「法人歷史」（STATUS.md 原本就列為已知缺口：主力同步買超只有
+最新一筆）。決定：**Python 核心負責抓資料＋計算，Next.js 只唯讀顯示**，不另寫一套 TS 爬蟲。
+
+**端點實測（2026-09-24 資料）**：
+- T86 `rwd/zh/fund/T86?date=YYYYMMDD` 可查歷史；非交易日 `stat` 為「很抱歉，沒有符合條件的資料!」。
+- BFI82U 五列＋合計；外資＝「外資及陸資(不含外資自營商)」＋「外資自營商」，自營＝自行＋避險。
+- 櫃買新版 `/www/zh-tw/insti/dailyTrade?type=Daily&sect=EW&date=YYYY/MM/DD`（24 欄：外資合計
+  第 10 欄、投信第 13 欄、自營合計第 22 欄）、`/insti/summary`、`/afterTrading/dailyQuotes`
+  都可帶日期；非交易日 `stat=ok` 但表格為空。openapi 版只能拿最新一天。
+
+**改法**：
+- 新 `tradingnote_institutional_history.py`：6 張自有表、解析／回補（3 秒間隔、非交易日記在
+  `institutional_calendar`、某市場資料不齊就整天不寫）、純函式指標（加速流入、連續買賣、5/20 日
+  累計、等權 5 日漲跌），全部預先算進 `sector_metrics`／`stock_metrics`。
+- `tradingnote_history.fetch_tpex_historical_day()`：上櫃歷史收盤改走櫃買 dailyQuotes，不再只能靠
+  FinMind 額度；寫入仍走 `upsert_daily_prices`。
+- `tradingnote_flow.FlowAnalysisService`：流向區間每天都有法人歷史時，「主力同步買超」改用區間加總，
+  否則退回原本的最新快照。
+- `scripts/`（backfill／fetch_daily／recompute／launchd 範本）、`sector_overrides.json`、`web/`
+  （4 支 API＋8 個頁面區塊，說明見 `web/README.md`）。
+
+**驗證**：
+- `test_tradingnote_institutional_history.py` 27 項全過（加速流入、連續天數、窗口、解析器、類股覆寫、
+  端到端 compute_metrics、區間聚合、回補跳過假日）。既有 flow／technical／journal／tasks／
+  chip_badges／stock_charts 測試通過；`test_tradingnote_flow_gui` 1 個失敗在 HEAD 版核心模組上
+  同樣失敗，不是這次造成的。
+- 回補後 2026-09-23 全部 18,134 檔個股股數跟既有 `institutional_cache.json`（openapi 快照）逐檔
+  一致；9/18 類股外資加總 +1,049 億 vs 交易所公布 +1,085 億（差額為 ETF）。
+- 瀏覽器實測：8 個區塊都有畫出、熱力圖排序、日期切換、點列／點泡泡開側欄、Esc 關閉、390px 寬
+  無水平捲動、深色模式。
+- **未做**：瀏覽器面板在隱藏狀態，ECharts 動畫偶爾截圖不到完整畫面，泡泡圖 Ctrl＋滾輪縮放沒有實測；
+  launchd 排程只提供範本，沒有實際載入；GUI 端「主力同步買超」用區間加總的效果沒有實機開 GUI 看。
+
+---
+
+## 2026-09-24 期貨頁：股票期貨標的清單／大額部位抓取失敗改為可見警示
+
+**動機**：user 回報「期貨連動個股查詢失效」——「期貨」分頁搜尋框可以用股票
+代號／名稱找對應的股票期貨（例如輸入「2330」或「台積電」找到 `CDF`），這個
+比對完全靠 `_filter_futures_table`（`tradingnote_gui.py:5170`）讀
+`self._futures_ssf_map`。查證：
+
+1. 直接打 `https://openapi.taifex.com.tw/v1/SSFLists`（TAIFEX 股票期貨標的
+   清單端點），回傳格式／欄位名稱（`Contract`／`StockCode`／`StockName`／
+   `UnderlyingStock`）跟 `build_ssf_map()`（`tradingnote_taifex.py:273`）
+   預期的完全一致，320 筆全部能正確解析——排除「TAIFEX 改版把解析邏輯弄
+   壞」的假設。
+2. 找到 `refresh_futures_tab`（`tradingnote_gui.py:5117`）裡 `ssf_map` 的
+   抓取包在 `try/except PriceFetchError` 裡，失敗時退回空字典
+   `{}`，**完全沒有任何提示**（沒有 log、沒有畫面警告）——這是刻意設計
+   （股票期貨標的清單是輔助資訊，抓失敗不該讓整個期貨表格跟著壞），但代價
+   是使用者完全看不出「搜尋找不到股票期貨」是暫時性的抓取失敗，還是功能
+   真的壞了，看起來就是「失效」。`large_traders_rows`（大額交易人未沖銷
+   部位）的抓取有一模一樣的靜默 fallback 模式。
+3. 推論根因是某次抓取遇到網路瞬斷／TAIFEX 端點暫時打不到（實測當下端點
+   本身正常），不是永久性壞掉——但因為完全靜默，使用者跟之後除錯的人都
+   沒有任何線索可以判斷。
+
+**改法**：`refresh_futures_tab` 的 `fetch()` 內層兩個 `try/except
+PriceFetchError` 各多記一個 bool（`ssf_failed`／`large_traders_failed`），
+隨結果一起傳給 `on_done`；`on_done` 組出 `futures_status_label` 文字時，
+任一為真就在既有的「資料日期：...」後面附加「⚠ 股票期貨標的清單載入失敗，
+暫時無法用股票代號／名稱搜尋股票期貨」／「⚠ 大額交易人未沖銷部位載入失敗，
+暫無資料」（兩者可同時出現，用「；」分隔）。沒有改動 fallback 的行為本身
+（仍然退回空 map／空清單，不讓整個表格壞掉），只是把原本完全靜默的失敗
+變成使用者看得到的警告，跟既有 `on_error`（完全抓不到期貨盤後行情時的
+錯誤訊息）共用同一個 `futures_status_label`。
+
+**驗證**：`python3.12 -m py_compile tradingnote_gui.py` 過；
+`python3.12 -m unittest discover -p "test_*.py"` 全部既有測試沒有新增
+失敗（跟改動前的既有失敗項目一致，見 2026-09-23 條目的驗證方式）。**未做**：
+沒有幫這支函式寫專屬單元測試（`refresh_futures_tab` 是 `TradingNoteWindow`
+主視窗的方法，高度耦合一整批 `self._futures_*` instance 屬性，跟現有期貨
+頁其他邏輯一樣沒有專屬測試覆蓋，屬於既有的測試缺口，不是這次新增的債）；
+也沒有實機真的觸發一次「抓取失敗」（網路瞬斷難以本地穩定重現）去目視確認
+警告文字實際顯示效果，只用程式碼審閱＋型別／流程確認過邏輯正確。
+
+---
+
+## 2026-09-23 個股「量價背離」與「籌碼動能」徽章
+
+**動機**：user 問「MFI 指數的盲點」，討論出 MFI／既有量價徽章（`_stock_trend_
+badges`）雖然放在「個股籌碼」分頁裡，其實只是純價量指標、不代表真正的三大
+法人／融資籌碼方向；而既有的趨勢／量能兩個徽章又刻意不互相參照，導致「量價
+背離」（價漲量縮、價跌量增）這個最有用的訊號從沒被標出來。接著討論個股籌碼
+資料（三大法人 120 日、融資融券 120 日）雖然都已經抓下來，卻只有原始折線圖
+＋最新一天快照，沒有任何動能/連續性判斷（只有族群層級的 `_institutional_
+sync_score` 有同步分數，個股層級沒有）。user 要求一起規劃並實作這兩項。
+
+**改法**：
+- **量價背離（Feature A）**：`_stock_trend_badges(technical)` 新增第 4 個
+  條件式標籤，用函式內本來就算好的 `diff_pct`（收盤 vs MA20）與
+  `volume_ratio`（今量 vs 均量20）交叉判斷——趨勢偏多（≥1%）且量能萎縮
+  （≤0.8x）→「量價背離：轉弱」（negative）；趨勢偏空（≤-1%）且量能放大
+  （≥1.2x）→「量價背離：留意止跌」（info，刻意不用 positive/negative，
+  因為可能是止跌訊號也可能是逃命賣壓，方向不明確）；其餘情況不附加標籤，
+  維持函式一貫「沒有明顯訊號就不下結論」的原則。沒有新增資料或網路呼叫，
+  兩個既有呼叫點（`StockDetailDialog`、「個股查詢」`stock_preview`）都自動
+  拿到這個新標籤。
+- **籌碼動能（Feature B）**：新增 `_chip_momentum_badges(institutional_
+  history, margin_history)`，三項指標：(1) 籌碼方向——沿用族群層級
+  `_institutional_sync_score` 同一套「三家各自取正負號加總」演算法，套用在
+  個股最新一天的外資／投信／自營商淨買賣超（股數），+3／-3 才算「同步」，
+  其餘算「分歧」，跟既有定義一致；(2) 籌碼動能——從最新一天往回數三大法人
+  合計淨額連續同號的天數，未達 3 天不顯示；(3) 融資動向——最新融資餘額 vs
+  10 個交易日前的變化率，未達 ±1% 不顯示，tone 用 info（融資增加可能是
+  追價也可能是加碼，方向不假設）。資料來自 `fetch_institutional_investors_
+  history(lookback_days=60)`／`fetch_margin_short_sale_history(lookback_
+  days=20)`，併入 `StockDetailDialog` 既有的 background fetch（跟
+  `fetch_valuation`／`fetch_institutional_investors` 同一個 thread），沒有
+  新增執行緒、沒有改變既有的「開視窗才查、不用等按鈕」的非同步時機。新增
+  `chip_row`（`StockDetailDialog.status_label` 下方），沒有資料（沒設定
+  FinMind token）時顯示空狀態文字，跟其餘籌碼 UI 的既有 degrade 方式一致。
+- **重構**：`_populate_trend_badge_row(layout, technical, empty_text)` 改成
+  `_populate_badge_row(layout, badges, empty_text)`——不再自己呼叫
+  `_stock_trend_badges` 計算，改成接受呼叫端已經算好的 badges 列表，讓
+  `_chip_momentum_badges` 的結果也能共用同一個 render helper，不用另外寫一份
+  幾乎一樣的 widget 填充邏輯。兩個既有呼叫點（`tradingnote_gui.py:768` 附近
+  的 `StockDetailDialog.__init__`、`_load_stock_trend_badges`）都已更新成
+  `_populate_badge_row(row, _stock_trend_badges(technical), empty_text=...)`
+  的呼叫形式。
+
+**驗證**：這個環境系統 `python3` 是 3.9.6，沒有 PySide6，也不支援專案用到的
+`X | None` 型別語法（`tradingnote_technical.py` 用了），改用
+`/opt/homebrew/bin/python3.12`（已裝好 PySide6 0.14／pyqtgraph）執行。新增
+`test_tradingnote_chip_badges.py`（13 項測試，涵蓋量價背離兩個方向＋無背離
+＋空資料、籌碼方向同步買/賣/分歧、連買連賣天數達標/未達標、融資餘額變化
+達標/未達標/資料不足），全部通過。跑 `python3.12 -m unittest discover -p
+"test_*.py"`：新增測試全過，其餘既有測試套件跟改動前（`git stash` 到乾淨
+`215f9a4`）比對，失敗項目完全一致（`test_tradingnote_flow_gui.
+test_full_window_six_pages_and_revision_refresh`、`test_tradingnote_
+journal_gui.test_responsive_density_and_larger_icons`），確認是這個環境本來
+就有、跟本次改動無關的既有失敗（前者是資料斷言錯誤，後者疑似字型/DPI
+環境差異造成的 flaky 測試，兩者都不在本次改動的檔案範圍內）。**未做**：
+這個環境沒有設定 FinMind token（`data/settings.json` 不存在），`chip_row`
+只驗證了空狀態文案跟純函式單元測試，沒有拿真實 FinMind 資料、也沒有實機
+開 GUI 目視確認排版與徽章換行/間距是否符合預期。
+
+---
+
 ## 2026-09-17（續4）反覆閃退根因追查與修復＋順便修掉的兩個小 bug
 
 **動機**：user 問「有剛剛的閃退紀錄嗎」。查了 `%LOCALAPPDATA%\CrashDumps`，

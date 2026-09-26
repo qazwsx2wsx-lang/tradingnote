@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 範本：把 __REPO__ 換成 tradingnote 的絕對路徑後複製到 ~/Library/LaunchAgents/，
+     再執行 launchctl load ~/Library/LaunchAgents/com.tradingnote.fetch-daily.plist
+     launchd 在電腦睡眠錯過時間時，會在喚醒後補跑一次（cron 不會）。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.tradingnote.fetch-daily</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3.12</string>
+    <string>__REPO__/scripts/fetch_daily.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>__REPO__</string>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
+  </array>
+  <key>StandardOutPath</key><string>__REPO__/data/fetch_daily.log</string>
+  <key>StandardErrorPath</key><string>__REPO__/data/fetch_daily.log</string>
+</dict>
+</plist>

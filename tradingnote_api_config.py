@@ -25,6 +25,10 @@ TWSE_MI_INDEX_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
 TWSE_INSTITUTIONAL_URL = (
     "https://www.twse.com.tw/rwd/zh/fund/T86?response=json&selectType=ALL"
 )
+# 同上，但可帶 date=YYYYMMDD 查歷史日（法人歷史回補用，見 tradingnote_institutional_history.py）
+TWSE_T86_HISTORY_URL = "https://www.twse.com.tw/rwd/zh/fund/T86"
+# 三大法人買賣金額統計（市場合計金額，含 ETF），帶 dayDate=YYYYMMDD
+TWSE_BFI82U_URL = "https://www.twse.com.tw/rwd/zh/fund/BFI82U"
 
 # ---- TPEx（櫃買中心）官方 OpenAPI／網頁端點，免金鑰 ----
 
@@ -36,6 +40,14 @@ TPEX_PERATIO_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_an
 TPEX_INDUSTRY_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
 # 三大法人買賣超，上櫃股票
 TPEX_INSTITUTIONAL_URL = "https://www.tpex.org.tw/openapi/v1/tpex_3insti_daily_trading"
+# 以下三個是櫃買新版網站（/www/zh-tw/）的 JSON 端點，跟 openapi 不同之處在於可帶
+# date=YYYY/MM/DD 查歷史日；非交易日回傳 stat=ok 但 tables[].data 為空。
+# 三大法人買賣明細（個股股數）
+TPEX_INSTI_DAILY_URL = "https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade"
+# 三大法人買賣金額彙總（市場合計金額，含 ETF）
+TPEX_INSTI_SUMMARY_URL = "https://www.tpex.org.tw/www/zh-tw/insti/summary"
+# 上櫃股票每日收盤行情（含權證、ETF）
+TPEX_DAILY_QUOTES_URL = "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes"
 # 產業價值鏈資訊平台首頁，refresh_concepts.py 爬概念股分類用
 TPEX_CHAIN_ROOT_URL = "https://ic.tpex.org.tw/"
 

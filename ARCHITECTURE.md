@@ -36,6 +36,7 @@
   tradingnote_core.py          部位模型／損益／TWSE-TPEX 即時查價／settings.json
   tradingnote_history.py       股票歷史 SQLite／產業分類／資金流向與估值計算／量比異常
   tradingnote_institutional.py 全市場三大法人買賣超（獨立於 history.py，只共用 http/cache）
+  tradingnote_institutional_history.py 三大法人逐日歷史＋類股指標預先計算（寫 daily_prices 只透過 history 的公開函式）
   tradingnote_flow.py          資金流向的期間模型＋儀表板結果＋分析服務（整合 history 的計算函式，加一層快取）
   tradingnote_technical.py     技術指標計算（純數學，吃 OHLCV list，不碰網路／DB）
   tradingnote_finmind.py       FinMind API（需 token；import tradingnote_core 的估值函式做上櫃 fallback）
@@ -47,6 +48,8 @@
 介面層（各自 import 上面所有需要的核心模組）
   tradingnote.py       CLI
   tradingnote_gui.py   GUI（唯一 import tradingnote_tasks.py 的地方）
+  scripts/*.py         排程／回補腳本（backfill、fetch_daily、recompute）
+  web/                 Next.js「法人資金流去哪？」：唯讀開啟 history.db，只查預先算好的表，不含任何計算
 ```
 
 **依賴方向規則**：核心模組之間可以互相 import（例如 `tradingnote_taifex.py` import `tradingnote_history.py` 的交易日曆函式），但**一個模組管理的 SQLite 表，讀寫函式要放在它自己的檔案裡**，不能讓別的模組把「自己表的 schema／CRUD」定義在別人的檔案裡再回頭 import——這條規則是這次審查修過的教訓：`large_traders_history`（期貨資料）原本連 schema 帶讀寫都定義在 `tradingnote_history.py`（股票歷史模組）裡，`tradingnote_taifex.py` 只是把函式 import 回來用，依賴方向是反的；已經搬正（見 `CHANGELOG.md` 2026-09-15）。
@@ -66,6 +69,7 @@
 - **`tradingnote_core.py`**：`Position`／`PriceInfo` 資料模型、`positions.json`／`settings.json` 讀寫、`get_market_snapshot()`（TWSE+TPEX 即時報價，走 `fetch_with_file_cache` 風格的 fallback，但因為有多階段 `on_progress` 需求所以沒有直接呼叫共用 helper，自己手刻一份）、`compute_pnl()`。
 - **`tradingnote_history.py`**（目前最大的核心模組，約1400行）：`data/history.db` 的股票歷史相關表格（`daily_prices`／`industry_map`／`valuation_history`）schema 與讀寫、TWSE 歷史回補、產業分類抓取與快取、資金流向與估值流向的百分位/加權中位數計算、個股量比異常偵測。**注意**：期貨的 `large_traders_history` 表**不在**這裡，在 `tradingnote_taifex.py`。
 - **`tradingnote_institutional.py`**：全市場三大法人買賣超（TWSE T86 + TPEx `tpex_3insti_daily_trading`），依族群聚合，供「法人方向」頁用；跟 `tradingnote_history.py` 是平行關係，不互相依賴。
+- **`tradingnote_institutional_history.py`**：可帶日期的 T86／BFI82U／櫃買新版 `/www/zh-tw/` 端點逐日回補（3 秒間隔、非交易日記錄在 `institutional_calendar`），把近 5／20 日、加速流入、連續買賣等跨日指標預先算進 `sector_metrics`／`stock_metrics`。**計算只在 Python 做**，`web/` 只查表——避免同一套指標在 Python 與 TypeScript 各寫一份。`aggregate_group_flow_for_dates()` 給 `tradingnote_flow.py` 用，流向區間每天都有歷史時「主力同步買超」改用區間加總。
 - **`tradingnote_flow.py`**：把 `tradingnote_history.py` 的多個計算函式（產業流向、估值流向、個股排行）包成一個 `FlowAnalysisService`，GUI 刷新時只建一次儀表板資料，同批查詢的多個子頁面共用同一份結果，避免同一次刷新重複計算。
 - **`tradingnote_technical.py`**：24 類技術指標的純函式計算（MA/EMA/KD/MACD/RSI/布林通道/OBV/VPT/MFI…），輸入是共用的 OHLCV bars，不觸網、不觸 DB，方便獨立測試（`test_tradingnote_technical.py`）。
 - **`tradingnote_finmind.py`**（約 700 行，第二大核心模組）：FinMind v4 API 的所有資料集查詢（本益比、三大法人、融資融券、外資持股、借券、技術指標用價格序列），統一走 `TTLCache` 做行程內快取，額度統計（`get_call_count`）供 GUI 判斷是否該提早停止批次回補。
@@ -96,6 +100,7 @@
 |---|---|---|
 | `daily_prices`／`industry_map`／`valuation_history` | 股票歷史價格／產業分類／估值歷史 | `tradingnote_history.py` |
 | `large_traders_history` | 期貨大額交易人未沖銷部位歷史 | `tradingnote_taifex.py` |
+| `daily_institutional`／`market_summary`／`institutional_calendar`／`sector_map`／`sector_metrics`／`stock_metrics` | 三大法人歷史、交易所公布金額、類股對照與預先計算指標 | `tradingnote_institutional_history.py` |
 | `journal_meta`／`journal_entries`／`portfolio_snapshots`／`portfolio_snapshot_positions` | 交易週誌與持股快照 | `tradingnote_journal.py` |
 
 **共用同一個實體檔案，但 schema／連線各自獨立**：每個擁有模組都有自己的 `_connect(db_path)`，各自用 `CREATE TABLE IF NOT EXISTS` 建自己的表，一律 `PRAGMA journal_mode=WAL` + `timeout=30`（多執行緒/多行程同時讀寫同一個檔案時，WAL 讓讀者不擋寫者、`timeout` 給排隊的寫入緩衝）。三個擁有模組彼此不 import 對方的 `_connect()`，只有需要跨模組查資料時才 import 對方暴露出來的讀寫函式（例如 `tradingnote_taifex.py` 會 import `tradingnote_history.py` 的交易日期輔助函式，但不會碰它的表）。
