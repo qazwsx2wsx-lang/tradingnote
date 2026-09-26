@@ -206,6 +206,47 @@ class ComputeMetricsTests(unittest.TestCase):
             self.db, {"甲乙": {"1111"}}, [self.dates[-1], "2026-09-13"]))
 
 
+    def test_readers(self):
+        self.assertEqual(ih.metric_dates(self.db)[0], self.dates[-1])
+        rows = ih.sector_rows(self.db, self.dates[-1], "all")
+        self.assertEqual([r["sector"] for r in rows], ["測試"])
+        history_points = ih.sector_history(self.db, "測試", "foreign", self.dates[-1], days=3)
+        self.assertEqual([d for d, _ in history_points], self.dates[-3:])
+        stocks = ih.sector_stocks(self.db, "測試", "all", self.dates[-1])
+        self.assertEqual([s["ticker"] for s in stocks], ["1111", "2222"])  # 2 億 > 0.5 億
+        self.assertEqual(stocks[0]["foreign_streak"], 6)
+        self.assertAlmostEqual(stocks[0]["close"], 100.0)
+
+
+class SummaryTextTests(unittest.TestCase):
+    def rows(self, **amounts):
+        return [{"sector": s, "day_amt": a} for s, a in amounts.items()]
+
+    def test_merges_same_action(self):
+        text = ih.summary_text({
+            "foreign": self.rows(半導體業=-300, 航運業=5),
+            "trust": self.rows(半導體業=-40),
+            "dealer": self.rows(航運業=3, 金融保險=-1),
+        })
+        self.assertEqual(text, "外資、投信大賣半導體業，自營商加碼航運業")
+
+    def test_small_moves_use_softer_verbs_and_quiet_day(self):
+        self.assertEqual(ih.summary_text({"trust": self.rows(航運業=-3)}), "投信調節航運業")
+        self.assertEqual(ih.summary_text({"foreign": self.rows(航運業=0.1)}),
+                         "三大法人今日類股進出不明顯")
+
+    def test_tu_yang_tag(self):
+        self.assertEqual(ih.tu_yang_tag(10, 2), "土洋同買")
+        self.assertEqual(ih.tu_yang_tag(-10, -2), "土洋同賣")
+        self.assertEqual(ih.tu_yang_tag(10, -2), "土洋對作")
+        self.assertIsNone(ih.tu_yang_tag(10, 0.01))
+
+    def test_streak_label(self):
+        self.assertEqual(ih.streak_label(4), "連買 4 天")
+        self.assertEqual(ih.streak_label(-2), "連賣 2 天")
+        self.assertEqual(ih.streak_label(0), "—")
+
+
 class BackfillSkipTests(unittest.TestCase):
     def test_non_trading_days_skipped_and_remembered(self):
         with tempfile.TemporaryDirectory() as tmp:

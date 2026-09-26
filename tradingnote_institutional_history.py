@@ -9,7 +9,7 @@
   market_summary       交易所公布的三大法人買賣金額（元，含 ETF），每個市場一列
   institutional_calendar 已確認的非交易日，避免每次回補都重打一次
   sector_map           類股成分股（industry_map＋sector_overrides.json 覆寫的結果）
-  sector_metrics       類股 × 法人 × 日期 的預先計算指標（web/ 直接讀這張表）
+  sector_metrics       類股 × 法人 × 日期 的預先計算指標（GUI「法人資金流去哪？」頁讀這張表）
   stock_metrics        個股 × 法人 × 日期 的當日金額、20 日累計、連續買賣天數
 
 價格來自 tradingnote_history 擁有的 daily_prices（只透過它公開的讀寫函式寫入）。
@@ -577,3 +577,119 @@ def aggregate_group_flow_for_dates(db_path, groups, dates):
                 date=dates[-1],
             ))
     return result
+
+
+# ---------- 讀取（給 ui/pages/institutional_flow_page.py；不含任何 Qt） ----------
+
+INVESTOR_LABELS = {"all": "合計", "foreign": "外資", "trust": "投信", "dealer": "自營商"}
+SECTOR_COLUMNS = ("sector", "day_amt", "sum5", "sum20", "accel", "streak", "change5_pct",
+                  "trading_value", "stock_count", "window_days")
+BIG_MOVE_YI = 20  # 盤後摘要：單一類股超過 20 億用「大買／大賣」
+
+
+def _rows(db_path, sql, params=()):
+    conn = _connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in conn.execute(sql, params)]
+    finally:
+        conn.close()
+
+
+def metric_dates(db_path):
+    """有預先計算指標的交易日，新到舊。"""
+    return [r["date"] for r in _rows(
+        db_path, "SELECT DISTINCT date FROM sector_metrics ORDER BY date DESC")]
+
+
+def sector_rows(db_path, date, investor):
+    """某日某法人全部類股指標，依當日買賣超由大到小。"""
+    return _rows(
+        db_path,
+        f"SELECT {', '.join(SECTOR_COLUMNS)} FROM sector_metrics "
+        "WHERE date = ? AND investor = ? ORDER BY day_amt DESC",
+        (date, investor),
+    )
+
+
+def market_amounts(db_path, date):
+    """交易所公布的三大法人買賣差額（億，上市＋上櫃，含 ETF）。"""
+    rows = _rows(db_path, "SELECT * FROM market_summary WHERE date = ?", (date,))
+    result = {inv: sum(r[f"{inv}_amt"] for r in rows) / AMOUNT_UNIT
+              for inv in ("foreign", "trust", "dealer")}
+    result["all"] = sum(result.values())
+    return result
+
+
+def sector_history(db_path, sector, investor, date, days=30):
+    """類股截至 date 最近 days 個交易日的每日買賣超 [(date, 億)]，舊到新。"""
+    rows = _rows(
+        db_path,
+        "SELECT date, day_amt FROM sector_metrics WHERE sector = ? AND investor = ? "
+        "AND date <= ? ORDER BY date DESC LIMIT ?",
+        (sector, investor, date, days),
+    )
+    return [(r["date"], r["day_amt"]) for r in reversed(rows)]
+
+
+def sector_stocks(db_path, sector, investor, date):
+    """成分股明細（收盤、漲跌、當日買超、外資連買、20 日累計），依當日買超排序。
+    daily_prices 屬於 tradingnote_history，這裡只讀取不寫入。"""
+    return _rows(
+        db_path,
+        """SELECT m.ticker, m.name, p.close, p.change_pct, s.day_amt, s.sum20,
+                  COALESCE(f.streak, 0) AS foreign_streak
+           FROM sector_map m
+           JOIN stock_metrics s ON s.ticker = m.ticker AND s.date = ? AND s.investor = ?
+           LEFT JOIN stock_metrics f
+                  ON f.ticker = m.ticker AND f.date = s.date AND f.investor = 'foreign'
+           LEFT JOIN daily_prices p ON p.ticker = m.ticker AND p.date = s.date
+           WHERE m.sector = ?
+           ORDER BY s.day_amt DESC""",
+        (date, investor, sector),
+    )
+
+
+def summary_text(rows_by_investor):
+    """依各法人當日買賣超絕對值最大的類股組一句摘要；同動作同類股合併，例如
+    「外資、投信大賣半導體業，自營商加碼航運業」。rows_by_investor：{investor: sector_rows}。"""
+    groups = {}
+    for inv in ("foreign", "trust", "dealer"):
+        rows = rows_by_investor.get(inv) or []
+        if not rows:
+            continue
+        top = max(rows, key=lambda r: abs(r["day_amt"]))
+        amount = top["day_amt"]
+        if abs(amount) < 0.5:
+            continue
+        if amount >= BIG_MOVE_YI:
+            verb = "大買"
+        elif amount > 0:
+            verb = "加碼"
+        elif amount <= -BIG_MOVE_YI:
+            verb = "大賣"
+        else:
+            verb = "調節"
+        groups.setdefault(f"{verb}{top['sector']}", []).append(INVESTOR_LABELS[inv])
+    if not groups:
+        return "三大法人今日類股進出不明顯"
+    return "，".join(f"{'、'.join(who)}{action}" for action, who in groups.items())
+
+
+def tu_yang_tag(foreign, trust, threshold=0.05):
+    """外資（洋）與投信（土）同一期間的方向：同買／同賣／對作；任一方幾乎沒動回傳 None。"""
+    if abs(foreign) < threshold or abs(trust) < threshold:
+        return None
+    if foreign > 0 and trust > 0:
+        return "土洋同買"
+    if foreign < 0 and trust < 0:
+        return "土洋同賣"
+    return "土洋對作"
+
+
+def streak_label(n):
+    if n > 0:
+        return f"連買 {n} 天"
+    if n < 0:
+        return f"連賣 {-n} 天"
+    return "—"

@@ -31,7 +31,7 @@ class FlowGuiTests(unittest.TestCase):
             window = gui.TradingNoteWindow(self.snapshot, None)
             try:
                 window.show()
-                self.assertEqual(window.page_stack.count(), 6)
+                self.assertEqual(window.page_stack.count(), 7)
                 for index in range(6):
                     window._set_main_page(index)
                     app.processEvents()

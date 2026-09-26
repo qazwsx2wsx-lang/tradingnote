@@ -6,12 +6,13 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 
 ---
 
-## 2026-09-26 「法人資金流去哪？」網頁＋三大法人逐日歷史
+## 2026-09-26 「法人資金流去哪？」GUI 頁＋三大法人逐日歷史
 
-**動機**：user 要做一個仿 CMoney 主力動向頁的網頁（Next.js），每天盤後看三大法人在各類股的買賣超。
+**動機**：user 要一個仿 CMoney 主力動向頁的功能，每天盤後看三大法人在各類股的買賣超。
 先盤點既有程式碼：T86／TPEx 法人抓取、股數×收盤價的族群聚合、`industry_map`、上市 402 天
 `daily_prices` 都已經有了，缺的是「法人歷史」（STATUS.md 原本就列為已知缺口：主力同步買超只有
-最新一筆）。決定：**Python 核心負責抓資料＋計算，Next.js 只唯讀顯示**，不另寫一套 TS 爬蟲。
+最新一筆）。一開始依原始規格做成獨立的 Next.js `web/`（只唯讀 history.db），user 看完指出
+「這個功能要整合進 tradingnote」，改成 GUI 頁、移除 `web/`（連同 Node 依賴）。
 
 **端點實測（2026-09-24 資料）**：
 - T86 `rwd/zh/fund/T86?date=YYYYMMDD` 可查歷史；非交易日 `stat` 為「很抱歉，沒有符合條件的資料!」。
@@ -23,25 +24,30 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 **改法**：
 - 新 `tradingnote_institutional_history.py`：6 張自有表、解析／回補（3 秒間隔、非交易日記在
   `institutional_calendar`、某市場資料不齊就整天不寫）、純函式指標（加速流入、連續買賣、5/20 日
-  累計、等權 5 日漲跌），全部預先算進 `sector_metrics`／`stock_metrics`。
+  累計、等權 5 日漲跌）預先算進 `sector_metrics`／`stock_metrics`；讀取函式與盤後摘要句
+  （`summary_text`）、土洋判斷（`tu_yang_tag`）也在這裡，GUI 不做計算。
+- 新 `ui/pages/institutional_flow_page.py`（`ui/pages/` 第一個頁面，沒有再往 5400 行的
+  `tradingnote_gui.py` 裡塞）：左側導覽第 2 頁，沿用 SectionCard／StatCard／InsightCard／
+  SignalBadge 與 `flowSectionButton` 分類按鈕慣例；`tradingnote_gui.py` 只加 import 與
+  `_page_specs` 一列。
 - `tradingnote_history.fetch_tpex_historical_day()`：上櫃歷史收盤改走櫃買 dailyQuotes，不再只能靠
   FinMind 額度；寫入仍走 `upsert_daily_prices`。
 - `tradingnote_flow.FlowAnalysisService`：流向區間每天都有法人歷史時，「主力同步買超」改用區間加總，
   否則退回原本的最新快照。
-- `scripts/`（backfill／fetch_daily／recompute／launchd 範本）、`sector_overrides.json`、`web/`
-  （4 支 API＋8 個頁面區塊，說明見 `web/README.md`）。
+- `scripts/`（backfill／fetch_daily／recompute／launchd 範本＋README）、`sector_overrides.json`。
 
 **驗證**：
-- `test_tradingnote_institutional_history.py` 27 項全過（加速流入、連續天數、窗口、解析器、類股覆寫、
-  端到端 compute_metrics、區間聚合、回補跳過假日）。既有 flow／technical／journal／tasks／
-  chip_badges／stock_charts 測試通過；`test_tradingnote_flow_gui` 1 個失敗在 HEAD 版核心模組上
-  同樣失敗，不是這次造成的。
-- 回補後 2026-09-23 全部 18,134 檔個股股數跟既有 `institutional_cache.json`（openapi 快照）逐檔
-  一致；9/18 類股外資加總 +1,049 億 vs 交易所公布 +1,085 億（差額為 ETF）。
-- 瀏覽器實測：8 個區塊都有畫出、熱力圖排序、日期切換、點列／點泡泡開側欄、Esc 關閉、390px 寬
-  無水平捲動、深色模式。
-- **未做**：瀏覽器面板在隱藏狀態，ECharts 動畫偶爾截圖不到完整畫面，泡泡圖 Ctrl＋滾輪縮放沒有實測；
-  launchd 排程只提供範本，沒有實際載入；GUI 端「主力同步買超」用區間加總的效果沒有實機開 GUI 看。
+- `test_tradingnote_institutional_history.py` 32 項全過（加速流入、連續天數、窗口、解析器、類股覆寫、
+  端到端 compute_metrics、讀取函式、摘要句、土洋判斷、區間聚合、回補跳過假日）。
+- 回補 60 個交易日（2026-07-02～09-24，7/10、9/25 正確判定為休市）。9/23 全部 18,134 檔個股股數
+  跟既有 `institutional_cache.json`（openapi 快照）逐檔一致；9/18 類股外資加總 +1,049 億 vs
+  交易所公布 +1,085 億（差額為 ETF）。
+- GUI 頁用 offscreen 腳本以真實 history.db 建立、切換四個分類與法人、開類股明細，逐張截圖目視：
+  泡泡標籤重疊（改成只標最突出且不互相重疊的 6 個）、累計線被柱子蓋住（右軸 ViewBox 提高 Z）
+  兩個問題已修；熱力圖依數值排序（非字串）已驗證。
+- **未做**：沒有實機開完整 `tradingnote_gui.py` 用滑鼠操作；`test_tradingnote_flow_gui` 頁數斷言已從
+  6 改 7，但該測試在 HEAD 版本就有另一個既存失敗（`flow_list` 為空），不是這次造成；launchd 排程
+  只提供範本沒有實際載入。
 
 ---
 

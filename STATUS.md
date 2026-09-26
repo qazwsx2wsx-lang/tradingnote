@@ -2,14 +2,15 @@
 
 ## 必讀簡介（2026-09-26）
 - 工作目錄**有未 commit 的改動**；HEAD 本身是乾淨的 `215f9a4`。
-- **Claude（2026-09-26，「法人資金流去哪？」網頁＋三大法人歷史）**：
-  新增 `tradingnote_institutional_history.py`（6 張自有表）、`scripts/`
-  （backfill／fetch_daily／recompute／launchd 範本）、`sector_overrides.json`、
-  `web/`（Next.js 唯讀顯示層）、`test_tradingnote_institutional_history.py`；
+- **Claude（2026-09-26，「法人資金流去哪？」GUI 頁＋三大法人歷史）**：
+  新增 `tradingnote_institutional_history.py`（6 張自有表＋讀取函式）、
+  `ui/pages/institutional_flow_page.py`（左側導覽第 2 頁）、`scripts/`
+  （backfill／fetch_daily／recompute／launchd 範本，說明見 `scripts/README.md`）、
+  `sector_overrides.json`、`test_tradingnote_institutional_history.py`；
   改 `tradingnote_history.py`（新增 `fetch_tpex_historical_day`，上櫃歷史收盤
   不必再靠 FinMind）、`tradingnote_flow.py`（「主力同步買超」區間有歷史時用
-  區間加總）、`tradingnote_api_config.py`。用法見 `web/README.md`，細節見
-  `CHANGELOG.md` 2026-09-26。`test_tradingnote_flow_gui` 的 1 個失敗在 HEAD
+  區間加總）、`tradingnote_api_config.py`。原本的 Next.js `web/` 已移除（user
+  要求整合進 GUI）。細節見 `CHANGELOG.md` 2026-09-26。`test_tradingnote_flow_gui` 的 1 個失敗在 HEAD
   版核心模組上同樣失敗，不是這次造成的。
 - **Claude（2026-09-23，個股籌碼動能徽章＋量價背離判斷）**：
   `tradingnote_gui.py`（改）、`test_tradingnote_chip_badges.py`（新）。
@@ -55,10 +56,9 @@ tradingnote/
 ├── tradingnote_history.py      # 核心：股票歷史 SQLite、產業分類、產業資金流向分析、個股量比異常清單
 ├── tradingnote_flow.py         # 核心：資金流向期間模型、儀表板結果集合、統一分析服務與快取
 ├── tradingnote_institutional.py # 核心：TWSE/TPEx 全市場三大法人買賣超與族群聚合（「法人方向」用）
-├── tradingnote_institutional_history.py # 核心：三大法人逐日歷史回補＋類股指標預先計算（web/ 與「主力同步買超」用）
+├── tradingnote_institutional_history.py # 核心：三大法人逐日歷史回補＋類股指標預先計算（「法人資金流去哪？」頁與「主力同步買超」用）
 ├── sector_overrides.json        # 「法人資金流去哪？」類股覆寫（人工維護）
 ├── scripts/                     # backfill.py／fetch_daily.py／recompute.py／launchd 範本
-├── web/                         # Next.js「法人資金流去哪？」網頁（唯讀 history.db），說明見 web/README.md
 ├── tradingnote_technical.py    # 核心：由共用 OHLCV 計算 24 類技術指標（MA/EMA/KD/MACD/RSI/...）
 ├── tradingnote_journal.py      # 核心：交易週誌與持股週曆（2026-09-10 新增）
 ├── tradingnote_finmind.py      # 核心：FinMind API（本益比/殖利率/三大法人/融資融券等），僅 GUI 使用
@@ -75,6 +75,7 @@ tradingnote/
 ├── tradingnote.py               # CLI（無「個股」「期貨」模組對應指令）
 ├── tradingnote_gui.py           # GUI：PySide6 + pyqtgraph，左側導覽列＋頁面堆疊（正在拆分，見下方「GUI Design System 重構」）
 ├── ui/                           # GUI design system + reusable components（2026-09-15 新增，進行中）
+│   ├── pages/institutional_flow_page.py # 「法人資金流去哪？」頁（2026-09-26）
 │   ├── theme.py                 # 顏色／字型／全域 QSS token（含 dark mode、TONE_COLORS）
 │   ├── format.py                # gain_loss_color() 等顯示用格式化 helper
 │   └── components/
@@ -90,13 +91,14 @@ tradingnote/
     └── history.db                # SQLite：股票歷史價格／產業分類／估值／週誌快照 + 期貨大額交易人歷史
 ```
 
-## GUI 現況：六個分頁（左側導覽列，2026-09-14 由上方分頁改版）
+## GUI 現況：七個分頁（左側導覽列，2026-09-14 由上方分頁改版）
 1. **資金流向分析**（預設頁）：pyqtgraph 泡泡圖，2026-09-16 改版——**泡泡填色＝所屬分類**（`_category_color()`，依名稱雜湊決定色相，同一分類永遠同一顏色，跟下方清單「分類」欄的色塊 icon 對照一致）、**外框顏色＝方向**（原本整顆泡泡只有紅/綠/灰三色代表當日量價方向，現在改成外框加粗表達，填色跟方向分開兩個視覺通道）。`ScatterPlotItem` 加 `antialias=False`（只針對這個 widget，不動全域抗鋸齒設定）修正 hover 時的卡頓。可觸控板/滾輪縮放平移，點擊泡泡看該產業前十大成分股；工具列「泡泡圖模式」三選一：「動能」（X＝N日累積漲跌%、Y＝量比）／「估值」（X＝最新一筆 PER/PBR 加權中位數、Y＝近5日均額÷近20日均額）／**「主力同步買超」**（新增，X＝三大法人方向一致性分數 -3～+3、Y＝三大法人合計買賣超金額億元，外框依一致性分數而非當日漲跌決定；資料僅反映最新一筆三大法人快照，不受「流向區間」影響，見下方已知缺口）。三種模式都有四象限淡色底與 hover 解讀。下方按分類切換：資金動向清單（「分類」欄已加色塊 icon）、產業熱度排行、個股資金流入前50、個股量比異常清單。另有「法人方向」子頁：從 TWSE T86、TPEx `tpex_3insti_daily_trading` 取得全市場真實淨買賣股數，依族群聚合後以三張左右發散圖顯示外資／投信／自營商（真實買賣超，淨額為股數×收盤價估算，跟新的「主力同步買超」泡泡模式共用同一份 `dashboard.institutional_flow`）。日期選擇一律用日曆式起始日期選擇器，沒有歷史資料的日期反白不能選，結束日固定今天／最新資料。
-2. **部位紀錄**：`QTableWidget`（含族群／概念股欄位），新增/刪除/查價/重新整理；下方詳細資訊區塊選取部位時背景查 FinMind，跟「個股」頁 `StockDetailDialog` 共用同一套 8 張趨勢圖（歷史股價／三大法人／法人分別／融資融券／VPT／MFI／借券賣出餘額／借券成交）。概念股清單來自 `concepts.json`（人工維護，見 `tradingnote_concepts.py`）。
-3. **交易週誌**（2026-09-10 新增）：週一至週日七張卡片顯示持股合計金額變化、絕對變動最大前三檔與日誌摘要；選取日期可看全部持股並編輯自由文字日誌；前/後週、本週、日期跳轉、Ctrl+S、切換日期與關閉程式時自動保存；未來日期不可編輯。
-4. **個股**：`QTreeWidget` 依產業族群列出全市場約1700檔股票，選取項目即時顯示右側摘要卡（含趨勢/動能/量能徽章），雙擊叫 FinMind API 查本益比/殖利率/股價淨值比/三大法人（`StockDetailDialog`，同樣有趨勢徽章）。彈窗「顯示完整籌碼面資訊」按鈕點下去才查跟部位紀錄頁相同的詳細資料＋分頁（歷史股價／三大法人／法人分別／融資融券／VPT／MFI／借券賣出餘額／借券成交／技術分析，共 8 張圖），技術分析可切換 KD／MACD／均線／RSI 等 24 類指標（純本地 SQLite 計算，不額外呼叫 API）。
-5. **期貨**：預設列出 TAIFEX 全部期貨商品盤後行情，搜尋框輸入才篩選。「標的」欄對照股票期貨標的、大額前10買/賣/淨/買佔比摘要欄；點選某列看完整大額未沖銷部位明細＋趨勢圖，雙擊開大彈窗。大額歷史由背景自動回補（綁定「設定」頁回補天數）。細節較多，見 `CHANGELOG.md` 2026-08-14 那幾則。
-6. **設定**：自動檢測開關、回補天數（TWSE／TPEX／期貨大額交易人歷史共用）、回補按鈕。**沒有 FinMind API Token 輸入欄**（見下方「已知缺口」）。
+2. **法人資金流去哪？**（2026-09-26 新增，`ui/pages/institutional_flow_page.py`）：讀 `tradingnote_institutional_history` 預先算好的表。上方盤後結論（一句摘要＋外資／投信／自營商／合計四張 StatCard，金額採交易所公布值）；下方四個分類按鈕切換：法人資金流向泡泡圖（X＝近 5 日、Y＝加速流入、大小可切成交金額／近 20 日絕對值，可展開「過去 30 天」）、今日法人買賣榜、近 5 日土洋操作、可排序熱力圖；右側「法人」切換合計／外資／投信／自營。點泡泡或熱力圖列開 `SectorDetailDialog`（30 日柱狀＋累計線、成分股表）。資料日期下拉只列有資料的交易日；「更新法人資料」背景跑 `ih.backfill()`。
+3. **部位紀錄**：`QTableWidget`（含族群／概念股欄位），新增/刪除/查價/重新整理；下方詳細資訊區塊選取部位時背景查 FinMind，跟「個股」頁 `StockDetailDialog` 共用同一套 8 張趨勢圖（歷史股價／三大法人／法人分別／融資融券／VPT／MFI／借券賣出餘額／借券成交）。概念股清單來自 `concepts.json`（人工維護，見 `tradingnote_concepts.py`）。
+4. **交易週誌**（2026-09-10 新增）：週一至週日七張卡片顯示持股合計金額變化、絕對變動最大前三檔與日誌摘要；選取日期可看全部持股並編輯自由文字日誌；前/後週、本週、日期跳轉、Ctrl+S、切換日期與關閉程式時自動保存；未來日期不可編輯。
+5. **個股**：`QTreeWidget` 依產業族群列出全市場約1700檔股票，選取項目即時顯示右側摘要卡（含趨勢/動能/量能徽章），雙擊叫 FinMind API 查本益比/殖利率/股價淨值比/三大法人（`StockDetailDialog`，同樣有趨勢徽章）。彈窗「顯示完整籌碼面資訊」按鈕點下去才查跟部位紀錄頁相同的詳細資料＋分頁（歷史股價／三大法人／法人分別／融資融券／VPT／MFI／借券賣出餘額／借券成交／技術分析，共 8 張圖），技術分析可切換 KD／MACD／均線／RSI 等 24 類指標（純本地 SQLite 計算，不額外呼叫 API）。
+6. **期貨**：預設列出 TAIFEX 全部期貨商品盤後行情，搜尋框輸入才篩選。「標的」欄對照股票期貨標的、大額前10買/賣/淨/買佔比摘要欄；點選某列看完整大額未沖銷部位明細＋趨勢圖，雙擊開大彈窗。大額歷史由背景自動回補（綁定「設定」頁回補天數）。細節較多，見 `CHANGELOG.md` 2026-08-14 那幾則。
+7. **設定**：自動檢測開關、回補天數（TWSE／TPEX／期貨大額交易人歷史共用）、回補按鈕。**沒有 FinMind API Token 輸入欄**（見下方「已知缺口」）。
 
 ## 已知缺口
 - **「設定」頁沒有 FinMind API Token 輸入欄**：`finmind_token` 只能手動編輯 `data/settings.json`，且 GUI 裡有處提示文字會叫使用者「請先在『設定』分頁填入 FinMind API Token」——這個欄位不存在，會誤導使用者。
