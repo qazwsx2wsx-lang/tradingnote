@@ -14,6 +14,16 @@ class StockChartTests(unittest.TestCase):
         cls.app.setFont(QtGui.QFont("Microsoft JhengHei", 10))
         cls.app.setStyleSheet(STYLESHEET)
 
+    @classmethod
+    def tearDownClass(cls):
+        # QApplication 是整個測試 process 共用的單例，setFont／setStyleSheet
+        # 不重設的話會漏到後面才跑的其他測試檔（例如 test_tradingnote_journal_gui
+        # 的視窗在有這份 STYLESHEET 時，QPushButton 的 padding/min-height 會讓
+        # journal_cards 的 setFixedHeight() 在版面空間不足時被壓縮到遠小於
+        # 132/164，跟這裡的圖表測試完全無關卻被牽連而失敗）。
+        cls.app.setStyleSheet("")
+        cls.app.setFont(QtGui.QFont())
+
     def test_date_alignment_missing_values_and_axis_switch(self):
         price, margin = StockChart(), StockChart()
         gui._populate_price_chart(price, [dict(date="2026-09-10", close=100), dict(date="2026-09-14", close=110)])
@@ -149,6 +159,14 @@ class DetailChartPanelTests(unittest.TestCase):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         cls.app.setFont(QtGui.QFont("Microsoft JhengHei", 10))
         cls.app.setStyleSheet(STYLESHEET)
+
+    @classmethod
+    def tearDownClass(cls):
+        # 理由同 StockChartTests.tearDownClass：QApplication 是整個測試
+        # process 共用的單例，這裡的 setStyleSheet／setFont 不還原會漏到
+        # 之後才跑的其他測試檔。
+        cls.app.setStyleSheet("")
+        cls.app.setFont(QtGui.QFont())
 
     @staticmethod
     def _sample_data(dates):

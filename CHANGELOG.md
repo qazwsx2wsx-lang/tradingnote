@@ -6,6 +6,36 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 
 ---
 
+## 2026-09-28 修 Windows tzdata 依賴缺漏＋測試跨檔污染（journal_gui 卡片高度）
+
+**動機**：pull 完 9/26 的法人歷史功能後在 Windows 上跑測試套件，`tradingnote_institutional_history.py`
+模組層級的 `ZoneInfo("Asia/Taipei")` 直接 `ModuleNotFoundError: No module named 'tzdata'`——Windows
+沒有內建 IANA 時區資料庫（macOS/Linux 通常有系統時區資料庫，所以先前開發時沒發現），擋掉約 6 個測試檔
+的 import。
+
+**改法**：
+- `.venv` 裝 `tzdata`，`requirements.txt` 加一行 `tzdata; sys_platform == "win32"`（只在 Windows 裝，
+  其他平台裝了也無害但沒必要）。
+- 修完後重跑全套 `discover`，剩 `test_tradingnote_journal_gui` 一個新失敗
+  （`journal_cards[0].height()` 92≠132）；單獨跑這個檔沒事，只有 `test_stock_charts.py` 跑在它之前
+  時才發生。追查發現 `test_stock_charts.py` 的 `StockChartTests`/`DetailChartPanelTests.setUpClass()`
+  對整個 test process 共用的 `QApplication` 呼叫 `setStyleSheet(STYLESHEET)`/`setFont(...)`，沒有對應
+  `tearDownClass()` 還原——QSS 的 `QPushButton{padding:...; min-height:...}` 讓 journal 分頁整體內容
+  高度超過測試視窗（760×600），Qt layout 過度擁擠時連 `setFixedHeight()` 鎖定的 widget 都會被壓縮到
+  小於指定值。寫了一次性重現腳本（未保留）確認：套用該 stylesheet 後即使視窗給到 1200×700，卡片高度
+  也從預期的 164 掉到 59；不套用則精準等於 164/132。
+- 修法：`StockChartTests`/`DetailChartPanelTests` 各加 `tearDownClass()`，還原
+  `setStyleSheet("")`/`setFont(QtGui.QFont())`，讓後面才跑的測試檔看到乾淨的共用 `QApplication`。
+
+**驗證**：`test_stock_charts test_tradingnote_journal_gui` 單獨跑、以及完整 `discover`（77 題）都
+確認只剩 1 個既有失敗（`test_tradingnote_flow_gui`，在 pull 前的 `215f9a4` 就已經用不同錯誤訊息
+失敗，跟這兩批改動都無關，未修——超出本次範圍）。
+
+**未做**：`test_tradingnote_flow_gui` 那個既有失敗沒有一併修；沒有順手清掉 `test_stock_charts.py`
+以外其他測試檔可能存在的類似共用狀態污染（沒有逐一排查每個測試檔是否也修改了 process 全域狀態）。
+
+---
+
 ## 2026-09-26 「法人資金流去哪？」GUI 頁＋三大法人逐日歷史
 
 **動機**：user 要一個仿 CMoney 主力動向頁的功能，每天盤後看三大法人在各類股的買賣超。

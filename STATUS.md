@@ -1,7 +1,18 @@
 # tradingnote 現況（STATUS.md）
 
-## 必讀簡介（2026-09-26）
-- 工作目錄**有未 commit 的改動**；HEAD 本身是乾淨的 `215f9a4`。
+## 必讀簡介（2026-09-28）
+- 工作目錄乾淨。HEAD 已經包含 9/26「法人資金流去哪？」（`96b655a`）＋本次 tzdata／測試隔離修正。
+- **Claude（2026-09-28，Windows tzdata 依賴缺漏＋測試跨檔污染）**：
+  `.venv` 補裝 `tzdata`（`requirements.txt` 新增 `tzdata; sys_platform == "win32"`）——
+  Windows 沒有內建 IANA 時區資料庫，`tradingnote_institutional_history.py` 模組層級的
+  `ZoneInfo("Asia/Taipei")` 原本直接 `ModuleNotFoundError`，擋掉一大批測試檔的 import。
+  另外修了 `test_stock_charts.py` 對共用 `QApplication` 的 `setStyleSheet`/`setFont` 沒有
+  `tearDownClass()` 還原，導致跑在它之後的 `test_tradingnote_journal_gui` 被牽連失敗（卡片
+  高度 92≠132）的測試隔離 bug。**注意**：`tradingnote_institutional_history.py` 的 6 張自有表
+  （`daily_institutional`／`market_summary`／`institutional_calendar`／`sector_map`／
+  `sector_metrics`／`stock_metrics`）目前這台機器的 `data/history.db` 裡一張都還不存在——
+  要跑過 `scripts/backfill.py` 或頁面內「更新法人資料」才會建立並有資料，不然「法人資金流去哪？」
+  分頁打開會是空的。詳見 `CHANGELOG.md` 2026-09-28。
 - **Claude（2026-09-26，「法人資金流去哪？」GUI 頁＋三大法人歷史）**：
   新增 `tradingnote_institutional_history.py`（6 張自有表＋讀取函式）、
   `ui/pages/institutional_flow_page.py`（左側導覽第 2 頁）、`scripts/`
