@@ -18,11 +18,15 @@
   `ZoneInfo("Asia/Taipei")` 原本直接 `ModuleNotFoundError`，擋掉一大批測試檔的 import。
   另外修了 `test_stock_charts.py` 對共用 `QApplication` 的 `setStyleSheet`/`setFont` 沒有
   `tearDownClass()` 還原，導致跑在它之後的 `test_tradingnote_journal_gui` 被牽連失敗（卡片
-  高度 92≠132）的測試隔離 bug。**注意**：`tradingnote_institutional_history.py` 的 6 張自有表
-  （`daily_institutional`／`market_summary`／`institutional_calendar`／`sector_map`／
-  `sector_metrics`／`stock_metrics`）目前這台機器的 `data/history.db` 裡一張都還不存在——
-  要跑過 `scripts/backfill.py` 或頁面內「更新法人資料」才會建立並有資料，不然「法人資金流去哪？」
-  分頁打開會是空的。詳見 `CHANGELOG.md` 2026-09-28。
+  高度 92≠132）的測試隔離 bug。詳見 `CHANGELOG.md` 2026-09-28。
+  另外跑了 `scripts/backfill.py`（預設 60 個交易日）建立 `tradingnote_institutional_history.py`
+  的 6 張自有表——**只成功回補 34 天（2026-08-06～2026-09-24）**，更早的日期（2026-08-05 以前，
+  一路到請求範圍的 2026-06-10）全部收到 HTTP 307／308 redirect 錯誤（`data/backfill_run.log`），
+  疑似 TWSE／TPEx 端點在同一個 session 打太多次歷史資料請求後觸發某種節流／導頁機制，不是「當天
+  沒有資料」的正常情況（正常無資料是回傳 `stat` 訊息，不是 redirect）。**沒有進一步查是哪個端點、
+  要多久才解除**；「法人資金流去哪？」頁目前資料只涵蓋這 34 天，近 20 日指標在資料範圍前段的幾天會
+  因為往回不夠 20 個交易日而算不出來。之後重跑 `scripts/backfill.py` 會跳過已完成的 34 天，只
+  補缺口，可以視節流是否解除決定要不要再試。
 - **Claude（2026-09-26，「法人資金流去哪？」GUI 頁＋三大法人歷史）**：
   新增 `tradingnote_institutional_history.py`（6 張自有表＋讀取函式）、
   `ui/pages/institutional_flow_page.py`（左側導覽第 2 頁）、`scripts/`
@@ -143,6 +147,7 @@ tradingnote/
 - 只有 EOD（收盤）/ 盤後資料，非即時報價——刻意選擇，見 `CHANGELOG.md`。
 - 一批「已驗證邏輯，但未實機開 GUI 目視驗證」的歷史紀錄散落在 `CHANGELOG.md` 各條目裡（EPS 欄位、視窗放大鈕、泡泡圖近N日修正等），是驗證債務，不是功能缺口，需要時去 `CHANGELOG.md` 逐條找。
 - **`gc.disable()` 是根據兩次實機重現的證據（都停在「Garbage-collecting」）做出的緩解措施，不是 100% 證實的根因**：如果之後還是遇到閃退（`PYTHONFAULTHANDLER=1` 執行 `tradingnote_gui.py` 可以重現堆疊），代表還有別的觸發路徑，需要繼續查；見 `CHANGELOG.md` 2026-09-17（續4）。
+- **「法人資金流去哪？」目前只有 2026-08-06～2026-09-24（34 個交易日）的資料**：`scripts/backfill.py` 跑 60 天目標時，更早的日期全部收到 HTTP 307/308 redirect（見上方必讀簡介、`data/backfill_run.log`），推測是 TWSE／TPEx 端點的節流機制，沒有進一步查是哪個端點、要多久解除；之後重跑會自動跳過已完成的 34 天、只補缺口。
 
 ## GUI Design System 重構（進行中，2026-09-15 啟動）
 user 提出完整規格：把 `tradingnote_gui.py` 拆成 `ui/theme.py`＋`ui/components/`＋`ui/pages/`＋`ui/widgets/`，建立 StatCard／SectionCard／SignalBadge／InsightCard／StockHeader 等 reusable component，最終讓首頁變成 progressive-disclosure 的現代分析 dashboard。明確要求**不要一次全部重寫**，小步進行，每輪都要確認 GUI 仍可啟動、既有功能不變。
