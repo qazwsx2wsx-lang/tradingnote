@@ -10,6 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6 import QtWidgets
 
 import tradingnote_gui as gui
+from ui import app_paths
 from tradingnote_core import Position
 from tradingnote_journal import initialize_journal, load_week
 
@@ -36,8 +37,8 @@ class JournalGuiTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp_dir.name) / "history.db"
-        self.original_db_path = gui.HISTORY_DB_PATH
-        gui.HISTORY_DB_PATH = self.db_path
+        self.original_db_path = app_paths.HISTORY_DB_PATH
+        app_paths.HISTORY_DB_PATH = self.db_path
         today = date.today()
         previous = today - timedelta(days=1)
         conn = sqlite3.connect(self.db_path)
@@ -75,7 +76,7 @@ class JournalGuiTests(unittest.TestCase):
         self.window.close()
         self.window.deleteLater()
         self.app.processEvents()
-        gui.HISTORY_DB_PATH = self.original_db_path
+        app_paths.HISTORY_DB_PATH = self.original_db_path
         self.temp_dir.cleanup()
 
     def test_week_cards_details_and_auto_save(self):

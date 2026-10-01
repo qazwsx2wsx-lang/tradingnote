@@ -5,8 +5,7 @@ import gc
 import hashlib
 import html
 import statistics
-from collections import Counter
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
 import pyqtgraph as pg
 from ui.stock_charts import (
@@ -18,8 +17,6 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from tradingnote_core import (
     add_position,
     compute_pnl,
-    fetch_tpex_valuation_all,
-    fetch_twse_valuation_all,
     find_position,
     get_market_snapshot,
     load_positions,
@@ -35,23 +32,17 @@ from tradingnote_history import (
     DEFAULT_BACKFILL_TARGET_DAYS,
     VOLUME_RATIO_TIERS,
     _change_pct,
-    backfill_twse_history,
     compute_industry_flow,
     compute_valuation_flow,
-    default_start_date_for_days,
     get_available_dates,
     get_history_status,
     get_industry_directory,
     get_industry_map,
     get_latest_ticker_record,
-    record_snapshot,
     get_data_revision,
-    record_valuation_snapshot,
-    trading_days_between,
 )
 from tradingnote_finmind import (
     FINMIND_HOURLY_LIMIT,
-    backfill_tpex_history_via_finmind,
     fetch_institutional_investors,
     fetch_institutional_investors_history,
     fetch_margin_short_sale_history,
@@ -71,7 +62,6 @@ from tradingnote_concepts import (
 )
 from tradingnote_taifex import (
     DEFAULT_FUTURES_PRODUCTS,
-    LARGE_TRADERS_ALL_CONTRACTS_MONTH,
     LARGE_TRADERS_HISTORY_ALL_CONTRACTS_MONTH,
     backfill_large_traders_history,
     build_large_traders_name_map,
@@ -86,9 +76,7 @@ from tradingnote_taifex import (
     list_all_products,
 )
 from tradingnote_flow import FlowAnalysisService, FlowPeriod
-from tradingnote_institutional import get_cached_institutional_snapshot
 from tradingnote_http import PriceFetchError
-from tradingnote_paths import APP_PATHS
 from tradingnote_cache import TTLCache
 from tradingnote_tasks import run_background_task, wait_for_background_tasks
 from tradingnote_technical import load_local_technical, calculate_indicators
@@ -98,17 +86,6 @@ from tradingnote_journal import (
     save_journal_entry,
     save_portfolio_snapshot,
 )
-
-DATA_DIR = APP_PATHS.data_dir
-POSITIONS_PATH = APP_PATHS.positions
-CACHE_PATH = APP_PATHS.price_cache
-FUTURES_CACHE_PATH = APP_PATHS.futures_cache
-FUTURES_LARGE_TRADERS_CACHE_PATH = APP_PATHS.futures_large_traders_cache
-FUTURES_SSF_CACHE_PATH = APP_PATHS.futures_ssf_cache
-INSTITUTIONAL_CACHE_PATH = APP_PATHS.institutional_cache
-POSITION_DETAIL_CACHE_PATH = APP_PATHS.position_detail_cache
-HISTORY_DB_PATH = APP_PATHS.history_db
-SETTINGS_PATH = APP_PATHS.settings
 
 # 背景檢查「今天的資料是否已發布」的輪詢間隔。get_market_snapshot 本身有 30 分鐘
 # 快取（tradingnote_core.CACHE_TTL_SECONDS），所以就算這裡設得比 30 分鐘短，實際
@@ -136,16 +113,11 @@ COLUMNS = [
 # 視覺主題常數與全域 QSS 已搬到 ui/theme.py（2026-09-15，見 ARCHITECTURE.md／
 # STATUS.md）；這裡改用 import，內容不變，往後要調色只改 ui/theme.py 一處。
 from ui.theme import (  # noqa: E402
-    COLOR_BG,
     COLOR_SURFACE,
     COLOR_TEXT,
     COLOR_MUTED,
     COLOR_ACCENT,
-    COLOR_ACCENT_ACTIVE,
-    COLOR_ACCENT_TEXT,
     COLOR_BORDER,
-    COLOR_ROW_ALT,
-    COLOR_HOVER,
     COLOR_CARD_BG,
     COLOR_GAIN,
     COLOR_LOSS,
@@ -157,7 +129,6 @@ from ui.theme import (  # noqa: E402
     COLOR_DISABLED_BG,
     COLOR_DISABLED_TEXT,
     COLOR_SPECIAL,
-    FONT_FAMILY,
     STYLESHEET,
 )
 from ui.format import gain_loss_color  # noqa: E402
@@ -166,475 +137,38 @@ from ui.components.signal_badge import SignalBadge  # noqa: E402
 from ui.components.section_card import SectionCard  # noqa: E402
 from ui.components.insight_card import InsightCard  # noqa: E402
 from ui.pages.institutional_flow_page import InstitutionalFlowPage  # noqa: E402
-
-
-def accent_button(text, slot=None):
-    btn = QtWidgets.QPushButton(text)
-    btn.setProperty("accent", True)
-    if slot is not None:
-        btn.clicked.connect(slot)
-    return btn
-
-
-def _set_standard_icon(button, standard_pixmap, tooltip=None):
-    """套用會隨 DPI 清晰縮放的 Qt 系統圖示，避免用文字符號模擬小圖示。"""
-    button.setIcon(button.style().standardIcon(standard_pixmap))
-    button.setIconSize(QtCore.QSize(22, 22))
-    if tooltip:
-        button.setToolTip(tooltip)
-    return button
-
-
-def _compact_money(value):
-    """把金額縮成適合摘要卡與提示框閱讀的億元格式。"""
-    if value is None:
-        return "—"
-    return f"{value / 1e8:+,.1f} 億"
-
-
-def _flow_momentum_insight(rows):
-    """rule-based（不接 LLM）：從族群資金流向清單挑出今天最值得注意的一則量價觀察，
-    給 InsightCard 用。只用 turnover_ratio（今日量比）與 daily_change_pct（當日
-    漲跌%）——兩者都存在才夠格參與，門檻（量比 >= 1.5、漲跌 >= 0.5%）是為了避免拿
-    普通、不特別的日子也硬生出一句「看起來煞有其事」的結論。回傳
-    (headline, detail, tone)；沒有夠格的族群時回傳中性的「暫無訊號」文案，而不是
-    留白或報錯——見規格「Loading/Error/Empty State」的一致性要求。
-    """
-    candidates = [
-        row
-        for row in rows
-        if row.turnover_ratio is not None
-        and row.daily_change_pct is not None
-        and row.turnover_ratio >= 1.5
-        and abs(row.daily_change_pct) >= 0.5
-    ]
-    if not candidates:
-        return (
-            "暫無明顯資金訊號",
-            "今日各族群量能與價格變動都在正常範圍內。",
-            "neutral",
-        )
-    top = max(candidates, key=lambda row: row.turnover_ratio)
-    if top.daily_change_pct > 0:
-        return (
-            "資金動能增強",
-            f"{top.industry}今日成交量為近期均量的 {top.turnover_ratio:.2f} 倍，"
-            f"且價格同步走強（{top.daily_change_pct:+.2f}%）。",
-            "positive",
-        )
-    return (
-        "放量下跌需留意",
-        f"{top.industry}今日成交量為近期均量的 {top.turnover_ratio:.2f} 倍，"
-        f"但價格走弱（{top.daily_change_pct:+.2f}%），賣壓可能未完全釋放。",
-        "negative",
-    )
-
-
-def _latest_valid(values):
-    """從指標數列取最後一個非 None 的值（序列尾端通常是最新交易日）。"""
-    for value in reversed(values or ()):
-        if value is not None:
-            return value
-    return None
-
-
-def _stock_trend_badges(technical):
-    """rule-based（不接 LLM）：從既有的本地技術指標（tradingnote_technical.
-    calculate_indicators 的既有輸出，不新增任何指標計算）萃取「趨勢／動能／量能」
-    三個方向性標籤，加上依前三者交叉判斷的「量價背離」標籤，給「個股概覽」的
-    SignalBadge 用。純粹是「怎麼解讀已經算好的數字」：
-    - 趨勢：收盤價相對 MA20 的乖離（>=1% 偏多、<=-1% 偏空，用來過濾貼著均線
-      上下的雜訊）。
-    - 動能：RSI(14)（>=55 偏強、<=45 偏弱，50 上下不特別有意義所以留一段中性帶）。
-    - 量能：今日成交量相對均量20 的倍數（>=1.2x 放大、<=0.8x 萎縮）；量能本身
-      沒有天生的多空傾向（爆量可能是噴出也可能是出貨），tone 刻意不用
-      positive/negative，避免暗示「量增=好事」。
-    - 量價背離：前面「趨勢」跟「量能」分開判斷、刻意不互相參照，所以量價背離
-      （價漲量縮、價跌量增）一直沒被標出來——這裡把兩者的判斷結果交叉比對，
-      只在真的出現背離時才多附一個標籤；趨勢中性或量價同步時不強行湊出第四
-      個標籤，維持跟其他三項一樣「沒有明顯訊號就不下結論」的原則。價跌量增
-      tone 刻意用 info 而非 positive/negative，因為可能是止跌訊號也可能是
-      逃命賣壓，方向不明確。
-    某一項資料不足（例如新股不到 20 個交易日）時該項直接跳過，不用預設值假裝
-    有結論；全部不足時回傳空 list，呼叫端應顯示「資料不足」的空狀態文字。
-    """
-    if not technical:
-        return []
-    badges = []
-    diff_pct = None
-    volume_ratio = None
-
-    close = _latest_valid(technical.get("close"))
-    ma20 = _latest_valid(technical.get("ma", {}).get("ma20"))
-    if close is not None and ma20:
-        diff_pct = (close / ma20 - 1) * 100
-        if diff_pct >= 1:
-            badges.append(("趨勢：偏多", "positive"))
-        elif diff_pct <= -1:
-            badges.append(("趨勢：偏空", "negative"))
-        else:
-            badges.append(("趨勢：中性", "neutral"))
-
-    rsi = _latest_valid(technical.get("rsi"))
-    if rsi is not None:
-        if rsi >= 55:
-            badges.append(("動能：偏強", "positive"))
-        elif rsi <= 45:
-            badges.append(("動能：偏弱", "negative"))
-        else:
-            badges.append(("動能：中性", "neutral"))
-
-    volume_series = technical.get("charts", {}).get("volume", {}).get("series", {})
-    volume = _latest_valid(volume_series.get("成交量"))
-    volume_ma20 = _latest_valid(volume_series.get("均量20"))
-    if volume is not None and volume_ma20:
-        volume_ratio = volume / volume_ma20
-        if volume_ratio >= 1.2:
-            badges.append(("量能：放大", "warning"))
-        elif volume_ratio <= 0.8:
-            badges.append(("量能：萎縮", "neutral"))
-        else:
-            badges.append(("量能：平穩", "neutral"))
-
-    if diff_pct is not None and volume_ratio is not None:
-        if diff_pct >= 1 and volume_ratio <= 0.8:
-            badges.append(("量價背離：轉弱", "negative"))
-        elif diff_pct <= -1 and volume_ratio >= 1.2:
-            badges.append(("量價背離：留意止跌", "info"))
-
-    return badges
-
-
-def _chip_momentum_badges(institutional_history, margin_history):
-    """rule-based（不接 LLM）：從個股 120 日三大法人買賣超與融資融券餘額歷史
-    （tradingnote_finmind.fetch_institutional_investors_history／
-    fetch_margin_short_sale_history 既有輸出，不新增任何抓取邏輯）萃取「籌碼
-    方向／籌碼動能／融資動向」三個標籤，給「個股概覽」的 SignalBadge 用，跟
-    _stock_trend_badges 同一套設計原則：
-    - 籌碼方向：跟族群層級 _institutional_sync_score 同一套三家各自取正負號
-      加總的演算法（範圍 -3~+3），套用在單一個股「最新一天」的外資／投信／
-      自營商淨買賣超（股數）上——正負號判斷跟金額或股數無關，演算法可以直接
-      沿用；只有 +3／-3（三家方向完全一致）才算「同步」，其餘（含只有兩家
-      同向）都算「分歧」，跟 _institutional_sync_score 的既有定義一致。
-    - 籌碼動能：從最新一天往回數，三大法人合計淨額連續同號（同買或同賣）的
-      天數；未達 3 天視為訊號不明顯，不特別標出來（跟量能的「平穩」不同，
-      這裡選擇直接不顯示，因為「連 1～2 天」本來就稱不上動能）。
-    - 融資動向：最新融資餘額 vs 10 個交易日前的融資餘額變化率，未達 ±1% 視
-      為持平不特別標出。tone 刻意用 info：融資增加可能是散戶追價（偏空的
-      反指標）也可能是真的看好加碼，跟 _stock_trend_badges 的量能徽章一樣
-      不假設方向。
-    institutional_history／margin_history 任一為 None（例如沒設定 FinMind
-    token）就跳過對應項目；兩者都缺時回傳空 list，呼叫端顯示「資料不足」。
-    """
-    badges = []
-
-    if institutional_history:
-        series = institutional_history.get("series", {})
-        foreign = series.get("外資") or []
-        trust = series.get("投信") or []
-        dealer = series.get("自營商") or []
-        n = min(len(foreign), len(trust), len(dealer))
-        if n:
-            score = _sign(foreign[-1]) + _sign(trust[-1]) + _sign(dealer[-1])
-            if score == 3:
-                badges.append(("籌碼方向：三大法人同步買超", "positive"))
-            elif score == -3:
-                badges.append(("籌碼方向：三大法人同步賣超", "negative"))
-            else:
-                badges.append(("籌碼方向：三大法人分歧", "neutral"))
-
-            streak = 0
-            streak_sign = 0
-            for index in range(n - 1, -1, -1):
-                daily_sign = _sign(foreign[index] + trust[index] + dealer[index])
-                if daily_sign == 0:
-                    break
-                if streak == 0:
-                    streak_sign = daily_sign
-                    streak = 1
-                elif daily_sign == streak_sign:
-                    streak += 1
-                else:
-                    break
-            if streak >= 3:
-                if streak_sign > 0:
-                    badges.append((f"籌碼動能：連買 {streak} 日", "positive"))
-                else:
-                    badges.append((f"籌碼動能：連賣 {streak} 日", "negative"))
-
-    if margin_history:
-        margin_series = margin_history.get("series", {}).get("融資餘額") or []
-        if len(margin_series) > 10:
-            latest = margin_series[-1]
-            reference = margin_series[-11]
-            if reference:
-                change_pct = (latest / reference - 1) * 100
-                if abs(change_pct) >= 1:
-                    badges.append((f"融資動向：10 日變化 {change_pct:+.1f}%", "info"))
-
-    return badges
-
-
-def _clear_layout(layout):
-    """移除 layout 裡目前所有 widget，給要重複重繪同一列徽章／標籤的地方用
-    （例如切換選取股票時），避免每次都往下疊加舊的 widget。`takeAt()` 只是讓
-    layout 不再管這個 widget 的版面配置，widget 本身仍是同一個 parent 底下的
-    子物件，還會留在原地疊圖，所以要先 `setParent(None)` 把它整個拔出父子關係
-    立刻讓它從畫面上消失，`deleteLater()` 才是排隊真正刪除底層 Qt 物件。
-    """
-    while layout.count():
-        child = layout.takeAt(0)
-        widget = child.widget()
-        if widget is not None:
-            widget.setParent(None)
-            widget.deleteLater()
-
-
-def _populate_badge_row(layout, badges, empty_text):
-    """清空並重繪一列 SignalBadge；沒有夠格的資料（badges 為空）時改顯示
-    empty_text 的 muted 提示，維持跟其他空狀態一致的呈現方式。呼叫端自己算好
-    badges 列表（例如 _stock_trend_badges／_chip_momentum_badges 的回傳值）
-    再傳進來，這個函式只負責畫面呈現，共用給 `StockDetailDialog` 的趨勢／
-    籌碼徽章列與「個股查詢」分頁的 `stock_preview` 摘要面板。
-    """
-    _clear_layout(layout)
-    if badges:
-        for text, tone in badges:
-            layout.addWidget(SignalBadge(text, tone=tone))
-    else:
-        hint = QtWidgets.QLabel(empty_text)
-        hint.setProperty("muted", True)
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-    layout.addStretch(1)
-
-
-def _screen_fit_size(widget, preferred_width=None, preferred_height=None, ratio=0.85):
-    """算出 widget 開啟時的合理尺寸，讓視窗／對話框自動符合目前螢幕大小，不會
-    在小螢幕（筆電、遠端桌面）上比可視範圍還大而被裁到看不見。有給
-    preferred_width/height（對話框習慣的偏好尺寸）時取「偏好尺寸」與「螢幕可用
-    工作區 * ratio」兩者較小值；沒給（例如主視窗）就直接用比例本身，讓尺寸隨
-    螢幕大小等比縮放，大螢幕也能用到更多畫面。"""
-    screen = widget.screen() or QtWidgets.QApplication.primaryScreen()
-    avail = screen.availableGeometry()
-    max_w = int(avail.width() * ratio)
-    max_h = int(avail.height() * ratio)
-    width = max_w if preferred_width is None else min(preferred_width, max_w)
-    height = max_h if preferred_height is None else min(preferred_height, max_h)
-    return width, height
-
-
-def _center_on_screen(widget):
-    screen = widget.screen() or QtWidgets.QApplication.primaryScreen()
-    frame = widget.frameGeometry()
-    frame.moveCenter(screen.availableGeometry().center())
-    widget.move(frame.topLeft())
-
-
-def _snapshot_date(snapshot):
-    """回傳快照裡最多股票共用的交易日（多數 PriceInfo.date 會是同一天，用眾數
-    避免少數個股資料延遲／異常日期影響判斷）；快照是空的就回傳 None。"""
-    dates = [p.date for p in snapshot.values() if p.date]
-    if not dates:
-        return None
-    return Counter(dates).most_common(1)[0][0]
-
-
-def _futures_snapshot_date(futures_snapshot):
-    """回傳期貨盤後快照（get_futures_snapshot 的回傳值）裡最新的資料日期，格式轉成
-    跟 _snapshot_date／history.db 一致的 "YYYY-MM-DD"（TAIFEX 原始欄位是 "YYYYMMDD"）；
-    快照是空的就回傳 None。"""
-    dates = [
-        data["date"]
-        for sessions in futures_snapshot.values()
-        for data in sessions.values()
-        if data.get("date")
-    ]
-    if not dates:
-        return None
-    raw = max(dates)
-    return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}"
-
-
-def _futures_date_to_iso(raw):
-    """TAIFEX 原始日期欄位 "YYYYMMDD" → "YYYY-MM-DD"；格式不符或空值回傳空字串。"""
-    if raw and len(raw) == 8 and raw.isdigit():
-        return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}"
-    return ""
-
-
-def _format_settlement_month(month):
-    """大額交易人未沖銷部位的 SettlementMonth 顯示文字：999912（TAIFEX 用來表示
-    「所有契約合計」）轉成「所有契約」；正常的 6 碼西元年月轉成 "YYYY/MM"；
-    其他非標準代碼（例如 TX 偶爾出現、全市場未沖銷僅 1 口的 666666 佔位資料）
-    原樣顯示，不臆測其語意。"""
-    if month == LARGE_TRADERS_ALL_CONTRACTS_MONTH:
-        return "所有契約"
-    if month and len(month) == 6 and month.isdigit() and "01" <= month[4:6] <= "12":
-        return f"{month[0:4]}/{month[4:6]}"
-    return month or "-"
-
-
-_MARKET_LABELS = {"TWSE": "上市 TWSE", "TPEX": "上櫃 TPEX"}
-
-
-def _format_history_status(status):
-    overall = status["overall"]
-    if not overall["days"]:
-        return "資料庫目前無歷史資料，請按「回補歷史資料」或等待下次自動同步。"
-
-    lines = [
-        f"整體：{overall['days']} 個交易日｜{overall['min_date']} ～ {overall['max_date']}"
-        f"｜{overall['tickers']:,} 檔｜{overall['rows']:,} 筆",
-    ]
-    for market, label in _MARKET_LABELS.items():
-        m = status["by_market"].get(market)
-        if m is None:
-            continue
-        lines.append(
-            f"{label}：{m['days']} 個交易日｜{m['min_date']} ～ {m['max_date']}"
-            f"｜{m['tickers']:,} 檔｜{m['rows']:,} 筆"
-        )
-
-    size_mb = status["file_size_bytes"] / (1024 * 1024)
-    lines.append(f"資料庫檔案大小：{size_mb:.1f} MB")
-    return "\n".join(lines)
-
-
-def _record_valuation_snapshot_best_effort():
-    """盡力而為記錄今天的本益比／股價淨值比快照（TWSE／TPEX 官方 bulk 端點各打
-    一次），供泡泡圖「估值百分位」新模式逐日累積用（見 tradingnote_history.
-    compute_valuation_flow）。刻意用寬鬆的 `except Exception`（不是專案慣例的窄範圍
-    例外）：這是輔助性的背景累積動作，任何失敗（離線、端點暫時掛掉、格式意外跑掉）
-    都不應該讓啟動或「重新整理」流程跟著失敗——當天只是沒新增一筆 valuation_history，
-    不影響其他既有功能，之後正常連線時自然會補上。"""
-    try:
-        record_valuation_snapshot(HISTORY_DB_PATH, fetch_twse_valuation_all(), "TWSE")
-    except Exception:
-        pass
-    try:
-        record_valuation_snapshot(HISTORY_DB_PATH, fetch_tpex_valuation_all(), "TPEX")
-    except Exception:
-        pass
-
-
-def run_backfill_in_thread(parent, target_days, progress_cb, done_cb, error_cb):
-    def work(_cancel_event, emit):
-        return backfill_twse_history(
-            HISTORY_DB_PATH,
-            target_days=target_days,
-            on_progress=lambda done, total: emit(done, total),
-        )
-
-    return run_background_task(
-        parent,
-        work,
-        done_cb,
-        error_cb,
-        on_progress=progress_cb,
-    )
-
-
-def run_tpex_finmind_backfill_in_thread(
-    parent, token, target_days, progress_cb, done_cb, error_cb
-):
-    def work(_cancel_event, emit):
-        return backfill_tpex_history_via_finmind(
-            HISTORY_DB_PATH,
-            token,
-            target_days=target_days,
-            on_progress=lambda done, total, ticker: emit(done, total, ticker),
-        )
-
-    return run_background_task(
-        parent,
-        work,
-        done_cb,
-        error_cb,
-        on_progress=progress_cb,
-    )
-
-
-def run_task_in_thread(parent, work_fn, on_done, on_error):
-    return run_background_task(
-        parent,
-        lambda _cancel_event, _emit: work_fn(),
-        on_done,
-        on_error,
-    )
-
-
-def _format_fetched_at(iso_string):
-    """把 position_detail_cache.json 的時間戳格式化成畫面可讀的文字。
-
-    舊快取若有異常格式，不應該讓整個部位詳細資訊區塊無法顯示，直接保留
-    原字串作為 fallback。
-    """
-    try:
-        return datetime.fromisoformat(iso_string).strftime("%Y-%m-%d %H:%M")
-    except (TypeError, ValueError):
-        return iso_string
-
-
-def run_refresh_in_thread(parent, progress_cb, done_cb, error_cb):
-    total_steps = 5
-
-    def work(_cancel_event, emit):
-        snapshot = get_market_snapshot(
-            CACHE_PATH,
-            force_refresh=True,
-            on_progress=lambda done, _total, label: emit(done, total_steps, label),
-        )
-        emit(3, total_steps, "正在取得三大法人方向...")
-        try:
-            get_cached_institutional_snapshot(
-                INSTITUTIONAL_CACHE_PATH, force_refresh=True
-            )
-        except PriceFetchError:
-            pass
-        emit(4, total_steps, "正在寫入歷史資料庫...")
-        record_snapshot(HISTORY_DB_PATH, snapshot)
-        _record_valuation_snapshot_best_effort()
-        emit(5, total_steps, "重新整理完成。")
-        return snapshot
-
-    return run_background_task(
-        parent,
-        work,
-        done_cb,
-        error_cb,
-        on_progress=progress_cb,
-    )
-
-
-def run_startup_preload_in_thread(parent, progress_cb, done_cb, error_cb):
-    total_steps = 5
-
-    def work(_cancel_event, emit):
-        snapshot = get_market_snapshot(
-            CACHE_PATH,
-            on_progress=lambda done, _total, label: emit(done, total_steps, label),
-        )
-        emit(3, total_steps, "正在取得三大法人方向...")
-        try:
-            get_cached_institutional_snapshot(INSTITUTIONAL_CACHE_PATH)
-        except PriceFetchError:
-            pass
-        emit(4, total_steps, "正在寫入歷史資料庫...")
-        record_snapshot(HISTORY_DB_PATH, snapshot)
-        _record_valuation_snapshot_best_effort()
-        emit(4, total_steps, "正在更新產業分類...")
-        get_industry_map(HISTORY_DB_PATH)
-        emit(5, total_steps, "啟動準備完成。")
-        return snapshot
-
-    return run_background_task(
-        parent,
-        work,
-        done_cb,
-        error_cb,
-        on_progress=progress_cb,
-    )
+from ui import app_paths
+from ui.badges import (
+    _flow_momentum_insight,
+    _stock_trend_badges,
+    _chip_momentum_badges,
+    _populate_badge_row,
+)
+from ui.format import (
+    _sign,
+    _compact_money,
+    _snapshot_date,
+    _futures_snapshot_date,
+    _futures_date_to_iso,
+    _format_settlement_month,
+    _format_history_status,
+    _format_fetched_at,
+)
+from ui.widgets import (
+    accent_button,
+    _set_standard_icon,
+    _clear_layout,
+    _screen_fit_size,
+    _center_on_screen,
+    _color_swatch_icon,
+)
+from ui.workers import (
+    run_backfill_in_thread,
+    run_tpex_finmind_backfill_in_thread,
+    run_task_in_thread,
+    run_refresh_in_thread,
+    run_startup_preload_in_thread,
+)
 
 
 class StartupProgressDialog(QtWidgets.QDialog):
@@ -776,7 +310,7 @@ class PriceLookupDialog(QtWidgets.QDialog):
             return
 
         # LIFO 備援：即時快照沒有這檔股票時，改向歷史資料庫要最新一筆（date DESC）。
-        record = get_latest_ticker_record(HISTORY_DB_PATH, ticker.upper())
+        record = get_latest_ticker_record(app_paths.HISTORY_DB_PATH, ticker.upper())
         if record is None:
             self.result_label.setText(f"查無此股票代號：{ticker}")
             return
@@ -848,8 +382,8 @@ class StockDetailDialog(QtWidgets.QDialog):
         self.hero_stat.set_value(price_text, change=change_text, status=status)
         hero_layout.addWidget(self.hero_stat)
 
-        cached = load_position_detail_cache(POSITION_DETAIL_CACHE_PATH, ticker) or {}
-        technical = load_local_technical(HISTORY_DB_PATH, ticker, cached.get("price_history"))
+        cached = load_position_detail_cache(app_paths.POSITION_DETAIL_CACHE_PATH, ticker) or {}
+        technical = load_local_technical(app_paths.HISTORY_DB_PATH, ticker, cached.get("price_history"))
 
         trend_row = QtWidgets.QHBoxLayout()
         trend_row.setSpacing(6)
@@ -996,7 +530,7 @@ class StockDetailDialog(QtWidgets.QDialog):
 
         # 跟「部位紀錄」頁 _load_position_detail 同一招：先顯示上次永久存下來
         # 的結果（有的話），背景照樣重打一次 FinMind 拿最新資料。
-        cached = load_position_detail_cache(POSITION_DETAIL_CACHE_PATH, self.ticker)
+        cached = load_position_detail_cache(app_paths.POSITION_DETAIL_CACHE_PATH, self.ticker)
         if cached is not None:
             note = f"（上次查詢：{_format_fetched_at(cached['fetched_at'])}，背景更新中...）"
             _render_detail_summary(self.full_detail_label, header, cached, note)
@@ -1007,7 +541,7 @@ class StockDetailDialog(QtWidgets.QDialog):
 
         def fetch():
             data = fetch_position_detail(self.ticker, self.finmind_token, market=self.market)
-            save_position_detail_cache(POSITION_DETAIL_CACHE_PATH, self.ticker, data)
+            save_position_detail_cache(app_paths.POSITION_DETAIL_CACHE_PATH, self.ticker, data)
             return data
 
         self._full_detail_timer = run_task_in_thread(
@@ -1589,10 +1123,6 @@ def _populate_institutional_direction_chart(chart, rows, value_attr, title):
     chart.setLabel("bottom", "← 賣超　估算淨額（億）　買超 →", color=COLOR_MUTED)
 
 
-def _sign(value):
-    return (value > 0) - (value < 0)
-
-
 def _institutional_sync_score(institutional_row):
     """三大法人（外資／投信／自營商）同一族群的方向一致性分數，範圍 -3～+3：
     每家淨買超記 +1、淨賣超記 -1、淨額剛好是 0 記 0，三家加總。+3＝三家全部
@@ -1614,20 +1144,6 @@ def _category_color(name):
     digest = hashlib.md5(name.encode("utf-8")).digest()
     hue = int.from_bytes(digest[:4], "big") % 360
     return QtGui.QColor.fromHsv(hue, 140, 225)
-
-
-def _color_swatch_icon(color, size=10):
-    """畫一個實心色塊小圖示，給 QTreeWidgetItem.setIcon() 用，讓清單列跟
-    泡泡圖用同一個 _category_color() 產生視覺上可以直接比對的顏色。"""
-    pixmap = QtGui.QPixmap(size, size)
-    pixmap.fill(QtCore.Qt.transparent)
-    painter = QtGui.QPainter(pixmap)
-    painter.setRenderHint(QtGui.QPainter.Antialiasing)
-    painter.setBrush(QtGui.QBrush(color))
-    painter.setPen(QtCore.Qt.NoPen)
-    painter.drawEllipse(0, 0, size, size)
-    painter.end()
-    return QtGui.QIcon(pixmap)
 
 
 def populate_flow_chart(
@@ -2285,7 +1801,6 @@ def _populate_technical_chart(chart, technical_data, mode="kd"):
         empty.setPos(0,.5)
 
 
-
 class TechnicalAnalysisWidget(QtWidgets.QWidget):
     """個股明細共用的技術分析視圖。"""
 
@@ -2774,9 +2289,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.resize(width, height)
         _center_on_screen(self)
 
-        self.settings = load_settings(SETTINGS_PATH)
-        self.positions = load_positions(POSITIONS_PATH)
-        initialize_journal(HISTORY_DB_PATH, self.positions)
+        self.settings = load_settings(app_paths.SETTINGS_PATH)
+        self.positions = load_positions(app_paths.POSITIONS_PATH)
+        initialize_journal(app_paths.HISTORY_DB_PATH, self.positions)
         # 概念目錄在啟動時讀入一次；重建 concepts.json 後需重開程式，
         # 才會讓持股概念標籤與資金流向分類同時更新。
         self._concepts = load_concepts()
@@ -2785,9 +2300,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self.snapshot = snapshot
         self.last_error = last_error
         self.flow_service = FlowAnalysisService(
-            HISTORY_DB_PATH,
+            app_paths.HISTORY_DB_PATH,
             classification_catalog=self._classification_catalog,
-            institutional_cache_path=INSTITUTIONAL_CACHE_PATH,
+            institutional_cache_path=app_paths.INSTITUTIONAL_CACHE_PATH,
         )
         self.staleness_warning = (
             "；".join(snapshot_staleness_warnings(self.snapshot)) if self.snapshot else ""
@@ -2826,7 +2341,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         self._new_data_check_timer = None
 
         self.flow_tab = QtWidgets.QWidget()
-        self.institutional_flow_tab = InstitutionalFlowPage(HISTORY_DB_PATH)
+        self.institutional_flow_tab = InstitutionalFlowPage(app_paths.HISTORY_DB_PATH)
         self.positions_tab = QtWidgets.QWidget()
         self.journal_tab = QtWidgets.QWidget()
         self.stocks_tab = QtWidgets.QWidget()
@@ -3048,7 +2563,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
     def _check_for_new_data(self):
         def work():
-            return get_market_snapshot(CACHE_PATH, force_refresh=False)
+            return get_market_snapshot(app_paths.CACHE_PATH, force_refresh=False)
 
         self._new_data_poll_timer = run_task_in_thread(
             self, work, self._on_new_data_check_done, self._on_new_data_check_error
@@ -3293,7 +2808,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.flow_chart, 1)
 
     def _update_flow_date_button(self):
-        period = self.flow_period.resolve(HISTORY_DB_PATH, self.snapshot)
+        period = self.flow_period.resolve(app_paths.HISTORY_DB_PATH, self.snapshot)
         start = period.actual_dates[0] if period.actual_dates else period.start_date
         self.flow_date_button.setText(
             f"{start} ～ {period.end_date} · 近 {period.trading_days} 日"
@@ -3332,7 +2847,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
     def _open_flow_date_picker(self):
         end_date = max((p.date for p in self.snapshot.values() if p.date), default=date.today().isoformat())
-        valid_dates = sorted(set(d for d in get_available_dates(HISTORY_DB_PATH) if d <= end_date)
+        valid_dates = sorted(set(d for d in get_available_dates(app_paths.HISTORY_DB_PATH) if d <= end_date)
                              | {p.date for p in self.snapshot.values() if p.date and p.date <= end_date})
         dialog = TradingDateDialog(self, valid_dates, "選擇流向區間起始日期")
         if dialog.exec() == QtWidgets.QDialog.Accepted and dialog.selected_date:
@@ -3342,7 +2857,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             self.refresh_flow_tab()
 
     def _refresh_flow_on_revision(self):
-        if get_data_revision(HISTORY_DB_PATH) != getattr(self, "_flow_data_revision", None):
+        if get_data_revision(app_paths.HISTORY_DB_PATH) != getattr(self, "_flow_data_revision", None):
             self.refresh_flow_tab()
 
     def refresh_flow_tab(self):
@@ -3371,7 +2886,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         ) = self._flow_refresh_pending_request
         self._flow_refresh_pending_request = None
         self._flow_refresh_in_flight = True
-        self._flow_data_revision = get_data_revision(HISTORY_DB_PATH)
+        self._flow_data_revision = get_data_revision(app_paths.HISTORY_DB_PATH)
 
         def work(_cancel_event, _emit_progress):
             return self.flow_service.analyze(
@@ -3436,7 +2951,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
                 f" {stale_count} 檔來源日期與截止日不同，未混用其價格計算。")
         populate_flow_chart(
             self.flow_chart,
-            HISTORY_DB_PATH,
+            app_paths.HISTORY_DB_PATH,
             self.snapshot,
             avg_days=period.trading_days,
             on_industry_click=self._on_industry_bubble_clicked,
@@ -3888,7 +3403,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         target_days = self.settings.get("backfill_target_days", DEFAULT_BACKFILL_TARGET_DAYS)
 
         def work():
-            return backfill_large_traders_history(HISTORY_DB_PATH, target_days)
+            return backfill_large_traders_history(app_paths.HISTORY_DB_PATH, target_days)
 
         def on_done(result):
             had_note = bool(self.large_traders_note)
@@ -3987,7 +3502,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         has_pnl = False
         self.table.setRowCount(len(self.positions))
         try:
-            industry_map = get_industry_map(HISTORY_DB_PATH)
+            industry_map = get_industry_map(app_paths.HISTORY_DB_PATH)
         except PriceFetchError:
             # 族群只是輔助資訊，抓不到（例如離線、快取剛好過期又連不上網）不該
             # 讓整個部位表格連損益都顯示不出來，各列的「族群」直接落回「-」。
@@ -4042,8 +3557,8 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
                     item.setForeground(QtGui.QColor(color))
                 self.table.setItem(row_index, col, item)
 
-        save_positions(POSITIONS_PATH, self.positions)
-        save_portfolio_snapshot(HISTORY_DB_PATH, date.today().isoformat(), self.positions)
+        save_positions(app_paths.POSITIONS_PATH, self.positions)
+        save_portfolio_snapshot(app_paths.HISTORY_DB_PATH, date.today().isoformat(), self.positions)
         if hasattr(self, "journal_cards"):
             self._save_journal_if_dirty()
             self._refresh_journal_week()
@@ -4066,7 +3581,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
     def _load_position_detail(self, pos):
         try:
-            industry = get_industry_map(HISTORY_DB_PATH).get(pos.ticker) or "未分類"
+            industry = get_industry_map(app_paths.HISTORY_DB_PATH).get(pos.ticker) or "未分類"
         except PriceFetchError:
             industry = "未分類"
         concepts = self._ticker_concept_map.get(pos.ticker) or []
@@ -4077,7 +3592,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         # 結果：有就先顯示（不用等這次背景查詢），沒有才顯示「查詢中」空白狀態。
         # 不管有沒有快取，下面都照樣背景重打一次 FinMind 拿最新資料、查到就覆寫
         # 快取檔——快取讓「隨時可以取用」，不是拿來取代查新資料。
-        cached = load_position_detail_cache(POSITION_DETAIL_CACHE_PATH, pos.ticker)
+        cached = load_position_detail_cache(app_paths.POSITION_DETAIL_CACHE_PATH, pos.ticker)
         if cached is not None:
             note = f"（上次查詢：{_format_fetched_at(cached['fetched_at'])}，背景更新中...）"
             self._render_position_detail(header, cached, note)
@@ -4090,7 +3605,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
         def fetch():
             data = fetch_position_detail(pos.ticker, token, market=market)
-            save_position_detail_cache(POSITION_DETAIL_CACHE_PATH, pos.ticker, data)
+            save_position_detail_cache(app_paths.POSITION_DETAIL_CACHE_PATH, pos.ticker, data)
             return data
 
         self._position_detail_timer = run_task_in_thread(
@@ -4140,10 +3655,10 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
     def _update_status_bar(self):
         cache_note = ""
-        if CACHE_PATH.exists():
+        if app_paths.CACHE_PATH.exists():
             import json as _json
 
-            with CACHE_PATH.open("r", encoding="utf-8") as f:
+            with app_paths.CACHE_PATH.open("r", encoding="utf-8") as f:
                 fetched_at = _json.load(f).get("fetched_at", "")
             cache_note = f"價格更新：{_format_fetched_at(fetched_at)}"
         total_note = (
@@ -4384,7 +3899,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
     def _refresh_journal_week(self):
         week = load_week(
-            HISTORY_DB_PATH,
+            app_paths.HISTORY_DB_PATH,
             self.journal_week_start,
             self.positions,
         )
@@ -4511,7 +4026,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         if self.journal_selected_date > date.today().isoformat():
             return
         save_journal_entry(
-            HISTORY_DB_PATH,
+            app_paths.HISTORY_DB_PATH,
             self.journal_selected_date,
             self.journal_note_edit.toPlainText(),
         )
@@ -4522,9 +4037,9 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         if self.journal_selected_date > date.today().isoformat():
             return
         if self.journal_selected_date == date.today().isoformat():
-            save_portfolio_snapshot(HISTORY_DB_PATH, self.journal_selected_date, self.positions)
+            save_portfolio_snapshot(app_paths.HISTORY_DB_PATH, self.journal_selected_date, self.positions)
         save_journal_entry(
-            HISTORY_DB_PATH,
+            app_paths.HISTORY_DB_PATH,
             self.journal_selected_date,
             self.journal_note_edit.toPlainText(),
         )
@@ -4653,7 +4168,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
     def refresh_stocks_tab(self):
         try:
-            directory = get_industry_directory(HISTORY_DB_PATH)
+            directory = get_industry_directory(app_paths.HISTORY_DB_PATH)
         except PriceFetchError as e:
             QtWidgets.QMessageBox.warning(self, "錯誤", f"無法取得產業分類資料：{e}")
             return
@@ -4807,7 +4322,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
         def work(_cancel_event, _emit_progress):
             return self._stock_technical_cache.get_or_fetch(
-                ticker, lambda: load_local_technical(HISTORY_DB_PATH, ticker)
+                ticker, lambda: load_local_technical(app_paths.HISTORY_DB_PATH, ticker)
             )
 
         def on_done(technical):
@@ -5003,7 +4518,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
         def work(_cancel_event, _emit_progress):
             return get_large_traders_history_series(
-                HISTORY_DB_PATH, lt_code, LARGE_TRADERS_HISTORY_ALL_CONTRACTS_MONTH, "0"
+                app_paths.HISTORY_DB_PATH, lt_code, LARGE_TRADERS_HISTORY_ALL_CONTRACTS_MONTH, "0"
             )
 
         def on_done(trend):
@@ -5120,7 +4635,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
     def refresh_futures_tab(self, force_refresh=False):
         def fetch():
-            rows = get_cached_daily_futures_report(FUTURES_CACHE_PATH, force_refresh=force_refresh)
+            rows = get_cached_daily_futures_report(app_paths.FUTURES_CACHE_PATH, force_refresh=force_refresh)
             all_products = list_all_products(rows)
             # 大額交易人未沖銷部位是另一支 TAIFEX 端點，抓失敗（且無舊快取）時
             # 不該讓整個期貨盤後表格跟著壞掉——退回空清單，雙擊時再提示稍後重試。
@@ -5128,7 +4643,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             # 畫面上警示，不然使用者只會看到搜尋／大額部位悄悄失效，找不到原因。
             try:
                 large_traders_rows = get_cached_large_traders_futures_report(
-                    FUTURES_LARGE_TRADERS_CACHE_PATH, force_refresh=force_refresh
+                    app_paths.FUTURES_LARGE_TRADERS_CACHE_PATH, force_refresh=force_refresh
                 )
                 large_traders_failed = False
             except PriceFetchError:
@@ -5139,7 +4654,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
             # 代號／名稱搜尋會找不到任何股票期貨列，同樣需要警示原因。
             try:
                 ssf_map = build_ssf_map(
-                    get_cached_ssf_list(FUTURES_SSF_CACHE_PATH, force_refresh=force_refresh)
+                    get_cached_ssf_list(app_paths.FUTURES_SSF_CACHE_PATH, force_refresh=force_refresh)
                 )
                 ssf_failed = False
             except PriceFetchError:
@@ -5326,11 +4841,11 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
 
     def _on_auto_check_toggle(self, checked):
         self.settings["auto_check_continuity"] = checked
-        save_settings(SETTINGS_PATH, self.settings)
+        save_settings(app_paths.SETTINGS_PATH, self.settings)
 
     def _on_backfill_days_changed(self, value):
         self.settings["backfill_target_days"] = value
-        save_settings(SETTINGS_PATH, self.settings)
+        save_settings(app_paths.SETTINGS_PATH, self.settings)
 
     def _refresh_data_freshness_label(self):
         """顯示各類資料「實際擷取到的最新一筆資料日期」，不是「上次按重新整理的
@@ -5348,7 +4863,7 @@ class TradingNoteWindow(QtWidgets.QMainWindow):
         """本地 SQLite 聚合查詢（COUNT／MIN／MAX，非逐列讀取），即使累積到 ~200 天、
         全市場資料量也只是毫秒等級，跟其他分頁的本地資料讀取一樣直接同步呼叫，
         不需要另外開背景執行緒。"""
-        status = get_history_status(HISTORY_DB_PATH)
+        status = get_history_status(app_paths.HISTORY_DB_PATH)
         self.history_status_label.setText(_format_history_status(status))
 
     def closeEvent(self, event):

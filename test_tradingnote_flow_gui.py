@@ -5,6 +5,7 @@ from dataclasses import replace
 from unittest.mock import patch, Mock
 from PySide6 import QtWidgets, QtCore
 import tradingnote_gui as gui
+from ui import app_paths
 import unittest
 import test_tradingnote_flow as fixtures
 from tradingnote_flow import FlowPeriod
@@ -17,10 +18,10 @@ class FlowGuiTests(unittest.TestCase):
     def test_full_window_six_pages_and_revision_refresh(self):
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         with ExitStack() as stack:
-            for name, value in vars(gui).copy().items():
+            for name, value in vars(app_paths).copy().items():
                 if name.endswith('_PATH') and hasattr(value, 'name'):
-                    stack.enter_context(patch.object(gui, name, self.db.parent / value.name))
-            gui.HISTORY_DB_PATH = self.db
+                    stack.enter_context(patch.object(app_paths, name, self.db.parent / value.name))
+            app_paths.HISTORY_DB_PATH = self.db
             stack.enter_context(patch.object(gui, 'load_settings', return_value={'auto_check_continuity': False}))
             stack.enter_context(patch.object(gui, 'load_positions', return_value=[]))
             stack.enter_context(patch.object(gui, 'build_classification_catalog', return_value=Mock(groups=Mock(return_value={'測試族群': {'1111'}}), revision='test', value_chain_scopes=[])))
