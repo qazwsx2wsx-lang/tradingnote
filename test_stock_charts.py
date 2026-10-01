@@ -4,7 +4,7 @@ import unittest
 from PySide6 import QtCore, QtGui, QtWidgets
 from ui.theme import STYLESHEET
 from ui.stock_charts import StockChart, ComparisonWidget, chart_page, LazyTabBuilder
-import tradingnote_gui as gui
+import ui.charts.detail as detail
 
 
 class StockChartTests(unittest.TestCase):
@@ -26,8 +26,8 @@ class StockChartTests(unittest.TestCase):
 
     def test_date_alignment_missing_values_and_axis_switch(self):
         price, margin = StockChart(), StockChart()
-        gui._populate_price_chart(price, [dict(date="2026-09-10", close=100), dict(date="2026-09-14", close=110)])
-        gui._populate_margin_chart(margin, {"dates": ["2026-09-11", "2026-09-14"], "series": {"融資餘額": [20, 25], "融券餘額": [10, 12]}})
+        detail._populate_price_chart(price, [dict(date="2026-09-10", close=100), dict(date="2026-09-14", close=110)])
+        detail._populate_margin_chart(margin, {"dates": ["2026-09-11", "2026-09-14"], "series": {"融資餘額": [20, 25], "融券餘額": [10, 12]}})
         compare = ComparisonWidget()
         compare.resize(900, 500)
         compare.show()
@@ -56,7 +56,7 @@ class StockChartTests(unittest.TestCase):
     def test_click_readout_uses_cumulative_values_and_clears(self):
         chart = StockChart()
         page = chart_page(chart)
-        gui._populate_flow_chart(chart, {"dates": ["2026-09-10", "2026-09-11"], "series": {"外資": [10, -3], "投信": [2, 4]}})
+        detail._populate_flow_chart(chart, {"dates": ["2026-09-10", "2026-09-11"], "series": {"外資": [10, -3], "投信": [2, 4]}})
         page.resize(800, 400)
         page.show()
         self.app.processEvents()
@@ -80,21 +80,21 @@ class StockChartTests(unittest.TestCase):
         產生完全一致的結果，否則延遲分頁時「雙資料比較」會跟其他分頁的資料
         對不起來。"""
         cases = [
-            (gui._populate_price_chart, gui._price_chart_series,
+            (detail._populate_price_chart, detail._price_chart_series,
              [dict(date="2026-09-10", close=100.0), dict(date="2026-09-11", close=102.0)]),
-            (gui._populate_flow_chart, gui._flow_chart_series,
+            (detail._populate_flow_chart, detail._flow_chart_series,
              {"dates": ["2026-09-10", "2026-09-11"], "series": {"外資": [10, -3], "投信": [2, 4]}}),
-            (gui._populate_institutional_detail_chart, gui._institutional_detail_chart_series,
+            (detail._populate_institutional_detail_chart, detail._institutional_detail_chart_series,
              {"dates": ["2026-09-10", "2026-09-11"], "series": {"外資": [10, -3], "投信": [2, 4]}}),
-            (gui._populate_margin_chart, gui._margin_chart_series,
+            (detail._populate_margin_chart, detail._margin_chart_series,
              {"dates": ["2026-09-10", "2026-09-11"], "series": {"融資餘額": [20, 25], "融券餘額": [10, 12]}}),
-            (gui._populate_vpt_chart, gui._vpt_chart_series,
+            (detail._populate_vpt_chart, detail._vpt_chart_series,
              {"dates": ["2026-09-10", "2026-09-11"], "vpt": [5.0, 9.0], "mfi": [40.0, 55.0]}),
-            (gui._populate_mfi_chart, gui._mfi_chart_series,
+            (detail._populate_mfi_chart, detail._mfi_chart_series,
              {"dates": ["2026-09-10", "2026-09-11"], "vpt": [5.0, 9.0], "mfi": [40.0, 55.0]}),
-            (gui._populate_short_sale_balance_chart, gui._short_sale_balance_chart_series,
+            (detail._populate_short_sale_balance_chart, detail._short_sale_balance_chart_series,
              {"dates": ["2026-09-10", "2026-09-11"], "series": {"借券賣出餘額": [300000, 301000]}}),
-            (gui._populate_lending_volume_chart, gui._lending_volume_chart_series,
+            (detail._populate_lending_volume_chart, detail._lending_volume_chart_series,
              {"dates": ["2026-09-10", "2026-09-11"], "series": {"借券成交量": [50, 62]}}),
         ]
         for populate_fn, series_fn, data in cases:
@@ -189,7 +189,7 @@ class DetailChartPanelTests(unittest.TestCase):
         }
 
     def test_only_active_tab_builds_widget_at_construction(self):
-        panel = gui.DetailChartPanel()
+        panel = detail.DetailChartPanel()
         self.assertIsNotNone(panel._chart_states[0]["chart"])  # 歷史股價＝預設分頁
         for state in panel._chart_states[1:]:
             self.assertIsNone(state["chart"])
@@ -198,7 +198,7 @@ class DetailChartPanelTests(unittest.TestCase):
         panel.tabs.close()
 
     def test_comparison_tab_works_without_visiting_other_tabs(self):
-        panel = gui.DetailChartPanel()
+        panel = detail.DetailChartPanel()
         data = self._sample_data(["2026-09-10", "2026-09-11"])
         panel.set_data(data)
         comparison_index = panel.tabs.count() - 1
@@ -217,7 +217,7 @@ class DetailChartPanelTests(unittest.TestCase):
         panel.tabs.close()
 
     def test_reset_repopulates_existing_widget_instead_of_rebuilding(self):
-        panel = gui.DetailChartPanel()
+        panel = detail.DetailChartPanel()
         panel.set_data(self._sample_data(["2026-09-10", "2026-09-11"]))
         flow_index = 1  # 「三大法人」
         panel.tabs.setCurrentIndex(flow_index)
@@ -245,7 +245,7 @@ class DetailChartPanelTests(unittest.TestCase):
         self.chart.addItem()），StockChart.clear() 的 removeItem() 迴圈看不到
         它，永遠不會被移除。這裡驗證切換過幾輪不同單位的資料之後，圖例項目
         數量還是固定 2 個，不會累積殘留。"""
-        panel = gui.DetailChartPanel()
+        panel = detail.DetailChartPanel()
         dates = ["2026-09-10", "2026-09-11"]
         panel.set_data({
             "price_history": [dict(date=d, close=100.0 + i) for i, d in enumerate(dates)],
@@ -269,7 +269,7 @@ class DetailChartPanelTests(unittest.TestCase):
         panel.tabs.close()
 
     def test_clear_shows_empty_state_on_active_tab(self):
-        panel = gui.DetailChartPanel()
+        panel = detail.DetailChartPanel()
         panel.set_data(self._sample_data(["2026-09-10", "2026-09-11"]))
         panel.clear()
         self.assertFalse(panel._chart_states[0]["chart"].dates)

@@ -1,4 +1,4 @@
-"""GUI 共用的小型 widget helper（按鈕、版面清空、螢幕適配尺寸）。"""
+"""GUI 共用的小型 widget helper（按鈕、版面清空、螢幕適配尺寸、對話框基底 DialogBase）。"""
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -69,3 +69,12 @@ def _color_swatch_icon(color, size=10):
     painter.drawEllipse(0, 0, size, size)
     painter.end()
     return QtGui.QIcon(pixmap)
+
+
+class DialogBase(QtWidgets.QDialog):
+    """所有一般對話框的共同基底：標題列加上「放大」按鈕（原本每個對話框各自
+    在 __init__ 第一行設定同一個 window flag）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowMaximizeButtonHint)

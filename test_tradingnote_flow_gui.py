@@ -6,6 +6,8 @@ from unittest.mock import patch, Mock
 from PySide6 import QtWidgets, QtCore
 import tradingnote_gui as gui
 from ui import app_paths
+from ui.dialogs.stock_detail import IndustryTopStocksDialog
+import pyqtgraph as pg
 import unittest
 import test_tradingnote_flow as fixtures
 from tradingnote_flow import FlowPeriod
@@ -47,7 +49,7 @@ class FlowGuiTests(unittest.TestCase):
                 window._refresh_flow_on_revision()
                 self.assertEqual(window.flow_list.topLevelItem(0).text(5), '+142.00%')
                 scatter = next(item for item in window.flow_chart.getPlotItem().items
-                               if isinstance(item, gui.pg.ScatterPlotItem))
+                               if isinstance(item, pg.ScatterPlotItem))
                 self.assertAlmostEqual(scatter.points()[0].pos().x(), 142)
                 window.flow_period = self.period(1)
                 updated_snapshot = {'1111': replace(self.snapshot['1111'], change=21)}
@@ -58,7 +60,7 @@ class FlowGuiTests(unittest.TestCase):
                     window.flow_period = self.period(days)
                     window.refresh_flow_tab()
                     rows = window.flow_service.get_group_top_stocks(self.snapshot, window.flow_period, '測試族群')
-                    dialog = gui.IndustryTopStocksDialog(window, '測試族群', rows, days)
+                    dialog = IndustryTopStocksDialog(window, '測試族群', rows, days)
                     if rows[0]['change_pct'] is not None:
                         table = dialog.findChild(QtWidgets.QTableWidget)
                         self.assertEqual(table.item(0, 3).text(), window.flow_list.topLevelItem(0).text(5))

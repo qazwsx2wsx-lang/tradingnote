@@ -3,7 +3,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import unittest
 
 from tradingnote_technical import calculate_indicators
-from tradingnote_gui import _stock_trend_badges, _chip_momentum_badges
+from ui.badges import _stock_trend_badges, _chip_momentum_badges
 
 
 def _flat_rows(n=100, close=100, volume=1000):

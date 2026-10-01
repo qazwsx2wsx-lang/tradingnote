@@ -36,7 +36,7 @@ from PySide6 import QtGui, QtWidgets
 
 from ui.theme import STYLESHEET
 from ui.stock_charts import StockChart, ComparisonWidget, chart_page
-import tradingnote_gui as gui
+import ui.charts.detail as detail
 from tradingnote_technical import calculate_indicators
 
 REPEATS = 20
@@ -176,22 +176,22 @@ def bench_populate_all(data):
         mfi = StockChart()
         sbl = StockChart()
         lending = StockChart()
-        gui._populate_price_chart(price, data["price_history"])
-        gui._populate_flow_chart(flow, data["institutional_history"])
-        gui._populate_institutional_detail_chart(inst_detail, data["institutional_detail_history"])
-        gui._populate_margin_chart(margin, data["margin_history"])
-        gui._populate_vpt_chart(vpt, data["vpt_mfi_history"])
-        gui._populate_mfi_chart(mfi, data["vpt_mfi_history"])
-        gui._populate_short_sale_balance_chart(sbl, data["sbl_short_balance"])
-        gui._populate_lending_volume_chart(lending, data["lending"])
+        detail._populate_price_chart(price, data["price_history"])
+        detail._populate_flow_chart(flow, data["institutional_history"])
+        detail._populate_institutional_detail_chart(inst_detail, data["institutional_detail_history"])
+        detail._populate_margin_chart(margin, data["margin_history"])
+        detail._populate_vpt_chart(vpt, data["vpt_mfi_history"])
+        detail._populate_mfi_chart(mfi, data["vpt_mfi_history"])
+        detail._populate_short_sale_balance_chart(sbl, data["sbl_short_balance"])
+        detail._populate_lending_volume_chart(lending, data["lending"])
         technical_chart = StockChart()
-        gui._populate_technical_chart(technical_chart, technical_data, "kd")
+        detail._populate_technical_chart(technical_chart, technical_data, "kd")
         comparison = ComparisonWidget()
         comparison.set_sources([
             ("股價", price), ("三大法人累計", flow), ("法人分別累計", inst_detail),
             ("融資融券", margin), ("VPT", vpt), ("MFI", mfi),
             ("借券餘額", sbl), ("借券成交", lending),
-            *gui._technical_comparison_sources(technical_data),
+            *detail._technical_comparison_sources(technical_data),
         ])
         for widget in (price, flow, inst_detail, margin, vpt, mfi, sbl, lending, technical_chart, comparison):
             widget.close()
@@ -217,7 +217,7 @@ def bench_detail_chart_panel(data):
     按下「顯示完整籌碼面資訊」／部位紀錄頁開啟＋選取第一筆部位，目前實際要
     付出的圖表成本。"""
     def build_and_set():
-        panel = gui.DetailChartPanel()
+        panel = detail.DetailChartPanel()
         panel.set_data(data)
         panel.tabs.close()
         panel.tabs.deleteLater()
@@ -230,7 +230,7 @@ def bench_detail_chart_panel_visit_all_tabs(data):
     互相對照：兩者理論上應該收斂到差不多的量級（因為到最後全部分頁都建立
     過了），差別只在於「使用者實際會不會切到每一分頁」。"""
     def build_and_visit_all():
-        panel = gui.DetailChartPanel()
+        panel = detail.DetailChartPanel()
         panel.set_data(data)
         for i in range(panel.tabs.count()):
             panel.tabs.setCurrentIndex(i)
