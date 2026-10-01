@@ -16,7 +16,7 @@ snapshot／本地 DB 等一整套應用程式狀態，不適合放進輕量基�
 環境下重跑都拿到同樣量級的數字，可重複比對。
 
 用法：
-    python bench_chart_loading.py [label]
+    python tools/bench_chart_loading.py [label]
 
 輸出：印一份人類可讀報表到 stdout，並把原始數字存成
 bench_results_<label>.json（預設 label 是 "latest"）；重新量測後可以跟先前
@@ -29,6 +29,8 @@ import sys
 import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import _bootstrap  # noqa: F401
 
 from PySide6 import QtGui, QtWidgets
 

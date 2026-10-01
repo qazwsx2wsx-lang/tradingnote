@@ -10,13 +10,14 @@ import sqlite3
 from collections import defaultdict
 from pathlib import Path
 
+import _bootstrap  # noqa: F401
 from tradingnote_history import INDUSTRY_CODE_NAMES
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "data" / "history.db"
 CONCEPTS_PATH = ROOT / "concepts.json"
-OUTPUT_PATH = ROOT / "CONCEPT.MD"
+OUTPUT_PATH = ROOT / "docs" / "CONCEPT.MD"
 MARKET_LABELS = {"TWSE": "上市", "TPEX": "上櫃"}
 INDUSTRY_ORDER = {
     name: index for index, name in enumerate(INDUSTRY_CODE_NAMES.values())
@@ -229,8 +230,8 @@ def render_document(directory, concepts):
             "先在 TradingNote 內更新產業資料，再於專案根目錄執行：",
             "",
             "```powershell",
-            ".\\.venv\\Scripts\\python.exe .\\refresh_concepts.py --write",
-            ".\\.venv\\Scripts\\python.exe .\\generate_concept_md.py",
+            ".\\.venv\\Scripts\\python.exe .\\tools\\refresh_concepts.py --write",
+            ".\\.venv\\Scripts\\python.exe .\\tools\\generate_concept_md.py",
             "```",
             "",
             "更新器只有在所有個股都至少有一個分類，且沒有未知代號或重複概念名稱時才會寫入。",

@@ -81,8 +81,12 @@ tradingnote/
 ├── tradingnote_api_config.py   # 核心：集中 TWSE/TPEx/FinMind/TAIFEX 端點網址（2026-09-15 新增）
 ├── tradingnote_paths.py        # 核心：CLI／GUI 共用的檔案路徑（AppPaths／APP_PATHS）
 ├── tradingnote_tasks.py        # 核心：GUI 背景執行緒任務共用 helper
-├── refresh_concepts.py         # 獨立腳本：從官方資料重建 concepts.json
-├── generate_concept_md.py      # 獨立腳本：產生概念股說明文件
+├── tools/                       # 開發／維護用獨立腳本（不屬於 app 本體）
+│   ├── refresh_concepts.py      # 從官方資料重建 concepts.json
+│   ├── generate_concept_md.py   # 產生 docs/CONCEPT.MD 概念股說明文件
+│   ├── bench_chart_loading.py   # 圖表建立效能基準
+│   └── claude.bat               # Windows：在專案根目錄開 Claude Code
+├── docs/                        # CONCEPT.MD（自動產生）、GEMINI.md（FinMind API 參考）
 ├── tradingnote.py               # CLI（無「個股」「期貨」模組對應指令）
 ├── tradingnote_gui.py           # GUI：PySide6 + pyqtgraph，左側導覽列＋頁面堆疊（正在拆分，見下方「GUI Design System 重構」）
 ├── ui/                           # GUI design system + reusable components（2026-09-15 新增，進行中）
@@ -147,7 +151,7 @@ user 提出完整規格：把 `tradingnote_gui.py` 拆成 `ui/theme.py`＋`ui/co
 除非之後發現還有必要。完整計畫見
 `C:\Users\Evan\.claude\plans\read-tradingnote-handoff-md-virtual-hopcroft.md`。
 
-**第一階段（效能基準）**：新增 `bench_chart_loading.py`（repo 根目錄，
+**第一階段（效能基準）**：新增 `bench_chart_loading.py`（現已移到 `tools/`，
 `QT_QPA_PLATFORM=offscreen`＋合成資料，不打任何 API）。量到「個股完整籌碼」
 ／「部位紀錄」詳細資訊當時都是一次建立＋populate 全部 8 張明細圖＋技術分析＋
 雙資料比較（共 10 個 `StockChart` 實例），`PositionRecordPage`（其實是
@@ -192,7 +196,7 @@ widget、切分頁不重建、`reset()` 後已建立的 widget 只重新 populat
 最大：原本不管有沒有選部位都要付出約 335ms 建立全部 10 張圖，現在只有真的
 被選取、且使用者切到的分頁才建立。原始數字存在 `bench_results_baseline.json`
 ／`bench_results_after_phase3.json`（未進 git，重跑
-`python bench_chart_loading.py <label>` 會覆寫/新增同名檔案）。
+`python tools/bench_chart_loading.py <label>` 會覆寫/新增同名檔案）。
 
 **未做（誠實揭露）**：沒有在這個環境用滑鼠實際操作驗證主觀「順不順」，改用
 offscreen 腳本斷言＋一次性 smoke script 確認接線正確；`PositionRecordPage`

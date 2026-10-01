@@ -22,11 +22,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
+import _bootstrap  # noqa: F401
 from tradingnote_api_config import TPEX_CHAIN_ROOT_URL as CHAIN_ROOT_URL
 from tradingnote_history import INDUSTRY_CODE_NAMES
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "data" / "history.db"
 CONCEPTS_PATH = ROOT / "concepts.json"
 USER_AGENT = "Mozilla/5.0 (compatible; TradingNote concept catalog updater)"
