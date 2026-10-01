@@ -1,7 +1,17 @@
 # tradingnote 現況（STATUS.md）
 
-## 必讀簡介（2026-09-28）
-- 工作目錄乾淨。HEAD 已經包含 9/26「法人資金流去哪？」（`96b655a`）＋本次 tzdata／測試隔離修正。
+## 必讀簡介（2026-10-01）
+- 分支 `refactor/gui-split`（尚未合併回 `main`、尚未 push）：結構整理，**純搬移、不改行為**。
+- **Claude（2026-10-01，GUI 拆檔＋repo 整理）**：`tradingnote_gui.py` 從 5,421 行拆到約 470 行，
+  只剩 `TradingNoteWindow` 外殼（導覽、頁面堆疊、狀態列、新資料提示、全域重新整理）＋`main()`。
+  其餘搬到 `ui/`：`widgets.py`（含新的 `DialogBase`）／`format.py`／`badges.py`／`workers.py`／
+  `app_paths.py`／`charts/`／`dialogs/`／`tabs/`（六個分頁各一個 mixin，透過多重繼承併入視窗）。
+  **資料檔路徑**一律寫 `app_paths.HISTORY_DB_PATH`（呼叫當下讀屬性），測試只要 patch `ui.app_paths`；
+  不要 `from ui.app_paths import HISTORY_DB_PATH`。找某個函式在哪：`grep -rn "def 名稱" ui/ tradingnote_gui.py`。
+  另外：維護腳本移到 `tools/`、`CONCEPT.MD`／`GEMINI.md` 移到 `docs/`，刪掉推薦信 .docx 與 `HANDOFF.md`。
+  驗證：每一步都跑完整 `discover`（77 題，只剩既有的 `test_tradingnote_flow_gui` 1 個失敗），另外用 AST
+  比對確認 170 個搬移的函式／類別／方法跟原版逐一相同。**未做**：沒有實機開 GUI 點過每個分頁。
+  詳見 `CHANGELOG.md` 2026-10-01。
 - **Claude（2026-09-28，Windows tzdata 依賴缺漏＋測試跨檔污染）**：
   `.venv` 補裝 `tzdata`（`requirements.txt` 新增 `tzdata; sys_platform == "win32"`）——
   Windows 沒有內建 IANA 時區資料庫，`tradingnote_institutional_history.py` 模組層級的
@@ -88,11 +98,19 @@ tradingnote/
 │   └── claude.bat               # Windows：在專案根目錄開 Claude Code
 ├── docs/                        # CONCEPT.MD（自動產生）、GEMINI.md（FinMind API 參考）
 ├── tradingnote.py               # CLI（無「個股」「期貨」模組對應指令）
-├── tradingnote_gui.py           # GUI：PySide6 + pyqtgraph，左側導覽列＋頁面堆疊（正在拆分，見下方「GUI Design System 重構」）
+├── tradingnote_gui.py           # GUI 進入點：TradingNoteWindow 外殼（導覽／頁面堆疊／狀態列）＋ main()
 ├── ui/                           # GUI design system + reusable components（2026-09-15 新增，進行中）
 │   ├── pages/institutional_flow_page.py # 「法人資金流去哪？」頁（2026-09-26）
+│   ├── tabs/                    # 其餘六個分頁的 TradingNoteWindow mixin（flow／stocks／positions／journal／futures／settings）
+│   ├── dialogs/                 # progress／positions／stock_detail／futures／trading_date 對話框
+│   ├── charts/                  # flow_chart.py（泡泡圖、法人方向圖）、detail.py（個股 8 張籌碼圖＋技術分析＋DetailChartPanel）
+│   ├── stock_charts.py          # StockChart／ComparisonWidget／LazyTabBuilder 圖表基礎元件
+│   ├── app_paths.py             # GUI 用的 data/ 檔案路徑（以 app_paths.X 存取，測試從這裡覆寫）
+│   ├── widgets.py               # accent_button／版面清空／螢幕適配尺寸／DialogBase
+│   ├── badges.py                # 趨勢／籌碼徽章與資金流向洞察文字
+│   ├── workers.py               # 回補／重新整理／啟動預載的背景流程
 │   ├── theme.py                 # 顏色／字型／全域 QSS token（含 dark mode、TONE_COLORS）
-│   ├── format.py                # gain_loss_color() 等顯示用格式化 helper
+│   ├── format.py                # gain_loss_color()、金額／日期格式化等顯示用 helper
 │   └── components/
 │       ├── stat_card.py         # StatCard(title/value/unit/change/status)
 │       ├── signal_badge.py      # SignalBadge(text, tone)
@@ -135,13 +153,13 @@ user 提出完整規格：把 `tradingnote_gui.py` 拆成 `ui/theme.py`＋`ui/co
 - `assets/chevron-down-dark.svg`／`chevron-up-dark.svg`：下拉選單箭頭原本是給淺色底設計的深色描邊，深色底下會看不清楚，新增了淺色描邊版本。
 - `ui/components/signal_badge.py`（`SignalBadge`，tone=positive/negative/info/warning/special/neutral，色彩對照表在 `ui/theme.py` 的 `TONE_COLORS`，`InsightCard` 共用同一份）。用法：「資金流向」分頁泡泡圖圖例（偏流入/偏流出/中性三個徽章，取代原本一句話說明顏色）。
 - `ui/components/section_card.py`（`SectionCard`，標題＋描述＋`body_layout` 讓呼叫端塞內容，沿用 `summaryCard` 卡片樣式）。用法：「法人方向」子頁整個包進一張卡（原本是頁面上直接鋪標題+提示+三張圖，沒有卡片邊界）。
-- `ui/components/insight_card.py`（`InsightCard`，headline＋detail，rule-based 不接 LLM）。用法：`tradingnote_gui._flow_momentum_insight()`——從族群資金流向資料（量比≥1.5 且當日漲跌 |%|≥0.5 才夠格參與）挑出當天最極端的一筆量價訊號，生成一句話（例如「資金動能增強：{族群}今日成交量為近期均量的X倍，且價格同步走強」），沒有夠格的族群時顯示中性的「暫無明顯資金訊號」，不留白。放在「資金流向」分頁 StatCard 下方。
+- `ui/components/insight_card.py`（`InsightCard`，headline＋detail，rule-based 不接 LLM）。用法：`ui/badges.py` 的 `_flow_momentum_insight()`——從族群資金流向資料（量比≥1.5 且當日漲跌 |%|≥0.5 才夠格參與）挑出當天最極端的一筆量價訊號，生成一句話（例如「資金動能增強：{族群}今日成交量為近期均量的X倍，且價格同步走強」），沒有夠格的族群時顯示中性的「暫無明顯資金訊號」，不留白。放在「資金流向」分頁 StatCard 下方。
 - **正綠負紅→正紅負綠**（2026-09-15 續7，已拍板並套用）：`COLOR_GAIN`/`COLOR_LOSS`（含對應的 `_TINT`）兩組 hex 直接對調，改成台灣市場「漲紅跌綠」慣例。因為所有呼叫端都是透過 `gain_loss_color()`／常數名稱取色，不是寫死 RGB，這次全部自動套用到全部畫面（個股漲跌、三大法人買賣超、大額交易人淨部位、資金流向徽章、泡泡圖四象限），沒有另外改任何呼叫端程式碼。
-- **`SignalBadge` 推廣到「個股概覽」**（2026-09-15 續8／續9；2026-09-23 加量價背離＋籌碼徽章）：`tradingnote_gui._stock_trend_badges()` 解讀既有本地技術指標（`tradingnote_technical.calculate_indicators`，MA20／RSI(14)／量比 20），並交叉判斷第 4 個「量價背離」標籤，沒有新增指標計算，資料不足時顯示一致的「歷史資料不足...」空狀態文字。用在兩處：(1) `StockDetailDialog`（雙擊個股彈出的視窗）hero 下方；(2)「個股查詢」分頁右側 `stock_preview` 摘要面板，選取清單項目時即時更新。兩處共用 `_populate_badge_row()`／`_clear_layout()` 兩個 helper，不是各自重複一份 build/clear 邏輯（`_populate_badge_row` 原名 `_populate_trend_badge_row`，2026-09-23 改成接受已算好的 badges 列表，讓 `_chip_momentum_badges()` 也能共用同一個 render helper）。`StockDetailDialog` 另外新增 `chip_row`，顯示 `_chip_momentum_badges()`（籌碼方向同步分數／連買連賣天數／融資餘額變化），資料來自既有的 background fetch，沒有 FinMind token 時顯示空狀態。
+- **`SignalBadge` 推廣到「個股概覽」**（2026-09-15 續8／續9；2026-09-23 加量價背離＋籌碼徽章）：`ui/badges.py` 的 `_stock_trend_badges()` 解讀既有本地技術指標（`tradingnote_technical.calculate_indicators`，MA20／RSI(14)／量比 20），並交叉判斷第 4 個「量價背離」標籤，沒有新增指標計算，資料不足時顯示一致的「歷史資料不足...」空狀態文字。用在兩處：(1) `StockDetailDialog`（雙擊個股彈出的視窗）hero 下方；(2)「個股查詢」分頁右側 `stock_preview` 摘要面板，選取清單項目時即時更新。兩處共用 `_populate_badge_row()`／`_clear_layout()` 兩個 helper，不是各自重複一份 build/clear 邏輯（`_populate_badge_row` 原名 `_populate_trend_badge_row`，2026-09-23 改成接受已算好的 badges 列表，讓 `_chip_momentum_badges()` 也能共用同一個 render helper）。`StockDetailDialog` 另外新增 `chip_row`，顯示 `_chip_momentum_badges()`（籌碼方向同步分數／連買連賣天數／融資餘額變化），資料來自既有的 background fetch，沒有 FinMind token 時顯示空狀態。
 
 **還沒做**（下一輪候選，任選其一即可，不用照順序）：
 - `SectionCard`／`InsightCard` 目前都只各用在一處，還沒推廣到其他頁面。
-- 泡泡圖／VPT／MFI／融資融券等 pyqtgraph 圖表系列色（`tradingnote_gui.py` 裡還有一批 `#1f77b4`／`#2ca02c` 之類的分類色，屬於資料序列配色，不是介面底色，這次刻意沒動）。
+- 泡泡圖／VPT／MFI／融資融券等 pyqtgraph 圖表系列色（`ui/charts/` 裡還有一批 `#1f77b4`／`#2ca02c` 之類的分類色，屬於資料序列配色，不是介面底色，這次刻意沒動）。
 - Sidebar 分組（市場／分析／交易／資料）、Dashboard／個股頁的 progressive disclosure 重做——規格中風險較高、影響面較大的部分，建議等 component 庫更完整再做。
 
 ## 圖表架構統整：第一~三階段（2026-09-17，已完成，暫停在此重新評估）
@@ -210,5 +228,5 @@ offscreen 腳本斷言＋一次性 smoke script 確認接線正確；`PositionRe
 ## 如果要繼續開發，建議先讀
 1. 這份 `STATUS.md`（現況最新）
 2. `ARCHITECTURE.md`（模組邊界、依賴方向、資料流、跨模組共用慣例——2026-09-15 已重寫）
-3. `tradingnote_gui.py`（GUI 全貌）
+3. `tradingnote_gui.py`（視窗外殼與進入點）＋ `ui/tabs/`（各分頁實作）
 4. 需要某個功能當初為什麼這樣做、驗證過什麼：`CHANGELOG.md`（按日期找對應條目）

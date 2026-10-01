@@ -6,41 +6,52 @@ import gc
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
+from tradingnote_cache import TTLCache
+from tradingnote_concepts import build_classification_catalog, build_ticker_concept_map, load_concepts
 from tradingnote_core import (
     get_market_snapshot,
     load_positions,
     load_settings,
     snapshot_staleness_warnings,
 )
-from tradingnote_concepts import build_classification_catalog, build_ticker_concept_map, load_concepts
 from tradingnote_flow import FlowAnalysisService
-from tradingnote_cache import TTLCache
-from tradingnote_tasks import wait_for_background_tasks
 from tradingnote_journal import initialize_journal
+from tradingnote_tasks import wait_for_background_tasks
+
+from ui import app_paths
+from ui.dialogs.progress import RefreshDialog, StartupProgressDialog
+from ui.format import _format_fetched_at, _snapshot_date
+from ui.pages.institutional_flow_page import InstitutionalFlowPage
+from ui.tabs.flow_tab import FlowTabMixin
+from ui.tabs.futures_tab import FuturesTabMixin
+from ui.tabs.journal_tab import JournalTabMixin
+from ui.tabs.positions_tab import PositionsTabMixin
+from ui.tabs.settings_tab import SettingsTabMixin
+from ui.tabs.stocks_tab import StocksTabMixin
+from ui.theme import COLOR_SURFACE, COLOR_TEXT, STYLESHEET
+from ui.widgets import _center_on_screen, _screen_fit_size, _set_standard_icon
+from ui.workers import run_startup_preload_in_thread, run_task_in_thread
 
 # 背景檢查「今天的資料是否已發布」的輪詢間隔。get_market_snapshot 本身有 30 分鐘
 # 快取（tradingnote_core.CACHE_TTL_SECONDS），所以就算這裡設得比 30 分鐘短，實際
 # 打 TWSE／TPEX 的頻率仍受快取保護，不會因為輪詢變密就增加對外部 API 的負擔。
 NEW_DATA_CHECK_INTERVAL_MS = 5 * 60 * 1000
 
-# 視覺主題常數與全域 QSS 已搬到 ui/theme.py（2026-09-15，見 ARCHITECTURE.md／
-# STATUS.md）；這裡改用 import，內容不變，往後要調色只改 ui/theme.py 一處。
-from ui.theme import COLOR_SURFACE, COLOR_TEXT, STYLESHEET  # noqa: E402
-from ui.pages.institutional_flow_page import InstitutionalFlowPage  # noqa: E402
-from ui import app_paths
-from ui.format import _snapshot_date, _format_fetched_at
-from ui.widgets import _set_standard_icon, _screen_fit_size, _center_on_screen
-from ui.workers import run_task_in_thread, run_startup_preload_in_thread
-from ui.dialogs.progress import StartupProgressDialog, RefreshDialog
-from ui.tabs.settings_tab import SettingsTabMixin
-from ui.tabs.futures_tab import FuturesTabMixin
-from ui.tabs.journal_tab import JournalTabMixin
-from ui.tabs.positions_tab import PositionsTabMixin
-from ui.tabs.stocks_tab import StocksTabMixin
-from ui.tabs.flow_tab import FlowTabMixin
 
+class TradingNoteWindow(
+    FlowTabMixin,
+    StocksTabMixin,
+    PositionsTabMixin,
+    JournalTabMixin,
+    FuturesTabMixin,
+    SettingsTabMixin,
+    QtWidgets.QMainWindow,
+):
+    """主視窗外殼：左側導覽、頁面堆疊、狀態列、「有新資料」提示與全域重新整理。
 
-class TradingNoteWindow(FlowTabMixin, StocksTabMixin, PositionsTabMixin, JournalTabMixin, FuturesTabMixin, SettingsTabMixin, QtWidgets.QMainWindow):
+    各分頁的建立／刷新／事件處理放在 ui/tabs/*_tab.py 的 mixin 裡，
+    透過多重繼承併入；mixin 方法直接共用這個視窗的 self 狀態。"""
+
     def __init__(self, snapshot, last_error):
         """snapshot／last_error 由 main() 的啟動前置作業（run_startup_preload_in_thread）
         算好傳入——報價抓取、寫入歷史資料庫、產業分類更新這三個會連網／連DB的步驟

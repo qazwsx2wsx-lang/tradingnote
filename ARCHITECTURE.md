@@ -12,7 +12,7 @@
 
 核心模組（部位模型、API 呼叫、SQLite、計算邏輯）完全不 import 任何 UI 套件、不依賴 `PySide6`；CLI（`tradingnote.py`）與 GUI（`tradingnote_gui.py`）各自 import 同一批核心模組，各自實作顯示與互動方式。這個原則從專案一開始（Tkinter 版）就存在，換成 PySide6 + pyqtgraph 之後依然成立——只有介面層換了套件，核心層完全沒被影響。
 
-**依賴**：核心模組（`tradingnote_core.py`／`tradingnote_history.py`／`tradingnote_institutional.py`／`tradingnote_finmind.py`／`tradingnote_taifex.py`／`tradingnote_technical.py`／`tradingnote_journal.py`／`tradingnote_concepts.py`／`tradingnote_http.py`／`tradingnote_cache.py`／`tradingnote_paths.py`／`tradingnote_api_config.py`）與 CLI 全部零外部依賴（純 stdlib：`urllib`／`sqlite3`／`json`）。只有 `tradingnote_gui.py` 跟 `tradingnote_tasks.py`（GUI 專用的背景執行緒 helper）需要 `PySide6`＋`pyqtgraph`。
+**依賴**：核心模組（`tradingnote_core.py`／`tradingnote_history.py`／`tradingnote_institutional.py`／`tradingnote_finmind.py`／`tradingnote_taifex.py`／`tradingnote_technical.py`／`tradingnote_journal.py`／`tradingnote_concepts.py`／`tradingnote_http.py`／`tradingnote_cache.py`／`tradingnote_paths.py`／`tradingnote_api_config.py`）與 CLI 全部零外部依賴（純 stdlib：`urllib`／`sqlite3`／`json`）。只有 `tradingnote_gui.py`、`ui/` 套件跟 `tradingnote_tasks.py`（GUI 專用的背景執行緒 helper）需要 `PySide6`＋`pyqtgraph`。
 
 **執行環境**：專案在自己的 `.venv` 裡跑（Windows 上是 `.venv/Scripts/python.exe`，之前 macOS 上是 Homebrew `python3.12`）。**不要用系統內建的 `python`**——實測系統 Python 3.14 對 TLS 憑證鏈驗證變嚴格，TWSE／TPEX 的憑證缺少 Subject Key Identifier 擴充欄位會導致 `SSL: CERTIFICATE_VERIFY_FAILED`，這不是 API 本身的問題，只有用專案 `.venv`（3.12.10）才會穩定成功。
 
@@ -47,7 +47,8 @@
         ▼
 介面層（各自 import 上面所有需要的核心模組）
   tradingnote.py       CLI
-  tradingnote_gui.py   GUI（唯一 import tradingnote_tasks.py 的地方）
+  tradingnote_gui.py   GUI 進入點：TradingNoteWindow 外殼＋main()
+  ui/                  GUI 實作（tabs／dialogs／charts／components／pages），只有介面層會 import tradingnote_tasks.py
   scripts/*.py         排程／回補腳本（backfill、fetch_daily、recompute）
   ui/pages/            GUI 頁面（目前只有「法人資金流去哪？」），只查核心模組預先算好的資料、不做計算
 ```
@@ -79,7 +80,10 @@
 
 ### 介面層
 - **`tradingnote.py`**（CLI）：文字介面，目前沒有「個股」「期貨」模組的對應指令（那兩個核心模組只有 GUI 在用）。
-- **`tradingnote_gui.py`**（約 4700 行，全專案最大檔案）：PySide6 主視窗，左側導覽列（2026-09-14 從上方分頁改版）+ 右側 `QStackedWidget`，六個分頁：資金流向分析（含法人方向子頁）、部位紀錄、交易週誌、個股查詢、期貨行情、設定。目前是最需要持續拆分/去重的檔案，見「已知架構債務」。
+- **`tradingnote_gui.py`**（約 470 行，2026-10-01 拆檔後）：只放 `TradingNoteWindow` 外殼＋`main()`。各分頁的方法放在 `ui/tabs/*_tab.py` 的 mixin（`FlowTabMixin`／`StocksTabMixin`／…），透過多重繼承併入視窗——選 mixin 而不是獨立 page widget，是因為這些方法大量共用視窗的 `self` 狀態，mixin 可以零行為改動地搬出來；之後要改成像 `ui/pages/institutional_flow_page.py` 那樣的獨立頁面，可以一頁一頁做。
+  - **`ui/` 依賴方向**：`tradingnote_gui` → `ui/tabs` → `ui/dialogs` → `ui/charts` → `ui/widgets`／`ui/format`／`ui/badges`／`ui/workers`／`ui/theme`。`ui/*` 一律不 import `tradingnote_gui`（避免循環）。
+  - **資料檔路徑**：GUI 程式碼一律寫 `app_paths.HISTORY_DB_PATH`（`from ui import app_paths`，呼叫當下讀模組屬性），不要 `from ui.app_paths import HISTORY_DB_PATH`——測試靠覆寫 `ui.app_paths` 的屬性隔離資料，直接 import 名稱會讓覆寫失效。
+  - 視窗外觀：左側導覽列（2026-09-14 從上方分頁改版）+ 右側 `QStackedWidget`，六個分頁：資金流向分析（含法人方向子頁）、部位紀錄、交易週誌、個股查詢、期貨行情、設定。目前是最需要持續拆分/去重的檔案，見「已知架構債務」。
 
 ---
 
@@ -120,8 +124,8 @@
 
 （2026-09-15 架構審查發現，尚未處理——找得到就直接修，不用等這份文件更新）
 
-- `tradingnote_gui.py` 內 9 個 `QDialog` 子類別重複視窗樣板碼（放大鈕 flag + 螢幕適配尺寸），沒有共用 base class。
-- 紅綠漲跌上色邏輯（`value >= 0 ? 綠 : 紅`）在 `tradingnote_gui.py` 裡重複了十幾次，沒有共用 helper。
+- ~~9 個 `QDialog` 子類別重複放大鈕 flag~~：2026-10-01 已改繼承 `ui/widgets.DialogBase`。螢幕適配尺寸（`_screen_fit_size`＋`_center_on_screen`）各對話框參數不同，仍各自呼叫。
+- 紅綠漲跌上色邏輯（`value >= 0 ? 綠 : 紅`）在 GUI 程式碼（現已分散到 `ui/`）裡重複了十幾次，沒有共用 helper。
 - `tradingnote_history.py` 內至少 5 個函式（`compute_group_flow`／`compute_group_valuation_flow`／`get_group_top_stocks_range` 等）各自重寫「載入 N 天歷史 + 算 cutoff 日期」的 SQL 查詢邏輯。
 - `tradingnote_institutional._http_get_json_retry()` 自己包一層重試，`tradingnote_http.http_get_json()` 本身沒有重試選項——不一致，其他打大型 JSON 端點的模組（history／finmind／taifex）完全沒重試。
 - `tradingnote_technical._number()` 跟 `tradingnote_http.to_float()` 邏輯幾乎一樣（多一個 `math.isfinite` 檢查），可以合併。

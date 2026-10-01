@@ -6,6 +6,43 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 
 ---
 
+## 2026-10-01 結構整理：拆 tradingnote_gui.py、整理 repo 根目錄
+
+**動機**：`tradingnote_gui.py` 5,421 行（helper、10 個對話框、約 40 個圖表函式、約 100 個方法的
+`TradingNoteWindow`）是 ARCHITECTURE.md 列的頭號架構債務；每個新功能都改同一個檔案，diff／review／
+Claude 與 Codex 交接成本都高。repo 根目錄另外混著跟專案無關的個人檔案（推薦信 .docx）與已停用的 `HANDOFF.md`。
+
+**改法**（分支 `refactor/gui-split`，每一步一個 commit，純搬移不改行為）：
+1. repo 整理：刪 `Recommendation_Letter_*.docx`×3、`HANDOFF.md`（AGENTS.md 改指向 STATUS.md／CHANGELOG.md）；
+   `CONCEPT.MD`／`GEMINI.md` → `docs/`；`refresh_concepts.py`／`generate_concept_md.py`／`bench_chart_loading.py`／
+   `claude.bat` → `tools/`（加 `tools/_bootstrap.py`，同 `scripts/` 的做法；`generate_concept_md.py` 輸出改到
+   `docs/CONCEPT.MD`；`claude.bat` 改 `cd` 到上一層）。
+2. 葉節點 helper → `ui/widgets.py`／`ui/format.py`／`ui/badges.py`／`ui/workers.py`；`data/` 路徑常數 →
+   `ui/app_paths.py`，所有用到的地方改寫成 `app_paths.X`（呼叫當下讀屬性）。
+3. 圖表 → `ui/charts/flow_chart.py`、`ui/charts/detail.py`。
+4. 對話框 → `ui/dialogs/*.py`；9 個對話框改繼承新的 `ui/widgets.DialogBase`（放大鈕 flag 收成一處）。
+5. `TradingNoteWindow` 的六個分頁 → `ui/tabs/*_tab.py` mixin（settings、futures、journal、positions、stocks、
+   flow 各一個 commit）。`COLUMNS` 跟著搬到 `positions_tab.py`、`FUTURES_COLUMNS` 等類別屬性跟著期貨 mixin。
+
+搬移用一支一次性腳本做（依 AST 切出定義、依原檔全域名稱自動產生每個新模組的 import），不是手動剪貼。
+測試只改 import／patch 目標，assertion 沒動：`test_stock_charts.py` 改 import `ui.charts.detail`、
+`test_tradingnote_chip_badges.py` 改 import `ui.badges`、兩個 GUI 測試改覆寫 `ui.app_paths`，
+`test_tradingnote_flow_gui.py` 新增 `_patch_gui_name()`，把同一個函式在 `tradingnote_gui` 與所有 `ui.*`
+模組裡的參照一起 patch。
+
+**驗證**：
+- 每一步都跑完整 `discover`：77 題，結果跟拆檔前完全相同（只剩既有的 `test_tradingnote_flow_gui`
+  `flow_list.topLevelItem(0)` 為 None 那 1 個失敗）。
+- pyflakes（裝在暫存目錄，沒有加進 requirements）對 `tradingnote_gui.py`＋`ui/` 零警告。
+- 拿原始 `tradingnote_gui.py`（`128e204`）跟拆檔後逐一比對 170 個函式／類別／視窗方法的 AST：除了
+  `X_PATH`→`app_paths.X_PATH` 與 `DialogBase` 兩項刻意改動外完全一致；`TradingNoteWindow` 的方法集合沒有多也沒有少。
+- `tools/bench_chart_loading.py` 拆檔後可正常跑，數字跟先前同量級。
+
+**未做**：沒有實機開 GUI 逐頁點擊驗證（測試只涵蓋視窗建立＋部分頁面）；mixin 還沒改成獨立 page widget；
+`_` 前綴的函式名稱跨模組 import 後語意上已不是「私有」，這次刻意不改名，避免一次動太多。
+
+---
+
 ## 2026-09-28 修 Windows tzdata 依賴缺漏＋測試跨檔污染（journal_gui 卡片高度）
 
 **動機**：pull 完 9/26 的法人歷史功能後在 Windows 上跑測試套件，`tradingnote_institutional_history.py`
