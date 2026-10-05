@@ -1,7 +1,7 @@
 # tradingnote 現況（STATUS.md）
 
 ## 必讀簡介（2026-10-01）
-- 分支 `refactor/gui-split`（尚未合併回 `main`、尚未 push）：結構整理，**純搬移、不改行為**。
+- `refactor/gui-split` 已 fast-forward 合併進 `main`（2026-10-05，尚未 push 到 origin）：結構整理，**純搬移、不改行為**。
 - **Claude（2026-10-01，GUI 拆檔＋repo 整理）**：`tradingnote_gui.py` 從 5,421 行拆到約 470 行，
   只剩 `TradingNoteWindow` 外殼（導覽、頁面堆疊、狀態列、新資料提示、全域重新整理）＋`main()`。
   其餘搬到 `ui/`：`widgets.py`（含新的 `DialogBase`）／`format.py`／`badges.py`／`workers.py`／
