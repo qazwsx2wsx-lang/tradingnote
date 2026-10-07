@@ -1,7 +1,10 @@
 # tradingnote 現況（STATUS.md）
 
-## 必讀簡介（2026-10-01）
-- `refactor/gui-split` 已 fast-forward 合併進 `main`（2026-10-05，尚未 push 到 origin）：結構整理，**純搬移、不改行為**。
+## 必讀簡介（2026-10-07）
+- git：`main` 與 `origin/main` 同步（2026-10-07），無未 commit 異動。
+- `refactor/gui-split` 已 fast-forward 合併進 `main` 並已 push（2026-10-05）：結構整理，**純搬移、不改行為**。
+- 既有測試失敗：`test_tradingnote_flow_gui`（疑似跟當天日期／價格資料天數有關，另有暫存 `history.db` 被鎖住刪不掉），
+  `test_tradingnote_tasks` 的 force-exit 測試偶發失敗（時序相關，flaky）。
 - **Claude（2026-10-01，GUI 拆檔＋repo 整理）**：`tradingnote_gui.py` 從 5,421 行拆到約 470 行，
   只剩 `TradingNoteWindow` 外殼（導覽、頁面堆疊、狀態列、新資料提示、全域重新整理）＋`main()`。
   其餘搬到 `ui/`：`widgets.py`（含新的 `DialogBase`）／`format.py`／`badges.py`／`workers.py`／
