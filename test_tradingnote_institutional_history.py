@@ -275,6 +275,35 @@ class BackfillSkipTests(unittest.TestCase):
             # 第二次：已完成日期與已知假日都不再打 API，只補更早的 9/18（9/19、9/20 是週末）
             self.assertEqual(calls, [date(2026, 9, 18)])
 
+    def test_failed_fetch_is_reported_via_failures(self):
+        from tradingnote_http import PriceFetchError
+
+        def fake_fetch(db_path, day, delay, log):
+            if day == date(2026, 9, 23):
+                raise PriceFetchError("HTTP 308")
+            return False
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(ih, "fetch_day", fake_fetch), \
+                patch.object(ih, "taipei_today", return_value=date(2026, 9, 25)):
+            failures = []
+            written = ih.backfill(Path(tmp) / "history.db", target_days=2,
+                                  end_date=date(2026, 9, 24), log=lambda *_: None,
+                                  failures=failures)
+        self.assertEqual(written, [])
+        self.assertEqual(failures, ["2026-09-23"])
+
+
+class UpdateSummaryTests(unittest.TestCase):
+    def test_distinguishes_failure_from_up_to_date(self):
+        from ui.pages.institutional_flow_page import _update_summary
+        self.assertEqual(_update_summary([], []), "已是最新（或今日資料尚未公布）")
+        self.assertEqual(_update_summary(["2026-10-08"], []), "已更新 1 個交易日")
+        text = _update_summary([], ["2026-10-07", "2026-10-08"])
+        self.assertIn("2 天抓取失敗", text)
+        self.assertIn("2026-10-08", text)
+        self.assertIn("已更新 1 個交易日", _update_summary(["2026-10-06"], ["2026-10-07"]))
+
 
 if __name__ == "__main__":
     unittest.main()

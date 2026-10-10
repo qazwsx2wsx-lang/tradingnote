@@ -277,6 +277,18 @@ class SectorDetailDialog(QtWidgets.QDialog):
         self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
 
 
+def _update_summary(written, failures):
+    """更新完成後的狀態列文字；把「抓失敗」和「真的沒有新資料」分開講。"""
+    parts = [f"已更新 {len(written)} 個交易日" if written else "沒有新增資料"]
+    if failures:
+        parts.append(
+            f"{len(failures)} 天抓取失敗（最近：{max(failures)}），"
+            "可能被證交所／櫃買暫時擋住，稍後再按更新")
+    elif not written:
+        parts = ["已是最新（或今日資料尚未公布）"]
+    return "；".join(parts)
+
+
 class InstitutionalFlowPage(QtWidgets.QWidget):
     """左側導覽「法人資金流去哪？」頁。"""
 
@@ -730,13 +742,15 @@ class InstitutionalFlowPage(QtWidgets.QWidget):
         self.status_label.setText("更新中…（每個請求間隔 3 秒）")
 
         def work(_cancel_event, emit):
-            return ih.backfill(self.db_path, log=emit)
+            failures = []
+            written = ih.backfill(self.db_path, log=emit, failures=failures)
+            return written, failures
 
-        def done(written):
+        def done(result):
+            written, failures = result
             self._update_task = None
             self.update_button.setEnabled(True)
-            self.status_label.setText(
-                f"已更新 {len(written)} 個交易日" if written else "已是最新（或今日資料尚未公布）")
+            self.status_label.setText(_update_summary(written, failures))
             self.reload_if_changed()
 
         def failed(message):

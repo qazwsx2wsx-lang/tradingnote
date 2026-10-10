@@ -1,9 +1,10 @@
 # tradingnote 現況（STATUS.md）
 
 ## 必讀簡介（2026-10-11）
-- git：**未 commit 異動**——「法人資金流去哪？」已併進「資金流向」頁當第 6 個分類按鈕，左側導覽變 6 頁
-  （`tradingnote_gui.py`、`ui/tabs/flow_tab.py`、`test_tradingnote_flow_gui.py`、文件）。未實機看過版面，
-  詳見 `CHANGELOG.md` 2026-10-11。下方舊段落提到的「左側導覽第 2 頁／七個分頁」以此為準已過時。
+- git：「法人資金流去哪？」已併進「資金流向」頁當第 6 個分類按鈕，左側導覽變 6 頁（已 push，`fd9a70d`）。
+  未實機看過版面。下方舊段落提到的「左側導覽第 2 頁／七個分頁」以此為準已過時。
+- **未 commit**：「更新法人資料」狀態列會顯示抓取失敗天數（`ih.backfill(failures=)`、`institutional_flow_page._update_summary`）；
+  法人資料已手動補到 10/8（9/28 被標非交易日，未確認）。詳見 `CHANGELOG.md` 2026-10-11。
 - `refactor/gui-split` 已 fast-forward 合併進 `main` 並已 push（2026-10-05）：結構整理，**純搬移、不改行為**。
 - 既有測試失敗：`test_tradingnote_flow_gui`（疑似跟當天日期／價格資料天數有關，另有暫存 `history.db` 被鎖住刪不掉），
   `test_tradingnote_tasks` 的 force-exit 測試偶發失敗（時序相關，flaky）。

@@ -378,10 +378,12 @@ def _non_trading_dates(conn):
 
 
 def backfill(db_path, target_days=DEFAULT_TARGET_DAYS, delay_seconds=DEFAULT_DELAY_SECONDS,
-             end_date=None, log=print):
+             end_date=None, log=print, failures=None):
     """從 end_date（預設台北今天）往回走，補到最近 target_days 個交易日都有資料。
     已完成的日期、已確認的非交易日會直接跳過，可中斷重跑；排程每天跑同一支即可
-    自動補上漏掉的日子。回傳這次新寫入的日期清單（寫入後會重算指標）。"""
+    自動補上漏掉的日子。回傳這次新寫入的日期清單（寫入後會重算指標）。
+    傳入 failures（list）時，抓取失敗而被略過的日期會 append 進去，讓呼叫端能區分
+    「已是最新」與「抓失敗」。"""
     today = taipei_today()
     cursor = end_date or today
     done = set(completed_dates(db_path))
@@ -405,6 +407,8 @@ def backfill(db_path, target_days=DEFAULT_TARGET_DAYS, delay_seconds=DEFAULT_DEL
                 ok = fetch_day(db_path, cursor, delay_seconds, log)
             except PriceFetchError as exc:
                 log(f"{iso}：略過（{exc}），下次重跑會再試")
+                if failures is not None:
+                    failures.append(iso)
                 ok = None
             if ok:
                 found += 1
