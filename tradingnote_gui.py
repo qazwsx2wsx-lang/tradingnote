@@ -125,8 +125,6 @@ class TradingNoteWindow(
         # QTabWidget，讓主導覽與頁內切換有清楚的視覺層級。
         self._page_specs = (
             (self.flow_tab, "資金流向", "市場族群、排行與法人方向"),
-            (self.institutional_flow_tab, "法人資金流去哪？",
-             "每天盤後整理外資、投信、自營商在各類股的買賣超，一眼看出資金正在加碼或撤出哪些類股"),
             (self.positions_tab, "部位紀錄", "持股損益與個股明細"),
             (self.journal_tab, "交易週誌", "每週持股變化與交易筆記"),
             (self.stocks_tab, "個股查詢", "全市場股票搜尋與基本資料"),

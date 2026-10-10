@@ -142,6 +142,7 @@ class FlowTabMixin:
             ("族群熱度排行", self._build_flow_list_section),
             ("資金流入前 50", self._build_stock_capital_flow_section),
             ("個股爆量", self._build_volume_outliers_section),
+            ("法人資金流去哪？", self._build_institutional_flow_page_section),
         )
         for index, (label, builder) in enumerate(sections):
             button = QtWidgets.QPushButton(label)
@@ -167,6 +168,12 @@ class FlowTabMixin:
         layout.addLayout(section_bar)
         layout.addWidget(self.flow_section_stack, 1)
         self.flow_section_buttons[0].setChecked(True)
+
+    def _build_institutional_flow_page_section(self, layout):
+        # 原本是左側導覽的獨立頁，整頁原樣嵌進來（自帶工具列／捲動區）。
+        # 外層已是 QScrollArea，內頁給足最小高度才不會被壓成一條。
+        self.institutional_flow_tab.setMinimumHeight(780)
+        layout.addWidget(self.institutional_flow_tab, 1)
 
     def _build_institutional_direction_section(self, layout):
         card = SectionCard(

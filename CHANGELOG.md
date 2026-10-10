@@ -6,6 +6,17 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 
 ---
 
+## 2026-10-11 「法人資金流去哪？」併進「資金流向」頁
+
+**動機**：user 要求把獨立的「法人資金流去哪？」導覽頁整合進「資金流向」。
+
+**改法**：`InstitutionalFlowPage` 整頁原樣嵌入 `ui/tabs/flow_tab.py` 的分類按鈕列，新增第 6 個按鈕
+「法人資金流去哪？」（`_build_institutional_flow_page_section`，內頁最小高度 780）；`tradingnote_gui.py`
+`_page_specs` 移除該項，左側導覽由 7 頁變 6 頁。`showEvent` 的自動 reload 照常運作。
+
+**驗證**：`test_tradingnote_flow_gui` 的頁數斷言改為 6，並確認內頁掛在 `flow_section_stack` 下，這兩個斷言通過；
+該測試後段仍有既有的 `+21.00%` 失敗（跟這次無關）。**未做**：沒有實機開 GUI 看版面（內嵌後外層與內頁各有一個捲動區）。
+
 ## 2026-10-01 結構整理：拆 tradingnote_gui.py、整理 repo 根目錄
 
 **動機**：`tradingnote_gui.py` 5,421 行（helper、10 個對話框、約 40 個圖表函式、約 100 個方法的
