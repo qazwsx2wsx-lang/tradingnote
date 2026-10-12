@@ -51,6 +51,10 @@ COLOR_WARNING_TINT = "#26F59E0B"
 COLOR_NEUTRAL_TINT = "#1E9DA5B4"
 COLOR_INFO_TINT = "#263B82F6"
 COLOR_SPECIAL_TINT = "#26A78BFA"
+# 象限圖專用的較濃底色（重點象限）；一般徽章／卡片仍用上面的淡色。
+COLOR_GAIN_TINT_STRONG = "#4DEF4444"
+COLOR_LOSS_TINT_STRONG = "#4D22C55E"
+COLOR_INFO_TINT_STRONG = "#4D3B82F6"
 
 # tone → (文字色, 淡色底) 的共用對照表，給 SignalBadge／InsightCard 等「用顏色
 # 表達狀態」的元件共用，不要各自重複定義一份。positive/negative 是漲跌方向專用，

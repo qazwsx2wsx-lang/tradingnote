@@ -1,6 +1,14 @@
 # tradingnote 現況（STATUS.md）
 
 ## 必讀簡介（2026-10-13）
+- **Claude（2026-10-13，資金流向象限圖改版，未 commit）**：改 `ui/charts/flow_chart.py`／`ui/charts/base.py`／
+  `ui/theme.py`／`ui/tabs/flow_tab.py`／`ui/pages/institutional_flow_page.py`。象限底色加濃（重點象限更濃）、
+  象限名稱用 `set_corner_labels` 釘在視窗角落（縮放不消失）、泡泡填色改成方向（紅買綠賣灰中性，不再用分類雜湊色，
+  清單的分類色塊一併移除）、標籤用共用 `select_bubble_labels` 碰撞過濾（優先標值得關注象限）、未標名泡泡淡化、
+  估值模式象限改藍／紫避免跟漲跌混淆、同步模式 X 軸加小抖動、圖上方新增「今日重點」可點清單（值得關注／需留意前 5）；
+  法人泡泡圖也補上象限底色與名稱。`populate_flow_chart` 現在回傳 picks dict。
+  驗證：offscreen 用合成資料渲染三種模式截圖正常；`test_chart_style`／`test_stock_charts` 通過；
+  `test_tradingnote_flow_gui` 的既有失敗（stash 前後相同）。**未做**：沒有實機看過；「今日重點」點擊＝開成分股，未做高亮泡泡。
 - **Claude（2026-10-10，製圖統一化，已合併進 `main`（2026-10-13，rebase 到 origin 的 `964f945` 之後））**：新增 `ui/charts/base.py`
   當製圖唯一入口——**建圖一律 `new_plot()`／繼承 `ChartWidget`，顏色一律 `series_color()`／`signed_bars()`
   （來源是 `ui/theme.py` 新增的 `CHART_*`／`SERIES_PALETTE`／`ENTITY_COLORS`）**，不要再直接 `pg.PlotWidget()`

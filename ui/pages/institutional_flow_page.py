@@ -22,8 +22,10 @@ from ui.charts.base import (
     limit_zoom_to_data,
     new_plot,
     ref_line,
+    select_bubble_labels,
     series_color,
     set_axis_label,
+    set_corner_labels,
     set_date_ticks,
     set_title,
     signed_bars,
@@ -32,9 +34,13 @@ from ui.theme import (
     CHART_LINE_WIDTH,
     COLOR_ACCENT,
     COLOR_GAIN,
+    COLOR_GAIN_TINT_STRONG,
     COLOR_LOSS,
+    COLOR_LOSS_TINT,
     COLOR_MUTED,
+    COLOR_NEUTRAL_TINT,
     COLOR_TEXT,
+    COLOR_WARNING_TINT,
 )
 
 INVESTOR_ORDER = ("all", "foreign", "trust", "dealer")
@@ -545,6 +551,7 @@ class InstitutionalFlowPage(QtWidgets.QWidget):
         chart.clear()
         rows = self.rows.get(self._investor()) or []
         if not rows:
+            set_corner_labels(chart, {})
             clear_zoom_limits(chart)
             return
         by_value = self.bubble_size_combo.currentData() == "value"
@@ -571,28 +578,59 @@ class InstitutionalFlowPage(QtWidgets.QWidget):
                 "data": {"sector": r["sector"], "tip": tip},
             })
         chart.addItem(bubble_scatter(spots, on_click=lambda data: self._open_detail(data["sector"])))
-        # 只標離原點最遠（兩軸各自正規化）的 6 個類股；擠在原點附近的標了只會重疊
+        # 優先標「買超且加速」象限的大泡泡，再依離原點距離補滿；共用碰撞過濾避免重疊。
         max_x = max(abs(r["sum5"]) for r in rows) or 1
         max_y = max(abs(r["accel"] or 0) for r in rows) or 1
-        prominent = sorted(rows, key=lambda r: -((r["sum5"] / max_x) ** 2 + ((r["accel"] or 0) / max_y) ** 2))
         span_x = (max(r["sum5"] for r in rows) - min(r["sum5"] for r in rows)) or 1
         span_y = (max(r["accel"] or 0 for r in rows) - min(r["accel"] or 0 for r in rows)) or 1
-        placed = []
-        for r in prominent:
-            if len(placed) == 6:
-                break
-            x, y = r["sum5"] / span_x, (r["accel"] or 0) / span_y
-            if any(abs(x - px) < 0.12 and abs(y - py) < 0.06 for px, py in placed):
-                continue  # 會跟已標的名稱重疊，hover 仍看得到
-            placed.append((x, y))
-            label = pg.TextItem(r["sector"], color=COLOR_TEXT, anchor=(0.5, 1.4))
+        ranked = sorted(
+            rows,
+            key=lambda r: (
+                not (r["sum5"] >= 0 and (r["accel"] or 0) >= 0),
+                -((r["sum5"] / max_x) ** 2 + ((r["accel"] or 0) / max_y) ** 2),
+            ),
+        )
+        by_sector = {r["sector"]: r for r in rows}
+        for sector in select_bubble_labels(
+            [(r["sector"], r["sum5"], r["accel"] or 0) for r in ranked], 8, span_x, span_y
+        ):
+            r = by_sector[sector]
+            label = pg.TextItem(sector, color=COLOR_TEXT, anchor=(0.5, 1.4))
             label.setPos(r["sum5"], r["accel"] or 0.0)
             chart.addItem(label)
+        self._add_bubble_quadrants(chart, rows)
         ref_line(chart, x=0)
         ref_line(chart, y=0)
         limit_zoom_to_data(
             chart, [r["sum5"] for r in rows] + [0], [r["accel"] or 0 for r in rows] + [0], y_floor=0.2)
         chart.enableAutoRange()
+
+    def _add_bubble_quadrants(self, chart, rows):
+        """四象限底色（資料座標）＋名稱釘在視窗角落，風格跟資金流向泡泡圖一致。"""
+        xs = [r["sum5"] for r in rows] + [0]
+        ys = [(r["accel"] or 0) for r in rows] + [0]
+        x_pad = max((max(xs) - min(xs)) * 0.15, 1.0)
+        y_pad = max((max(ys) - min(ys)) * 0.15, 0.2)
+        x_lo, x_hi = min(xs) - x_pad, max(xs) + x_pad
+        y_lo, y_hi = min(ys) - y_pad, max(ys) + y_pad
+        areas = {
+            (True, True): (0, x_hi, 0, y_hi, COLOR_GAIN_TINT_STRONG),
+            (False, True): (x_lo, 0, 0, y_hi, COLOR_WARNING_TINT),
+            (False, False): (x_lo, 0, y_lo, 0, COLOR_LOSS_TINT),
+            (True, False): (0, x_hi, y_lo, 0, COLOR_NEUTRAL_TINT),
+        }
+        for left, right, bottom, top, color in areas.values():
+            region = QtWidgets.QGraphicsRectItem(QtCore.QRectF(left, bottom, right - left, top - bottom))
+            region.setBrush(pg.mkBrush(QtGui.QColor(color)))
+            region.setPen(pg.mkPen(None))
+            region.setZValue(-20)
+            chart.addItem(region)
+        set_corner_labels(chart, {
+            (True, True): ("買超加速", "近 5 日買超・仍在加碼"),
+            (False, True): ("賣超轉買", "近 5 日賣超・開始回補"),
+            (False, False): ("賣超加速", "近 5 日賣超・持續出脫"),
+            (True, False): ("買超降溫", "近 5 日買超・力道減弱"),
+        })
 
     def _toggle_trend(self, expanded):
         self.trend_toggle.setText(f"{'▼' if expanded else '▶'} 過去 30 天")

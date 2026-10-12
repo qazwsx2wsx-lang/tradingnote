@@ -2,6 +2,8 @@
 
 以 mixin 形式併入 tradingnote_gui.TradingNoteWindow；方法直接使用視窗的 self 狀態。"""
 
+import html
+import urllib.parse
 from datetime import date
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -15,7 +17,6 @@ from ui import app_paths
 from ui.badges import _flow_momentum_insight
 from ui.charts.flow_chart import (
     FlowChartWidget,
-    _category_color,
     _populate_institutional_direction_chart,
     populate_flow_chart,
 )
@@ -29,10 +30,12 @@ from ui.dialogs.trading_date import TradingDateDialog
 from ui.format import gain_loss_color
 from ui.theme import (
     COLOR_ACCENT,
+    COLOR_GAIN,
     COLOR_LOSS,
     COLOR_MUTED,
+    COLOR_TEXT,
 )
-from ui.widgets import _color_swatch_icon, _set_standard_icon
+from ui.widgets import _set_standard_icon
 
 
 class FlowTabMixin:
@@ -228,6 +231,17 @@ class FlowTabMixin:
         layout.addLayout(summary_row)
         layout.addSpacing(8)
 
+        # 今日重點：直接列出值得關注／需留意象限的前幾名，點名稱＝點泡泡（看成分股）。
+        self.flow_picks_label = QtWidgets.QLabel()
+        self.flow_picks_label.setTextFormat(QtCore.Qt.RichText)
+        self.flow_picks_label.setWordWrap(True)
+        self.flow_picks_label.setOpenExternalLinks(False)
+        self.flow_picks_label.linkActivated.connect(
+            lambda name: self._on_industry_bubble_clicked(urllib.parse.unquote(name))
+        )
+        layout.addWidget(self.flow_picks_label)
+        layout.addSpacing(8)
+
         self.flow_insight_card = InsightCard("資料載入中...", tone="neutral")
         layout.addWidget(self.flow_insight_card)
         layout.addSpacing(4)
@@ -247,8 +261,8 @@ class FlowTabMixin:
         layout.addSpacing(4)
 
         self.flow_chart_hint = QtWidgets.QLabel(
-            "泡泡填色＝所屬分類（對照下方清單色塊）；外框顏色＝方向（見上方圖例）；"
-            "標示成交佔比前五大族群，滑鼠移至泡泡查看數值。"
+            "泡泡顏色＝方向（見上方圖例）、大小＝資金比重；標名的是值得關注象限的大型族群，"
+            "其餘淡化，滑鼠移至泡泡查看數值。"
         )
         self.flow_chart_hint.setProperty("muted", True)
         self.flow_chart_hint.setWordWrap(True)
@@ -377,20 +391,20 @@ class FlowTabMixin:
         )
         if bubble_mode == "institutional_sync":
             self.flow_chart_hint.setText(
-                "泡泡填色＝所屬分類（對照下方清單色塊）；外框顏色＝三大法人同步方向"
-                "（見上方圖例）。僅反映最新一筆三大法人資料，不受「流向區間」影響；"
+                "泡泡顏色＝三大法人同步方向（見上方圖例）；"
+                "僅反映最新一筆三大法人資料，不受「流向區間」影響；"
                 "滑鼠移至泡泡可看外資／投信／自營商個別金額。"
             )
         elif overlapping_groups:
             self.flow_chart_hint.setText(
-                "泡泡填色＝所屬分類（對照下方清單色塊）；外框顏色＝當日量價方向"
-                "（見上方圖例）；泡泡大小為成交涵蓋率。概念可重疊，各群組合計可能"
+                "泡泡顏色＝當日量價方向（見上方圖例）；"
+                "泡泡大小為成交涵蓋率。概念可重疊，各群組合計可能"
                 "超過 100%。先看淡色象限判斷區間狀態，滑鼠移至泡泡可看完整數值。"
             )
         else:
             self.flow_chart_hint.setText(
-                "泡泡填色＝所屬分類（對照下方清單色塊）；外框顏色＝當日量價方向"
-                "（見上方圖例）；泡泡大小為成交佔比。先看淡色象限判斷區間狀態，"
+                "泡泡顏色＝當日量價方向（見上方圖例）；"
+                "泡泡大小為成交佔比。先看淡色象限判斷區間狀態，"
                 "滑鼠移至泡泡可看完整數值與象限解讀。"
             )
         if bubble_mode != "institutional_sync" and not period.sufficient:
@@ -400,7 +414,7 @@ class FlowTabMixin:
         if stale_count:
             self.flow_chart_hint.setText(self.flow_chart_hint.text() +
                 f" {stale_count} 檔來源日期與截止日不同，未混用其價格計算。")
-        populate_flow_chart(
+        picks = populate_flow_chart(
             self.flow_chart,
             app_paths.HISTORY_DB_PATH,
             self.snapshot,
@@ -412,11 +426,27 @@ class FlowTabMixin:
             classification_label=classification_label,
             overlapping_groups=overlapping_groups,
         )
+        self._refresh_flow_picks(picks)
         self._refresh_flow_summary(dashboard)
         self._refresh_institutional_direction(dashboard)
         self.refresh_flow_list(dashboard)
         self.refresh_stock_capital_flow_list(dashboard)
         self.refresh_volume_outliers_list(dashboard)
+
+    def _refresh_flow_picks(self, picks):
+        def links(names):
+            return "　".join(
+                f'<a href="{urllib.parse.quote(name)}" style="color:{COLOR_TEXT};">{html.escape(name)}</a>'
+                for name in names
+            ) or "—"
+
+        if not picks or not picks.get("focus_name"):
+            self.flow_picks_label.setText("")
+            return
+        self.flow_picks_label.setText(
+            f'<b style="color:{COLOR_GAIN};">值得關注・{picks["focus_name"]}</b>　{links(picks["focus"])}<br>'
+            f'<b style="color:{COLOR_MUTED};">需留意・{picks["avoid_name"]}</b>　{links(picks["avoid"])}'
+        )
 
     def _refresh_flow_summary(self, dashboard):
         """用既有 dashboard 更新三張摘要卡，不觸發額外 DB 或網路工作。"""
@@ -578,9 +608,6 @@ class FlowTabMixin:
                 ]
             )
             item.setData(0, QtCore.Qt.UserRole, f.industry)
-            # 分類欄加色塊 icon，跟泡泡圖共用 _category_color()，讓清單列跟
-            # 泡泡圖的顏色可以直接對照，不新增欄位（避免牽動既有欄位索引）。
-            item.setIcon(1, _color_swatch_icon(_category_color(f.industry)))
             for col in (0, 2, 3, 4, 5, 6, 7, 8, 9, 10):
                 item.setTextAlignment(col, QtCore.Qt.AlignCenter)
             if f.avg_change_pct is not None:

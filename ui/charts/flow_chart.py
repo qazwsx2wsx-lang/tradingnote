@@ -14,7 +14,9 @@ from ui.charts.base import (
     clear_zoom_limits,
     empty_state,
     ref_line,
+    select_bubble_labels,
     set_axis_label,
+    set_corner_labels,
     set_title,
     signed_bars,
     style_plot,
@@ -23,10 +25,14 @@ from ui.format import _compact_money, _sign
 from ui.theme import (
     COLOR_GAIN,
     COLOR_GAIN_TINT,
+    COLOR_GAIN_TINT_STRONG,
+    COLOR_INFO_TINT_STRONG,
     COLOR_LOSS,
     COLOR_LOSS_TINT,
+    COLOR_LOSS_TINT_STRONG,
     COLOR_MUTED,
     COLOR_NEUTRAL_TINT,
+    COLOR_SPECIAL_TINT,
     COLOR_TEXT,
     COLOR_WARNING_TINT,
 )
@@ -47,63 +53,58 @@ def _flow_quadrant_specs(mode):
     """回傳象限名稱、解讀與底色；鍵值依序是 X／Y 是否高於參考線。"""
     if mode == "valuation":
         return {
-            (False, True): ("便宜吸金", "估值較低・資金升溫", COLOR_GAIN_TINT),
+            # 估值模式的象限是「便宜／貴」不是漲跌，刻意不用紅綠底色以免跟方向混淆。
+            (False, True): ("便宜吸金", "估值較低・資金升溫", COLOR_INFO_TINT_STRONG),
             (True, True): ("強勢追價", "估值較高・資金升溫", COLOR_WARNING_TINT),
             (False, False): ("低估觀望", "估值較低・資金降溫", COLOR_NEUTRAL_TINT),
-            (True, False): ("高估降溫", "估值較高・資金降溫", COLOR_LOSS_TINT),
+            (True, False): ("高估降溫", "估值較高・資金降溫", COLOR_SPECIAL_TINT),
         }
     if mode == "institutional_sync":
         return {
             (False, True): ("訊號不一致", "同步偏賣・金額卻偏買超", COLOR_WARNING_TINT),
-            (True, True): ("主力同步買超", "同步偏買・買超金額大", COLOR_GAIN_TINT),
-            (False, False): ("主力同步賣超", "同步偏賣・賣超金額大", COLOR_LOSS_TINT),
+            (True, True): ("主力同步買超", "同步偏買・買超金額大", COLOR_GAIN_TINT_STRONG),
+            (False, False): ("主力同步賣超", "同步偏賣・賣超金額大", COLOR_LOSS_TINT_STRONG),
             (True, False): ("訊號不一致", "同步偏買・金額卻偏賣超", COLOR_WARNING_TINT),
         }
     return {
         (False, True): ("放量承壓", "區間下跌・今日放量", COLOR_LOSS_TINT),
-        (True, True): ("強勢吸金", "區間上漲・今日放量", COLOR_GAIN_TINT),
+        (True, True): ("強勢吸金", "區間上漲・今日放量", COLOR_GAIN_TINT_STRONG),
         (False, False): ("弱勢觀望", "區間下跌・量能不足", COLOR_NEUTRAL_TINT),
         (True, False): ("量縮走強", "區間上漲・量能待確認", COLOR_WARNING_TINT),
     }
 
 
+def _flow_focus_quadrants(mode):
+    """（值得關注象限, 需留意象限）；用於「今日重點」清單與標籤優先順序。"""
+    if mode == "valuation":
+        return (False, True), (True, False)
+    if mode == "institutional_sync":
+        return (True, True), (False, False)
+    return (True, True), (False, True)
+
+
 def _add_flow_quadrants(chart, bounds, x_ref, y_ref, mode):
-    """以固定八個圖元畫四象限底色與名稱，不隨泡泡數增加繪圖成本。"""
+    """四個象限底色畫在資料座標；象限名稱釘在視窗角落（縮放後仍看得到）。"""
     x_low, x_high, y_low, y_high = bounds
-    x_span = max(x_high - x_low, 1e-9)
-    y_span = max(y_high - y_low, 1e-9)
     specs = _flow_quadrant_specs(mode)
     areas = {
-        # 上方標籤以頂緣為錨點向下展開；下方反之，避免文字被圖框裁掉。
-        (False, True): (x_low, x_ref, y_ref, y_high, (0, 0)),
-        (True, True): (x_ref, x_high, y_ref, y_high, (1, 0)),
-        (False, False): (x_low, x_ref, y_low, y_ref, (0, 1)),
-        (True, False): (x_ref, x_high, y_low, y_ref, (1, 1)),
+        (False, True): (x_low, x_ref, y_ref, y_high),
+        (True, True): (x_ref, x_high, y_ref, y_high),
+        (False, False): (x_low, x_ref, y_low, y_ref),
+        (True, False): (x_ref, x_high, y_low, y_ref),
     }
-    for quadrant, (left, right, bottom, top, anchor) in areas.items():
-        name, detail, color = specs[quadrant]
+    for quadrant, (left, right, bottom, top) in areas.items():
         region = QtWidgets.QGraphicsRectItem(
             QtCore.QRectF(left, bottom, max(right - left, 0), max(top - bottom, 0))
         )
-        region.setBrush(pg.mkBrush(QtGui.QColor(color)))
+        region.setBrush(pg.mkBrush(QtGui.QColor(specs[quadrant][2])))
         region.setPen(pg.mkPen(None))
         region.setZValue(-20)
         region._flow_quadrant_region = True
         chart.addItem(region)
-
-        x = (left + 0.035 * x_span) if anchor[0] == 0 else (right - 0.035 * x_span)
-        y = (top - 0.055 * y_span) if anchor[1] == 0 else (bottom + 0.055 * y_span)
-        label = pg.TextItem(
-            html=(
-                f'<div style="color:{COLOR_TEXT}; font-size:11pt; font-weight:600;">{name}</div>'
-                f'<div style="color:{COLOR_MUTED}; font-size:8pt;">{detail}</div>'
-            ),
-            anchor=anchor,
-        )
-        label.setPos(x, y)
-        label.setZValue(-10)
-        label._flow_quadrant_label = True
-        chart.addItem(label)
+    set_corner_labels(
+        chart, {quadrant: (name, detail) for quadrant, (name, detail, _c) in specs.items()}
+    )
     return specs
 
 
@@ -267,9 +268,10 @@ def populate_flow_chart(
     skipped = len(flow) - len(plotted)
 
     if not plotted:
+        set_corner_labels(chart, {})
         empty_state(chart, empty_hint, title=empty_title)
         clear_zoom_limits(chart)
-        return
+        return {"focus": [], "avoid": []}
 
     # 泡泡大小用「資金比重(%)」（該群組成交金額 ÷ 全市場今日總成交金額）而非絕對金額，
     # 讓數字換算成跟當日大盤規模脫鉤的相對占比，不再是每天隨大盤總量起伏的絕對值。
@@ -296,16 +298,36 @@ def populate_flow_chart(
         )
         for f in direction_source
     }
-    prominent = {
-        f.industry
-        for f in sorted(plotted, key=lambda f: f.capital_share_pct, reverse=True)[:5]
-    }
+    focus_key, avoid_key = _flow_focus_quadrants(mode)
+    quadrant_of = {f.industry: (xs_of(f) >= x_ref_line, ys_of(f) >= y_ref_line) for f in plotted}
+    # 標籤優先給「值得關注象限」的大泡泡，其餘依資金比重補滿；用共用的碰撞過濾避免重疊。
+    ranked = sorted(
+        plotted,
+        key=lambda f: (quadrant_of[f.industry] != focus_key, -f.capital_share_pct),
+    )
+    # 離散的 X（同步分數 -3～+3）會讓泡泡疊成一直線，依序散開一點點；提示仍顯示真實分數。
+    jitter = {}
+    if mode == "institutional_sync":
+        seen = {}
+        for f in plotted:
+            n = seen.get(xs_of(f), 0)
+            seen[xs_of(f)] = n + 1
+            jitter[f.industry] = ((n % 5) - 2) * 0.07
+    x_span = (x_max - x_min) or 1
+    y_span = (y_max - y_min) or 1
+    labeled = set(
+        select_bubble_labels(
+            [(f.industry, xs_of(f) + jitter.get(f.industry, 0), ys_of(f)) for f in ranked],
+            limit=8,
+            span_x=x_span,
+            span_y=y_span,
+            min_dy=0.1,
+        )
+    )
     spots = []
     for f in plotted:
         x, y = xs_of(f), ys_of(f)
-        quadrant_name, quadrant_detail, _quadrant_color = quadrant_specs[
-            (x >= x_ref_line, y >= y_ref_line)
-        ]
+        quadrant_name, quadrant_detail, _quadrant_color = quadrant_specs[quadrant_of[f.industry]]
         size = max(14.0, (f.capital_share_pct / max_share) ** 0.5 * 55.0)
         if mode == "institutional_sync":
             # 這個模式的「方向」不是當日漲跌，是三大法人的同步一致性——外框顏色
@@ -363,21 +385,21 @@ def populate_flow_chart(
                 f"成交佔比：{f.capital_share_pct:.1f}%\n"
                 f"{x_label}：{x:.2f}\n{y_label}：{y:.2f}\n點擊查看成分股"
             )
-        # 填色＝分類（_category_color，同一分類永遠同一顏色，對照下方清單色塊）；
-        # 外框＝方向（direction_color，加粗讓辨識度更高）——兩種資訊分開兩個
-        # 視覺通道，不會互相蓋掉（2026-09-16 改版，原本填色跟外框都只有方向色，
-        # 沒有分類資訊）。
-        fill_color = _category_color(f.industry)
+        # 填色＝方向（紅買／綠賣／灰中性，全站同一語意）；大小＝資金比重；
+        # 沒被標名的泡泡淡化，讓有標名的重點更突出。分類名稱看標籤與 hover 提示。
+        is_labeled = f.industry in labeled
+        fill = QtGui.QColor(direction_color)
+        fill.setAlpha(210 if is_labeled else 110)
         spots.append(
             {
-                "pos": (x, y),
+                "pos": (x + jitter.get(f.industry, 0), y),
                 "size": size,
                 "data": {"industry": f.industry, "tip": tip},
-                "brush": pg.mkBrush(fill_color.red(), fill_color.green(), fill_color.blue(), 195),
-                "pen": pg.mkPen(direction_color, width=2.5),
+                "brush": pg.mkBrush(fill),
+                "pen": pg.mkPen(QtGui.QColor(COLOR_TEXT), width=1.2 if is_labeled else 0.6),
             }
         )
-        if f.industry not in prominent:
+        if not is_labeled:
             continue
         display_name = f.industry if len(f.industry) <= 18 else f"{f.industry[:17]}…"
         label = pg.TextItem(
@@ -385,7 +407,7 @@ def populate_flow_chart(
             color=COLOR_TEXT,
             anchor=(0.5, 1.3),
         )
-        label.setPos(x, y)
+        label.setPos(x + jitter.get(f.industry, 0), y)
         chart.addItem(label)
 
     # 所有泡泡共用單一 ScatterPlotItem，避免每次更新建立數十個 GraphicsObject。
@@ -416,3 +438,17 @@ def populate_flow_chart(
     )
 
     chart.enableAutoRange()
+
+    def _picks(key):
+        return [
+            f.industry
+            for f in sorted(plotted, key=lambda f: -f.capital_share_pct)
+            if quadrant_of[f.industry] == key
+        ][:5]
+
+    return {
+        "focus": _picks(focus_key),
+        "avoid": _picks(avoid_key),
+        "focus_name": quadrant_specs[focus_key][0],
+        "avoid_name": quadrant_specs[avoid_key][0],
+    }

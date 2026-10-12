@@ -170,6 +170,64 @@ def set_date_ticks(chart, dates, axis="bottom", max_labels=8):
     chart.getAxis(axis).setTicks([[(i, dates[i]) for i in range(0, len(dates), step)]])
 
 
+def set_corner_labels(chart, labels):
+    """把象限名稱釘在目前視窗的四個角落（像素座標，不隨縮放／平移移開）。
+
+    labels：{(在右邊?, 在上方?): (名稱, 說明)}。名稱畫在泡泡下層，重畫時先清掉舊的。"""
+    vb = chart.getPlotItem().getViewBox()
+    for item in getattr(chart, "_corner_labels", ()):
+        item.setParentItem(None)
+        if item.scene() is not None:
+            item.scene().removeItem(item)
+    items = []
+    for (right, top), (name, detail) in labels.items():
+        item = pg.TextItem(
+            html=(
+                f'<div style="color:{COLOR_TEXT}; font-size:12pt; font-weight:700;">{name}</div>'
+                f'<div style="color:{COLOR_MUTED}; font-size:8pt;">{detail}</div>'
+            ),
+            anchor=(1 if right else 0, 0 if top else 1),
+        )
+        item.setParentItem(vb)
+        item.setZValue(-1)
+        item._corner = (right, top)
+        items.append(item)
+
+    def place(*_):
+        width, height = vb.width(), vb.height()
+        for item in items:
+            right, top = item._corner
+            item.setPos(width - 10 if right else 10, 8 if top else height - 8)
+
+    if getattr(chart, "_corner_resize_slot", None) is not None:
+        try:
+            vb.sigResized.disconnect(chart._corner_resize_slot)
+        except (TypeError, RuntimeError):
+            pass
+    chart._corner_labels = items
+    chart._corner_resize_slot = place
+    vb.sigResized.connect(place)
+    place()
+
+
+def select_bubble_labels(points, limit, span_x, span_y, min_dx=0.12, min_dy=0.06):
+    """依優先順序挑出不會互相重疊的標籤。
+
+    points：已依優先度由高到低排好的 [(key, x, y)]；回傳被選中的 key 清單。
+    座標先除以各軸跨度正規化，跟已選標籤太近的就跳過（hover 仍看得到）。"""
+    span_x, span_y = span_x or 1, span_y or 1
+    placed, keys = [], []
+    for key, x, y in points:
+        if len(keys) >= limit:
+            break
+        nx, ny = x / span_x, y / span_y
+        if any(abs(nx - px) < min_dx and abs(ny - py) < min_dy for px, py in placed):
+            continue
+        placed.append((nx, ny))
+        keys.append(key)
+    return keys
+
+
 def bubble_scatter(spots, on_click=None):
     """泡泡圖共用的 ScatterPlotItem：hover 顯示 spot["data"]["tip"]、hover 外框用
     accent 色，點擊時把第一個點的 data 傳給 on_click。
