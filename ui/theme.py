@@ -75,6 +75,44 @@ COLOR_SELECTED_BORDER = "#2C4A73"
 COLOR_DISABLED_BG = "#14161B"
 COLOR_DISABLED_TEXT = "#525A66"
 
+# ---------- 圖表 token（2026-10-10 製圖統一化）----------
+# 所有 pyqtgraph 圖表都經由 `ui/charts/base.py` 取用這裡的值，不要在圖表程式碼裡
+# 另外寫 hex。分類色刻意避開紅／綠——紅綠保留給漲跌／買賣超方向（COLOR_GAIN／
+# COLOR_LOSS），系列線如果也用紅綠，會被誤讀成方向訊號。
+CHART_BG = COLOR_CARD_BG      # 圖表一律放在卡片底上，跟 SectionCard 融為一體
+CHART_GRID_ALPHA = 0.08
+CHART_LINE_WIDTH = 2
+CHART_TITLE_SIZE = "11pt"
+COLOR_CYAN = "#22D3EE"
+COLOR_PINK = "#F472B6"
+COLOR_SLATE = "#CBD5E1"
+COLOR_INDIGO = "#818CF8"
+
+# 沒有固定實體色的系列（技術指標等）依序取色。
+SERIES_PALETTE = (
+    COLOR_ACCENT, COLOR_WARNING, COLOR_SPECIAL, COLOR_CYAN, COLOR_PINK, COLOR_SLATE, COLOR_INDIGO,
+)
+
+# 固定實體 → 顏色：同一個實體在每張圖都同色（例如外資永遠是藍、投信永遠是琥珀）。
+# 「買方／賣方」屬於方向語意，沿用台灣慣例紅買綠賣。
+ENTITY_COLORS = {
+    "外資": COLOR_ACCENT,
+    "外資自營商": COLOR_CYAN,
+    "投信": COLOR_WARNING,
+    "自營商": COLOR_SPECIAL,
+    "自營商(自行)": COLOR_SPECIAL,
+    "自營商(避險)": COLOR_PINK,
+    "收盤價": COLOR_SLATE,
+    "融資餘額": COLOR_ACCENT,
+    "融券餘額": COLOR_WARNING,
+    "借券賣出餘額": COLOR_ACCENT,
+    "借券成交量": COLOR_SPECIAL,
+    "VPT": COLOR_CYAN,
+    "MFI": COLOR_WARNING,
+    "前10大買方": COLOR_GAIN,
+    "前10大賣方": COLOR_LOSS,
+}
+
 # ---------- 延伸 token：只有下面的 STYLESHEET 自己用，其他檔案不需要 import ----------
 _SIDEBAR_ITEM_TEXT = COLOR_MUTED
 _BUTTON_HOVER_BORDER = "#3A4150"

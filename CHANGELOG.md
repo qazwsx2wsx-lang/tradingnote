@@ -29,6 +29,45 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 **驗證**：`test_tradingnote_flow_gui` 的頁數斷言改為 6，並確認內頁掛在 `flow_section_stack` 下，這兩個斷言通過；
 該測試後段仍有既有的 `+21.00%` 失敗（跟這次無關）。**未做**：沒有實機開 GUI 看版面（內嵌後外層與內頁各有一個捲動區）。
 
+---
+
+## 2026-10-10 製圖統一化：`ui/charts/base.py`
+
+（2026-10-13 rebase 到 `964f945` 之後才 push；同期另一個 session 的併頁 `fd9a70d` 保留，這邊的重複併頁捨棄。）
+
+**動機**：所有圖都是 pyqtgraph，但 7 個檔案各自 setBackground／showGrid／mkPen：背景有 `COLOR_SURFACE`／`COLOR_CARD_BG`
+兩種；`ui/charts/detail.py`、`ui/dialogs/futures.py` 用 matplotlib tab10 hardcode hex（違反 `ui/theme.py` 的規則）；
+同一個法人在個股明細（外資 `#1f77b4`、投信綠、自營商紅）跟「法人資金流去哪？」頁（外資 accent、投信琥珀）顏色不同，
+而且紅綠跟漲跌語意撞色；縮放限制、auto-range 按鈕、觸控板捏合、hover 提示各圖有的有有的沒有；歷史股價圖點擊會
+同時出現兩套查值（StockChart readout＋`_setup_price_chart_click` 浮動標籤）。另外「法人方向」發散圖
+（`_populate_institutional_direction_chart`）用 hardcode RGB 畫買超綠／賣超紅，是 2026-09-15 改「正紅負綠」時漏改的。
+
+**改法**：
+1. `ui/theme.py` 新增圖表 token：`CHART_BG`（＝`COLOR_CARD_BG`）、`CHART_GRID_ALPHA`、`CHART_LINE_WIDTH`、
+   `CHART_TITLE_SIZE`、四個新分類色、`SERIES_PALETTE`（避開紅綠）、`ENTITY_COLORS`（外資藍／外資自營商青／投信琥珀／
+   自營商紫／自營商(避險)粉、融資融券、VPT、MFI…；前10大買方／賣方沿用紅買綠賣）。
+2. 新增 `ui/charts/base.py`：`ChartWidget`（從 `FlowChartWidget` 抽出的觸控板捏合縮放）、`style_plot`／`new_plot`
+   （背景、格線、軸線／刻度色、隱藏 auto-range 按鈕、圖例；互動只有 `"zoom"`／`"static"` 兩種）、`series_color`、
+   `signed_bars`、`line`、`ref_line`、`set_title`、`set_axis_label`、`empty_state`、`bubble_scatter`（兩個泡泡圖共用）、
+   `limit_zoom_to_data`、`fit_series`（原本 detail.py 每張圖重複的 setRange 區塊）、`set_date_ticks`／`apply_chart_theme`
+   （從 `ui/stock_charts.py` 搬來，舊位置保留 re-export）。
+3. 各檔改用：`detail.py`（8 張圖＋技術分析；三大法人／法人分別合併成 `_populate_cumulative_flow_chart`，借券兩張合併成
+   `_populate_single_series_chart` 並補上原本沒有的縮放下限；刪 `_setup_price_chart_click`）、`flow_chart.py`、
+   `institutional_flow_page.py`（刪 `_new_plot`；買賣榜／土洋圖改 static；泡泡圖、類股資金流圖補縮放下限）、
+   `flow_tab.py`（方向圖改 static，原本可 x 縮放）、`futures_tab.py`、`dialogs/futures.py`、`tradingnote_gui.py` 全域背景。
+4. 新增 `test_chart_style.py`：掃 `ui/`＋`tradingnote_gui.py` 不得有 hex 字面值與 `pg.PlotWidget(`（theme.py／base.py 除外），
+   並驗證背景、實體色、正負長條色、static 鎖滑鼠。
+
+**行為差異**（刻意的）：圖背景全部變成卡片底色；個股明細各線條顏色改變；方向圖紅綠對調（修 bug）；標題字級統一 11pt
+（泡泡圖原本 13pt、期貨 10pt）；軸標籤統一 muted 色；圖例統一右上角；歷史股價圖點擊只剩虛線＋上方 readout。
+
+**驗證**：`unittest discover` 83 題，只剩既有的 `test_tradingnote_flow_gui` 1 個失敗（改動前同樣失敗）。offscreen 用合成資料
+渲染個股 8 張圖、技術分析、雙資料比較、方向圖、期貨趨勢、類股資金流截圖檢查；另用 HEAD 版本渲染方向圖，確認原本確實是
+買超綠。**未做**：沒有實機開 GUI 用滑鼠／觸控板操作過縮放、hover、點擊；泡泡圖（需要 dashboard／DB 資料）只跑過 import
+與單元測試，沒有截圖。
+
+---
+
 ## 2026-10-01 結構整理：拆 tradingnote_gui.py、整理 repo 根目錄
 
 **動機**：`tradingnote_gui.py` 5,421 行（helper、10 個對話框、約 40 個圖表函式、約 100 個方法的

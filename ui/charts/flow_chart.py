@@ -8,47 +8,36 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from tradingnote_history import compute_industry_flow, compute_valuation_flow
 
+from ui.charts.base import (
+    ChartWidget,
+    bubble_scatter,
+    clear_zoom_limits,
+    empty_state,
+    ref_line,
+    set_axis_label,
+    set_title,
+    signed_bars,
+    style_plot,
+)
 from ui.format import _compact_money, _sign
 from ui.theme import (
-    COLOR_ACCENT,
     COLOR_GAIN,
     COLOR_GAIN_TINT,
     COLOR_LOSS,
     COLOR_LOSS_TINT,
     COLOR_MUTED,
     COLOR_NEUTRAL_TINT,
-    COLOR_SURFACE,
     COLOR_TEXT,
     COLOR_WARNING_TINT,
 )
 
 
-class FlowChartWidget(pg.PlotWidget):
-    """產業資金流向泡泡圖，內建滑鼠滾輪縮放與觸控板手勢縮放（macOS pinch-to-zoom）。"""
+class FlowChartWidget(ChartWidget):
+    """產業資金流向泡泡圖：統一外觀＋滾輪／觸控板捏合縮放（見 ui.charts.base）。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setBackground(COLOR_SURFACE)
-        self.showGrid(x=True, y=True, alpha=0.08)
-        self.getPlotItem().getViewBox().setMouseMode(pg.ViewBox.RectMode)
-        # RectMode 讓滑鼠左鍵拖曳做框選縮放；平移改用滾輪縮放 + 觸控板手勢，
-        # 保留右鍵拖曳可平移（pyqtgraph 預設行為）。
-        self.setMouseEnabled(x=True, y=True)
-        self.getPlotItem().getViewBox().setMouseMode(pg.ViewBox.PanMode)
-
-    def event(self, ev):
-        # macOS 觸控板雙指捏合（pinch）在 Qt 上是 NativeGesture 事件，
-        # 跟滑鼠滾輪縮放（wheelEvent，pyqtgraph 已內建支援）分開處理，
-        # 這樣兩指滾動、雙指捏合都能觸發平滑縮放。
-        if ev.type() == QtCore.QEvent.NativeGesture:
-            if ev.gestureType() == QtCore.Qt.NativeGestureType.ZoomNativeGesture:
-                vb = self.getPlotItem().getViewBox()
-                scale = 1.0 - ev.value()
-                center_scene = self.mapToScene(ev.position().toPoint())
-                center_view = vb.mapSceneToView(center_scene)
-                vb.scaleBy((scale, scale), center=center_view)
-                return True
-        return super().event(ev)
+        style_plot(self, legend=False)
 
 
 VALUATION_METRIC_LABELS = {"per": "本益比 PER", "pbr": "股價淨值比 PBR"}
@@ -122,50 +111,20 @@ def _populate_institutional_direction_chart(chart, rows, value_attr, title):
     """畫單一法人的族群淨買賣左右發散圖；右買超、左賣超。"""
     chart.clear()
     plot = chart.getPlotItem()
-    plot.hideButtons()
-    plot.setMouseEnabled(x=True, y=False)
     ranked = sorted(
         (row for row in rows if getattr(row, value_attr, 0)),
         key=lambda row: abs(getattr(row, value_attr)),
         reverse=True,
     )[:8]
     if not ranked:
-        empty = pg.TextItem("尚無法人資料", color=COLOR_MUTED, anchor=(0.5, 0.5))
-        empty.setPos(0, 0)
-        chart.addItem(empty)
-        chart.setTitle(title, color=COLOR_TEXT, size="11pt")
+        empty_state(chart, "尚無法人資料", title=title)
         return
 
     ranked.reverse()
     values = [getattr(row, value_attr) / 100_000_000 for row in ranked]
-    positions = list(range(len(ranked)))
-    positive_y = [y for y, value in zip(positions, values) if value >= 0]
-    positive_x = [value for value in values if value >= 0]
-    negative_y = [y for y, value in zip(positions, values) if value < 0]
-    negative_x = [value for value in values if value < 0]
-    if positive_x:
-        chart.addItem(
-            pg.BarGraphItem(
-                y=positive_y,
-                height=0.64,
-                x0=0,
-                x1=positive_x,
-                brush=pg.mkBrush(46, 155, 101, 205),
-                pen=pg.mkPen("#247E53"),
-            )
-        )
-    if negative_x:
-        chart.addItem(
-            pg.BarGraphItem(
-                y=negative_y,
-                height=0.64,
-                x0=0,
-                x1=negative_x,
-                brush=pg.mkBrush(217, 88, 82, 205),
-                pen=pg.mkPen("#B94743"),
-            )
-        )
-    chart.addLine(x=0, pen=pg.mkPen(COLOR_MUTED, width=1))
+    # 買超（正）紅、賣超（負）綠：台灣慣例，跟 COLOR_GAIN／COLOR_LOSS 一致。
+    signed_bars(chart, range(len(ranked)), values, horizontal=True)
+    ref_line(chart, x=0, dashed=False)
     plot.getAxis("left").setTicks(
         [[(index, row.group) for index, row in enumerate(ranked)]]
     )
@@ -174,12 +133,8 @@ def _populate_institutional_direction_chart(chart, rows, value_attr, title):
     plot.setXRange(-max_abs * 1.15, max_abs * 1.15, padding=0)
     total = sum(getattr(row, value_attr) for row in rows)
     direction = "買超" if total > 0 else "賣超" if total < 0 else "持平"
-    chart.setTitle(
-        f"{title}｜整體{direction} {abs(total) / 100_000_000:,.1f} 億",
-        color=COLOR_TEXT,
-        size="11pt",
-    )
-    chart.setLabel("bottom", "← 賣超　估算淨額（億）　買超 →", color=COLOR_MUTED)
+    set_title(chart, f"{title}｜整體{direction} {abs(total) / 100_000_000:,.1f} 億")
+    set_axis_label(chart, "bottom", "← 賣超　估算淨額（億）　買超 →")
 
 
 def _institutional_sync_score(institutional_row):
@@ -312,11 +267,8 @@ def populate_flow_chart(
     skipped = len(flow) - len(plotted)
 
     if not plotted:
-        text = pg.TextItem(empty_hint, color=COLOR_MUTED, anchor=(0.5, 0.5))
-        chart.addItem(text)
-        text.setPos(0, 0)
-        chart.setTitle(empty_title, color=COLOR_TEXT, size="13pt")
-        vb.setLimits(xMin=None, xMax=None, yMin=None, yMax=None)
+        empty_state(chart, empty_hint, title=empty_title)
+        clear_zoom_limits(chart)
         return
 
     # 泡泡大小用「資金比重(%)」（該群組成交金額 ÷ 全市場今日總成交金額）而非絕對金額，
@@ -438,38 +390,20 @@ def populate_flow_chart(
 
     # 所有泡泡共用單一 ScatterPlotItem，避免每次更新建立數十個 GraphicsObject。
     # 點擊仍可由 point.data() 找回群組，因此效能改善不犧牲互動。
-    # antialias=False：全域 pg.setConfigOptions(antialias=True) 套用到這顆
-    # scatter 後，搭配 hoverable=True 會讓滑鼠移動時每次 hover 重繪都要重新
-    # 光柵化抗鋸齒圓形，是泡泡圖互動卡頓的主因；只關掉這一個 widget 的抗鋸齒，
-    # 不動全域設定，不影響其他已經調好的深色主題視覺。
-    scatter = pg.ScatterPlotItem(
-        spots=spots,
-        hoverable=True,
-        # 2026-09-17：目前裝的 pyqtgraph 版本用關鍵字引數呼叫
-        # tip(x=, y=, data=)（見 ScatterPlotItem.hoverEvent），參數名稱一定要
-        # 叫 x/y 才接得到——原本命名成 _x/_y 會直接 TypeError（拿
-        # PYTHONFAULTHANDLER=1 實機跑才發現：hover 泡泡圖時 stderr 一直噴
-        # RuntimeWarning，導致這個功能從來沒真的顯示過提示文字）。
-        tip=lambda x, y, data: data["tip"],
-        hoverPen=pg.mkPen(COLOR_ACCENT, width=2),
-        antialias=False,
-    )
-    if on_industry_click is not None:
-        scatter.sigClicked.connect(
-            lambda _plot, points, _ev: points
-            and on_industry_click(points[0].data()["industry"])
-        )
-    chart.addItem(scatter)
+    chart.addItem(bubble_scatter(
+        spots,
+        on_click=(lambda data: on_industry_click(data["industry"])) if on_industry_click else None,
+    ))
 
-    chart.addLine(x=x_ref_line, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
-    chart.addLine(y=y_ref_line, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
-    chart.setLabel("bottom", x_label, color=COLOR_TEXT)
-    chart.setLabel("left", y_label, color=COLOR_TEXT)
+    ref_line(chart, x=x_ref_line)
+    ref_line(chart, y=y_ref_line)
+    set_axis_label(chart, "bottom", x_label)
+    set_axis_label(chart, "left", y_label)
     share_label = "成交涵蓋率%" if overlapping_groups else "資金比重%"
     title = f"{title_prefix}（泡泡大小＝{share_label}，點擊可查看成分股）"
     if skipped:
         title += f"　（另有 {skipped} 個群組因歷史資料不足未顯示）"
-    chart.setTitle(title, color=COLOR_TEXT, size="13pt")
+    set_title(chart, title)
 
     # 限制縮小（滾輪／觸控板捏合）的下限，最多縮到剛好看見全部泡泡為止，避免
     # 縮出一大片空白；邊界抓資料範圍的 15% 當緩衝，讓泡泡本身（半徑）與旁邊的

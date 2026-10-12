@@ -1,6 +1,6 @@
 # 法人資金流去哪？— 資料回補與每日排程
 
-GUI 左側導覽「法人資金流去哪？」頁讀的是 `data/history.db` 裡預先算好的法人歷史表
+GUI「資金流向」頁的「法人資金流去哪？」分類讀的是 `data/history.db` 裡預先算好的法人歷史表
 （`tradingnote_institutional_history.py`）。這裡的腳本負責把資料抓進來。所有腳本都要用
 Python 3.12 執行（**不要用系統內建 python3**，TWSE／TPEx 憑證在新版 Python 會驗證失敗，
 見 `ARCHITECTURE.md`）。

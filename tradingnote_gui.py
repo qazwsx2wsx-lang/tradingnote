@@ -28,7 +28,7 @@ from ui.tabs.journal_tab import JournalTabMixin
 from ui.tabs.positions_tab import PositionsTabMixin
 from ui.tabs.settings_tab import SettingsTabMixin
 from ui.tabs.stocks_tab import StocksTabMixin
-from ui.theme import COLOR_SURFACE, COLOR_TEXT, STYLESHEET
+from ui.theme import CHART_BG, COLOR_TEXT, STYLESHEET
 from ui.widgets import _center_on_screen, _screen_fit_size, _set_standard_icon
 from ui.workers import run_startup_preload_in_thread, run_task_in_thread
 
@@ -441,7 +441,7 @@ def main():
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     app.setStyle("Fusion")
     app.setStyleSheet(STYLESHEET)
-    pg.setConfigOptions(antialias=True, background=COLOR_SURFACE, foreground=COLOR_TEXT)
+    pg.setConfigOptions(antialias=True, background=CHART_BG, foreground=COLOR_TEXT)
     # 關閉視窗時，run_background_task() 開的 daemon thread 不會被 CPython 等待
     # 就直接進入直譯器關閉流程；上面的 gc.disable() 擋不掉直譯器 finalize
     # 自己強制觸發的最後一次 GC，所以這裡另外用 aboutToQuit（事件迴圈真正

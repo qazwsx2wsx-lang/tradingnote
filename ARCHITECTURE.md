@@ -83,7 +83,7 @@
 - **`tradingnote_gui.py`**（約 470 行，2026-10-01 拆檔後）：只放 `TradingNoteWindow` 外殼＋`main()`。各分頁的方法放在 `ui/tabs/*_tab.py` 的 mixin（`FlowTabMixin`／`StocksTabMixin`／…），透過多重繼承併入視窗——選 mixin 而不是獨立 page widget，是因為這些方法大量共用視窗的 `self` 狀態，mixin 可以零行為改動地搬出來；之後要改成像 `ui/pages/institutional_flow_page.py` 那樣的獨立頁面，可以一頁一頁做。
   - **`ui/` 依賴方向**：`tradingnote_gui` → `ui/tabs` → `ui/dialogs` → `ui/charts` → `ui/widgets`／`ui/format`／`ui/badges`／`ui/workers`／`ui/theme`。`ui/*` 一律不 import `tradingnote_gui`（避免循環）。
   - **資料檔路徑**：GUI 程式碼一律寫 `app_paths.HISTORY_DB_PATH`（`from ui import app_paths`，呼叫當下讀模組屬性），不要 `from ui.app_paths import HISTORY_DB_PATH`——測試靠覆寫 `ui.app_paths` 的屬性隔離資料，直接 import 名稱會讓覆寫失效。
-  - 視窗外觀：左側導覽列（2026-09-14 從上方分頁改版）+ 右側 `QStackedWidget`，六個分頁：資金流向分析（含法人方向子頁）、部位紀錄、交易週誌、個股查詢、期貨行情、設定。目前是最需要持續拆分/去重的檔案，見「已知架構債務」。
+  - 視窗外觀：左側導覽列（2026-09-14 從上方分頁改版）+ 右側 `QStackedWidget`，六個分頁：資金流向分析（含法人方向、法人資金流去哪？子頁）、部位紀錄、交易週誌、個股查詢、期貨行情、設定。目前是最需要持續拆分/去重的檔案，見「已知架構債務」。
 
 ---
 

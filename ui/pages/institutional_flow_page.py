@@ -15,15 +15,26 @@ from ui.components.insight_card import InsightCard
 from ui.components.section_card import SectionCard
 from ui.components.signal_badge import SignalBadge
 from ui.components.stat_card import StatCard
-from ui.stock_charts import set_date_ticks
+from ui.charts.base import (
+    bubble_scatter,
+    clear_zoom_limits,
+    empty_state,
+    limit_zoom_to_data,
+    new_plot,
+    ref_line,
+    series_color,
+    set_axis_label,
+    set_date_ticks,
+    set_title,
+    signed_bars,
+)
 from ui.theme import (
+    CHART_LINE_WIDTH,
     COLOR_ACCENT,
-    COLOR_CARD_BG,
     COLOR_GAIN,
     COLOR_LOSS,
     COLOR_MUTED,
     COLOR_TEXT,
-    COLOR_WARNING,
 )
 
 INVESTOR_ORDER = ("all", "foreign", "trust", "dealer")
@@ -69,14 +80,6 @@ def _heat_color(value, max_abs):
     color = QtGui.QColor(COLOR_GAIN if value > 0 else COLOR_LOSS)
     color.setAlphaF(0.10 + 0.50 * min(1.0, abs(value) / max_abs))
     return color
-
-
-def _new_plot(min_height=260):
-    chart = pg.PlotWidget()
-    chart.setBackground(COLOR_CARD_BG)
-    chart.setMinimumHeight(min_height)
-    chart.getPlotItem().hideButtons()
-    return chart
 
 
 class _SortItem(QtWidgets.QTableWidgetItem):
@@ -144,12 +147,11 @@ class SectorFlowChart(QtWidgets.QWidget):
         self.cumulative_check.setChecked(True)
         self.cumulative_check.toggled.connect(lambda _on: self._draw())
         layout.addWidget(self.cumulative_check)
-        self.chart = _new_plot(240)
+        self.chart = new_plot(min_height=240, grid="y")
         layout.addWidget(self.chart, 1)
 
         plot = self.chart.getPlotItem()
-        plot.showGrid(x=False, y=True, alpha=0.08)
-        plot.setLabel("left", "億／日", color=COLOR_MUTED)
+        set_axis_label(plot, "left", "億／日")
         self._cum_view = pg.ViewBox()
         self._cum_view.setZValue(10)  # 累計線畫在柱子上面，不被遮住
         plot.scene().addItem(self._cum_view)
@@ -173,16 +175,14 @@ class SectorFlowChart(QtWidgets.QWidget):
         self._cum_view.clear()
         if not self._points:
             plot.hideAxis("right")
-            empty = pg.TextItem("沒有資料", color=COLOR_MUTED, anchor=(0.5, 0.5))
-            plot.addItem(empty)
+            clear_zoom_limits(self.chart)
+            empty_state(plot, "沒有資料")
             return
         xs = list(range(len(self._points)))
         values = [v for _d, v in self._points]
-        plot.addItem(pg.BarGraphItem(
-            x=xs, height=values, width=0.7,
-            brushes=[pg.mkBrush(_tone_color(v)) for v in values], pen=pg.mkPen(None),
-        ))
-        plot.addLine(y=0, pen=pg.mkPen(COLOR_MUTED, width=1))
+        signed_bars(plot, xs, values, thickness=0.7)
+        ref_line(plot, y=0, dashed=False)
+        limit_zoom_to_data(self.chart, xs, values + [0], y_floor=0.1)
         set_date_ticks(plot, [d[5:] for d, _v in self._points])
         if self.cumulative_check.isChecked():
             running, cumulative = 0.0, []
@@ -190,8 +190,9 @@ class SectorFlowChart(QtWidgets.QWidget):
                 running += v
                 cumulative.append(running)
             plot.showAxis("right")
-            plot.getAxis("right").setLabel("累計（億）", color=COLOR_MUTED)
-            self._cum_view.addItem(pg.PlotCurveItem(xs, cumulative, pen=pg.mkPen(COLOR_ACCENT, width=2)))
+            set_axis_label(plot, "right", "累計（億）")
+            self._cum_view.addItem(pg.PlotCurveItem(
+                xs, cumulative, pen=pg.mkPen(COLOR_ACCENT, width=CHART_LINE_WIDTH)))
             self._cum_view.enableAutoRange(axis=pg.ViewBox.YAxis)
         else:
             plot.hideAxis("right")
@@ -410,10 +411,9 @@ class InstitutionalFlowPage(QtWidgets.QWidget):
         size_row.addStretch(1)
         card.body_layout.addLayout(size_row)
 
-        self.bubble_chart = _new_plot(420)
-        self.bubble_chart.showGrid(x=True, y=True, alpha=0.08)
-        self.bubble_chart.setLabel("bottom", "近 5 日買賣超（億）", color=COLOR_TEXT)
-        self.bubble_chart.setLabel("left", "加速流入（億／天）", color=COLOR_TEXT)
+        self.bubble_chart = new_plot(min_height=420)
+        set_axis_label(self.bubble_chart, "bottom", "近 5 日買賣超（億）")
+        set_axis_label(self.bubble_chart, "left", "加速流入（億／天）")
         card.body_layout.addWidget(self.bubble_chart, 1)
         note = QtWidgets.QLabel(BUBBLE_NOTE + "。滾輪可縮放、拖曳可平移。")
         note.setProperty("muted", True)
@@ -437,8 +437,8 @@ class InstitutionalFlowPage(QtWidgets.QWidget):
     def _build_ranking_section(self, layout):
         card = SectionCard("今日法人買賣榜", "類股當日買賣超前 10 名，單位：億元")
         row = QtWidgets.QHBoxLayout()
-        self.buy_chart = _new_plot(360)
-        self.sell_chart = _new_plot(360)
+        self.buy_chart = new_plot(min_height=360, grid="", interaction="static")
+        self.sell_chart = new_plot(min_height=360, grid="", interaction="static")
         row.addWidget(self.buy_chart, 1)
         row.addWidget(self.sell_chart, 1)
         card.body_layout.addLayout(row, 1)
@@ -446,9 +446,7 @@ class InstitutionalFlowPage(QtWidgets.QWidget):
 
     def _build_tu_yang_section(self, layout):
         card = SectionCard("近 5 日土洋操作", "外資（洋）與投信（土）近 5 日類股買賣超比較；不受上方法人切換影響")
-        self.tu_yang_chart = _new_plot(440)
-        self.tu_yang_chart.showGrid(x=True, y=False, alpha=0.08)
-        self.tu_yang_chart.addLegend(offset=(-10, 10))
+        self.tu_yang_chart = new_plot(min_height=440, grid="x", legend=True, interaction="static")
         card.body_layout.addWidget(self.tu_yang_chart, 1)
         self.tu_yang_badges = QtWidgets.QGridLayout()
         self.tu_yang_badges.setHorizontalSpacing(6)
@@ -547,6 +545,7 @@ class InstitutionalFlowPage(QtWidgets.QWidget):
         chart.clear()
         rows = self.rows.get(self._investor()) or []
         if not rows:
+            clear_zoom_limits(chart)
             return
         by_value = self.bubble_size_combo.currentData() == "value"
         size_of = (lambda r: r["trading_value"]) if by_value else (lambda r: abs(r["sum20"]))
@@ -571,13 +570,7 @@ class InstitutionalFlowPage(QtWidgets.QWidget):
                 "pen": pg.mkPen(color, width=1.5),
                 "data": {"sector": r["sector"], "tip": tip},
             })
-        scatter = pg.ScatterPlotItem(
-            spots=spots, hoverable=True, tip=lambda x, y, data: data["tip"],
-            hoverPen=pg.mkPen(COLOR_ACCENT, width=2), antialias=False,
-        )
-        scatter.sigClicked.connect(
-            lambda _p, points, _ev: points and self._open_detail(points[0].data()["sector"]))
-        chart.addItem(scatter)
+        chart.addItem(bubble_scatter(spots, on_click=lambda data: self._open_detail(data["sector"])))
         # 只標離原點最遠（兩軸各自正規化）的 6 個類股；擠在原點附近的標了只會重疊
         max_x = max(abs(r["sum5"]) for r in rows) or 1
         max_y = max(abs(r["accel"] or 0) for r in rows) or 1
@@ -595,9 +588,10 @@ class InstitutionalFlowPage(QtWidgets.QWidget):
             label = pg.TextItem(r["sector"], color=COLOR_TEXT, anchor=(0.5, 1.4))
             label.setPos(r["sum5"], r["accel"] or 0.0)
             chart.addItem(label)
-        dash = pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1)
-        chart.addLine(x=0, pen=dash)
-        chart.addLine(y=0, pen=dash)
+        ref_line(chart, x=0)
+        ref_line(chart, y=0)
+        limit_zoom_to_data(
+            chart, [r["sum5"] for r in rows] + [0], [r["accel"] or 0 for r in rows] + [0], y_floor=0.2)
         chart.enableAutoRange()
 
     def _toggle_trend(self, expanded):
@@ -626,18 +620,14 @@ class InstitutionalFlowPage(QtWidgets.QWidget):
     def _draw_rank(chart, rows, title, color, names_right):
         chart.clear()
         plot = chart.getPlotItem()
-        plot.setMouseEnabled(x=False, y=False)
-        chart.setTitle(title, color=color, size="11pt")
+        set_title(chart, title, color=color)
         if not rows:
             plot.getAxis("left").setTicks([[]])
             return
         rows = list(reversed(rows))  # 第一名畫在最上面
         ys = list(range(len(rows)))
         values = [r["day_amt"] for r in rows]
-        chart.addItem(pg.BarGraphItem(
-            x0=0, y=ys, height=0.62, width=values,
-            brush=pg.mkBrush(color), pen=pg.mkPen(None),
-        ))
+        signed_bars(chart, ys, values, thickness=0.62, horizontal=True)
         ticks = [[(y, r["sector"]) for y, r in zip(ys, rows)]]
         name_axis, other_axis = ("right", "left") if names_right else ("left", "right")
         plot.showAxis(name_axis)
@@ -674,13 +664,13 @@ class InstitutionalFlowPage(QtWidgets.QWidget):
         ys = list(range(len(pairs)))
         chart.addItem(pg.BarGraphItem(
             x0=0, y=[y + 0.19 for y in ys], height=0.36, width=[p[1] for p in pairs],
-            brush=pg.mkBrush(COLOR_ACCENT), pen=pg.mkPen(None), name="外資",
+            brush=pg.mkBrush(series_color("外資")), pen=pg.mkPen(None), name="外資",
         ))
         chart.addItem(pg.BarGraphItem(
             x0=0, y=[y - 0.19 for y in ys], height=0.36, width=[p[2] for p in pairs],
-            brush=pg.mkBrush(COLOR_WARNING), pen=pg.mkPen(None), name="投信",
+            brush=pg.mkBrush(series_color("投信")), pen=pg.mkPen(None), name="投信",
         ))
-        chart.addLine(x=0, pen=pg.mkPen(COLOR_MUTED, width=1))
+        ref_line(chart, x=0, dashed=False)
         ticks = []
         for y, (sector, foreign, trust_value) in zip(ys, pairs):
             tag = ih.tu_yang_tag(foreign, trust_value)
@@ -694,7 +684,7 @@ class InstitutionalFlowPage(QtWidgets.QWidget):
                 self.tu_yang_badges.addWidget(badge, tag_count // 4, tag_count % 4)
                 tag_count += 1
         plot.getAxis("left").setTicks([ticks])
-        plot.setLabel("bottom", "近 5 日買賣超（億）", color=COLOR_MUTED)
+        set_axis_label(plot, "bottom", "近 5 日買賣超（億）")
         plot.setYRange(-0.7, len(pairs) - 0.3, padding=0)
         plot.enableAutoRange(axis=pg.ViewBox.XAxis)
 

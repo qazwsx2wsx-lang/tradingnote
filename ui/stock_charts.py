@@ -4,31 +4,11 @@ import math
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
-from ui.theme import COLOR_ACCENT, COLOR_SPECIAL, COLOR_SURFACE, COLOR_TEXT, COLOR_MUTED
+from ui.charts.base import ChartWidget, apply_chart_theme, set_date_ticks, set_title  # noqa: F401（re-export 給既有 import）
+from ui.theme import CHART_LINE_WIDTH, COLOR_ACCENT, COLOR_SPECIAL, COLOR_TEXT, COLOR_MUTED
 
 
-def apply_chart_theme(chart, *, min_height=320):
-    """套用 `StockChart`／`FlowChartWidget` 等 `pg.PlotWidget` 共用的深色主題
-    設定（背景／格線／圖例／最小高度）。取代原本在 `tradingnote_gui.py` 多處
-    逐字重複的 setBackground／showGrid／addLegend／setMinimumHeight 四行。"""
-    chart.setBackground(COLOR_SURFACE)
-    chart.showGrid(x=True, y=True, alpha=.08)
-    chart.addLegend()
-    chart.setMinimumHeight(min_height)
-
-
-def set_date_ticks(chart, dates, axis="bottom", max_labels=8):
-    """把 `dates`（依時間排序的日期字串清單）等距抽樣成軸刻度標籤，取代原本
-    在每個 `_populate_*_chart` 與 `ComparisonWidget.refresh` 裡逐字重複的
-    「算 step、組 tick 清單」邏輯。"""
-    if not dates:
-        chart.getAxis(axis).setTicks([])
-        return
-    step = max(1, len(dates) // max_labels)
-    chart.getAxis(axis).setTicks([[(i, dates[i]) for i in range(0, len(dates), step)]])
-
-
-class StockChart(pg.PlotWidget):
+class StockChart(ChartWidget):
     cleared = QtCore.Signal()
 
     def __init__(self, *args, **kwargs):
@@ -212,10 +192,10 @@ class ComparisonWidget(QtWidgets.QWidget):
             self.chart.plotItem.legend.clear()
         selected = [self.catalog.get(combo.currentText()) for combo in self.selectors]
         if not all(selected):
-            self.chart.setTitle("尚無可比較資料", color=COLOR_TEXT)
+            set_title(self.chart, "尚無可比較資料")
             return
         if self.selectors[0].currentText() == self.selectors[1].currentText():
-            self.chart.setTitle("請選擇兩項不同資料", color=COLOR_TEXT)
+            set_title(self.chart, "請選擇兩項不同資料")
             return
         dates = sorted(set(selected[0][2]) | set(selected[1][2]))
         self.chart.dates = dates
@@ -228,7 +208,7 @@ class ComparisonWidget(QtWidgets.QWidget):
             color = (COLOR_ACCENT, COLOR_SPECIAL)[i]
             curve = pg.PlotDataItem(list(range(len(dates))),
                                    [values.get(day, float("nan")) for day in dates],
-                                   pen=pg.mkPen(color, width=2), name=name, connect="finite",
+                                   pen=pg.mkPen(color, width=CHART_LINE_WIDTH), name=name, connect="finite",
                                    symbol="o", symbolSize=4, symbolBrush=color, symbolPen=None)
             if i == 1 and dual:
                 self.chart.showAxis("right")
@@ -240,7 +220,7 @@ class ComparisonWidget(QtWidgets.QWidget):
             if i == 0:
                 self.chart.setLabel("left", unit if dual else " / ".join(dict.fromkeys(s[1] for s in selected)), color=color if dual else COLOR_TEXT)
         set_date_ticks(self.chart, dates, max_labels=6)
-        self.chart.setTitle("雙資料比較｜點擊查看同日數值", color=COLOR_TEXT)
+        set_title(self.chart, "雙資料比較｜點擊查看同日數值")
         self._resize()
         self.chart.enableAutoRange()
         self.right.enableAutoRange(axis=pg.ViewBox.YAxis)

@@ -1,12 +1,9 @@
 """期貨大額交易人未沖銷部位：表格／趨勢圖 helper 與對話框（期貨頁也共用 helper）。"""
 
-import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ui.charts.detail import _limit_zoom_to_data
+from ui.charts.base import fit_series, line, set_axis_label, set_date_ticks, set_title
 from ui.format import _format_settlement_month, _futures_date_to_iso, gain_loss_color
-from ui.stock_charts import set_date_ticks
-from ui.theme import COLOR_TEXT
 from ui.widgets import DialogBase, _center_on_screen, _screen_fit_size
 
 
@@ -82,11 +79,7 @@ def _populate_large_traders_trend(chart, series):
     所有契約合計才連續。"""
     chart.clear()
     if not series:
-        chart.setTitle(
-            "大額交易人未沖銷部位趨勢（尚無歷史：背景回補中，或本商品無此統計）",
-            color=COLOR_TEXT,
-            size="10pt",
-        )
+        set_title(chart, "大額交易人未沖銷部位趨勢（尚無歷史：背景回補中，或本商品無此統計）")
         return
 
     dates = [r["date"] for r in series]
@@ -95,20 +88,11 @@ def _populate_large_traders_trend(chart, series):
 
     buy = [r["top10_buy"] or 0 for r in series]
     sell = [r["top10_sell"] or 0 for r in series]
-    chart.plot(x, buy, pen=pg.mkPen("#1f77b4", width=2), name="前10大買方")
-    chart.plot(x, sell, pen=pg.mkPen("#ff7f0e", width=2), name="前10大賣方")
-    chart.setLabel("left", "未沖銷部位（口）", color=COLOR_TEXT)
-    chart.setTitle(
-        f"前10大交易人未沖銷部位趨勢（所有契約·所有交易人）｜近 {len(dates)} 日",
-        color=COLOR_TEXT,
-        size="10pt",
-    )
-    all_y = buy + sell
-    _limit_zoom_to_data(chart, x, all_y)
-    y_lo, y_hi = min(all_y), max(all_y)
-    y_pad = max((y_hi - y_lo) * 0.1, 1.0)
-    chart.setXRange(min(x), max(x), padding=0.02)
-    chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
+    line(chart, x, buy, "前10大買方")
+    line(chart, x, sell, "前10大賣方")
+    set_axis_label(chart, "left", "未沖銷部位（口）")
+    set_title(chart, f"前10大交易人未沖銷部位趨勢（所有契約·所有交易人）｜近 {len(dates)} 日")
+    fit_series(chart, x, buy + sell)
 
 
 class FuturesLargeTradersDialog(DialogBase):

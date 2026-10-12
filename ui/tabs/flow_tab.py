@@ -4,7 +4,6 @@
 
 from datetime import date
 
-import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from tradingnote_concepts import CLASSIFICATION_INDUSTRY, CLASSIFICATION_LABELS, CLASSIFICATION_VALUE_CHAIN_LEAF
@@ -20,6 +19,7 @@ from ui.charts.flow_chart import (
     _populate_institutional_direction_chart,
     populate_flow_chart,
 )
+from ui.charts.base import new_plot
 from ui.components.insight_card import InsightCard
 from ui.components.section_card import SectionCard
 from ui.components.signal_badge import SignalBadge
@@ -29,7 +29,6 @@ from ui.dialogs.trading_date import TradingDateDialog
 from ui.format import gain_loss_color
 from ui.theme import (
     COLOR_ACCENT,
-    COLOR_CARD_BG,
     COLOR_LOSS,
     COLOR_MUTED,
 )
@@ -191,10 +190,8 @@ class FlowTabMixin:
         chart_row.setSpacing(8)
         self.institutional_direction_charts = []
         for _title in ("外資", "投信", "自營商"):
-            chart = pg.PlotWidget()
-            chart.setBackground(COLOR_CARD_BG)
-            chart.showGrid(x=True, y=False, alpha=0.08)
-            chart.setMinimumSize(180, 260)
+            chart = new_plot(min_height=260, grid="x", interaction="static")
+            chart.setMinimumWidth(180)
             chart_row.addWidget(chart, 1)
             self.institutional_direction_charts.append(chart)
         card.body_layout.addLayout(chart_row, 1)

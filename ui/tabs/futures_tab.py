@@ -2,7 +2,6 @@
 
 以 mixin 形式併入 tradingnote_gui.TradingNoteWindow；方法直接使用視窗的 self 狀態。"""
 
-import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from tradingnote_http import PriceFetchError
@@ -30,8 +29,9 @@ from ui.dialogs.futures import (
     _populate_large_traders_table,
     _populate_large_traders_trend,
 )
+from ui.charts.base import new_plot
 from ui.format import _futures_snapshot_date, gain_loss_color
-from ui.theme import COLOR_GAIN, COLOR_LOSS, COLOR_SURFACE
+from ui.theme import COLOR_GAIN, COLOR_LOSS
 from ui.workers import run_task_in_thread
 
 
@@ -147,11 +147,7 @@ class FuturesTabMixin:
 
         # 趨勢圖：選取商品的前10大買/賣方未沖銷部位逐日走勢（歷史由背景回補累積，
         # 見 _sync_large_traders_history）。放在明細表右邊，用 QSplitter 可調寬度。
-        self.futures_lt_trend_chart = pg.PlotWidget()
-        self.futures_lt_trend_chart.setBackground(COLOR_SURFACE)
-        self.futures_lt_trend_chart.showGrid(x=True, y=True, alpha=0.08)
-        self.futures_lt_trend_chart.addLegend()
-        self.futures_lt_trend_chart.setMinimumHeight(200)
+        self.futures_lt_trend_chart = new_plot(min_height=200, legend=True)
 
         inner = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         inner.addWidget(self.futures_lt_detail_table)

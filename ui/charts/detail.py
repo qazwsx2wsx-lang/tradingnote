@@ -9,21 +9,29 @@ from PySide6 import QtCore, QtWidgets
 
 from tradingnote_technical import calculate_indicators
 
+from ui.charts.base import (
+    apply_chart_theme,
+    clear_zoom_limits,
+    empty_state,
+    fit_series,
+    limit_zoom_to_data,
+    line,
+    ref_line,
+    series_color,
+    set_axis_label,
+    set_date_ticks,
+    set_title,
+)
 from ui.stock_charts import (
     ComparisonWidget,
     LazyTabBuilder,
     StockChart,
-    apply_chart_theme,
     chart_page,
-    set_date_ticks,
 )
 from ui.theme import (
-    COLOR_ACCENT,
     COLOR_GAIN,
     COLOR_LOSS,
     COLOR_MUTED,
-    COLOR_SPECIAL,
-    COLOR_TEXT,
 )
 
 
@@ -40,20 +48,21 @@ def _detail_summary_scroll(label):
     return scroll
 
 
-def _limit_zoom_to_data(chart, xs, ys, x_floor=1.0, y_floor=1.0):
-    """限制往外縮的下限，最多縮到剛好看見全部資料為止，避免縮出一大片空白；
-    放大則不受影響，仍可無限拉近。邊界抓資料範圍的 15% 當緩衝。"""
-    vb = chart.getPlotItem().getViewBox()
-    x_min, x_max = min(xs), max(xs)
-    y_min, y_max = min(ys), max(ys)
-    x_pad = max((x_max - x_min) * 0.15, x_floor)
-    y_pad = max((y_max - y_min) * 0.15, y_floor)
-    vb.setLimits(
-        xMin=x_min - x_pad,
-        xMax=x_max + x_pad,
-        yMin=y_min - y_pad,
-        yMax=y_max + y_pad,
-    )
+def _cumulative(series):
+    running_total, result = 0, []
+    for net in series:
+        running_total += net
+        result.append(running_total)
+    return result
+
+
+def _start_series_chart(chart, dates):
+    """時間序列圖共用的開頭：記住日期（給 StockChart 點擊查值用）、設日期刻度，
+    回傳 x 座標。"""
+    if isinstance(chart, StockChart):
+        chart.dates = list(dates)
+    set_date_ticks(chart, dates)
+    return list(range(len(dates)))
 
 
 def _populate_price_chart(chart, price_history):
@@ -61,203 +70,70 @@ def _populate_price_chart(chart, price_history):
     （list of {"date":, "close":, ...}，由舊到新排序），跟其他幾張圖吃的
     {"dates":, "series":/"vpt":/"mfi":} dict 格式不同，這裡直接吃 list。只畫
     收盤價（使用者要的是「歷史股價資訊圖」，不是另外疊漲跌%／成交量，避免跟
-    其他幾張圖一樣的軸混在一起）。"""
+    其他幾張圖一樣的軸混在一起）。點擊查值走 StockChart 共用的虛線＋readout。"""
     chart.clear()
-    # chart.clear() 會把先前點擊留下的標記線／文字一併清掉，這裡順便重置追蹤
-    # 用的屬性，避免 _on_price_chart_click 之後 removeItem 到已經不存在的物件。
-    chart._click_marker_items = []
-    chart._price_dates = None
-    chart._price_closes = None
     if not price_history:
         return
 
     dates = [row["date"] for row in price_history]
-    if isinstance(chart, StockChart):
-        chart.dates = list(dates)
     closes = [row["close"] for row in price_history]
-    chart._price_dates = dates
-    chart._price_closes = closes
-    x = list(range(len(dates)))
-    set_date_ticks(chart, dates)
-
-    chart.plot(x, closes, pen=pg.mkPen("#e377c2", width=2), name="收盤價")
-    chart.setLabel("left", "收盤價（元）", color=COLOR_TEXT)
-    chart.setTitle(f"歷史股價｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
-    _limit_zoom_to_data(chart, x, closes)
-    # 跟 _populate_vpt_chart 同樣的理由：這張圖也可能一開始被 QScrollArea 捲到
-    # 看不見的地方，enableAutoRange() 算出來的範圍在 widget 還沒有真正版面
-    # 尺寸時不可靠，改用算好的資料範圍直接 setRange。
-    y_lo, y_hi = min(closes), max(closes)
-    y_pad = max((y_hi - y_lo) * 0.1, 1.0)
-    chart.setXRange(min(x), max(x), padding=0.02)
-    chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
+    x = _start_series_chart(chart, dates)
+    line(chart, x, closes, "收盤價")
+    set_axis_label(chart, "left", "收盤價（元）")
+    set_title(chart, f"歷史股價｜近 {len(dates)} 個交易日")
+    fit_series(chart, x, closes)
 
 
-def _setup_price_chart_click(chart):
-    """幫「歷史股價」圖加上滑鼠點擊查看該日股價的功能：點圖上任一位置，找出
-    最接近的交易日，畫一條垂直虛線＋文字標出「日期｜收盤價」。只在 PlotWidget
-    建立時呼叫一次——scene 的訊號連線是永久的，不會因為 _populate_price_chart
-    之後的 chart.clear() 而消失；_populate_price_chart 每次重繪時把最新的
-    dates／closes 存到 chart 物件上（見該函式），這裡的 handler 讀取當下存的
-    那份，不用另外傳參數，重新整理／切換股票後點擊仍然對得上目前顯示的資料。"""
-    vb = chart.getPlotItem().getViewBox()
-
-    def on_click(event):
-        dates = getattr(chart, "_price_dates", None)
-        closes = getattr(chart, "_price_closes", None)
-        if not dates:
-            return
-        if not chart.getPlotItem().sceneBoundingRect().contains(event.scenePos()):
-            return
-        point = vb.mapSceneToView(event.scenePos())
-        idx = round(point.x())
-        idx = max(0, min(len(dates) - 1, idx))
-
-        for item in getattr(chart, "_click_marker_items", []):
-            chart.removeItem(item)
-
-        marker_line = pg.InfiniteLine(
-            pos=idx, angle=90, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1)
-        )
-        label = pg.TextItem(
-            f"{dates[idx]}｜{closes[idx]:.2f}", color=COLOR_TEXT, anchor=(0.5, 1)
-        )
-        label.setPos(idx, closes[idx])
-        chart.addItem(marker_line)
-        chart.addItem(label)
-        chart._click_marker_items = [marker_line, label]
-
-    chart.scene().sigMouseClicked.connect(on_click)
-
-
-def _populate_flow_chart(chart, history):
+def _populate_cumulative_flow_chart(chart, history, title):
+    """逐日淨買賣超累加成累計曲線、加一條零軸參考線。"""
     chart.clear()
     if history is None or not history["dates"]:
         return
 
     dates = history["dates"]
-    if isinstance(chart, StockChart):
-        chart.dates = list(dates)
-    x = list(range(len(dates)))
-    set_date_ticks(chart, dates)
-
-    bucket_colors = {"外資": "#1f77b4", "投信": "#2ca02c", "自營商": "#d62728"}
-    all_y = [0]  # 包含 0，讓下面的零軸參考線不會被縮出視野邊界外
-    for label, series in history["series"].items():
-        cumulative = []
-        running_total = 0
-        for net in series:
-            running_total += net
-            cumulative.append(running_total)
+    x = _start_series_chart(chart, dates)
+    all_y = [0]  # 包含 0，讓零軸參考線不會被縮出視野邊界外
+    for index, (label, series) in enumerate(history["series"].items()):
+        cumulative = _cumulative(series)
         all_y.extend(cumulative)
-        chart.plot(
-            x,
-            cumulative,
-            pen=pg.mkPen(bucket_colors.get(label, COLOR_TEXT), width=2),
-            name=label,
-        )
+        line(chart, x, cumulative, label, index=index)
 
-    chart.addLine(y=0, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
-    chart.setLabel("left", "累計淨買賣超（股）", color=COLOR_TEXT)
-    chart.setTitle(f"三大法人累計買賣超｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
-    _limit_zoom_to_data(chart, x, all_y)
-    # 現在這張圖可能是 QTabWidget 裡目前沒被切到的分頁（隱藏、還沒有真正版面
-    # 尺寸），這時 enableAutoRange() 算出來的範圍不可靠（同 _populate_price_chart
-    # 的理由），改用算好的資料範圍直接 setRange。
-    y_lo, y_hi = min(all_y), max(all_y)
-    y_pad = max((y_hi - y_lo) * 0.1, 1.0)
-    chart.setXRange(min(x), max(x), padding=0.02)
-    chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
+    ref_line(chart, y=0)
+    set_axis_label(chart, "left", "累計淨買賣超（股）")
+    set_title(chart, f"{title}｜近 {len(dates)} 個交易日")
+    fit_series(chart, x, all_y)
+
+
+def _populate_flow_chart(chart, history):
+    _populate_cumulative_flow_chart(chart, history, "三大法人累計買賣超")
 
 
 def _populate_institutional_detail_chart(chart, detail_history):
-    """法人分別累計買賣超：跟 _populate_flow_chart（合併三大類）完全同一種畫法
-    ——逐日淨買賣超累加成累計曲線、加一條零軸參考線——但畫的是五個細項各自
-    一條線（外資／外資自營商／投信／自營商(自行)／自營商(避險)，見
-    tradingnote_finmind.INSTITUTIONAL_DETAIL_BUCKETS），讓使用者看得出「哪一
-    類法人在持續進出」而不只是合併後的三大類。detail_history 是
-    fetch_institutional_investors_detailed_history() 的回傳值（也就是
-    fetch_position_detail() 存進 institutional_detail_history 的那份）。"""
-    chart.clear()
-    if detail_history is None or not detail_history["dates"]:
-        return
-
-    dates = detail_history["dates"]
-    if isinstance(chart, StockChart):
-        chart.dates = list(dates)
-    x = list(range(len(dates)))
-    set_date_ticks(chart, dates)
-
-    detail_colors = {
-        "外資": "#1f77b4",
-        "外資自營商": "#17becf",
-        "投信": "#2ca02c",
-        "自營商(自行)": "#d62728",
-        "自營商(避險)": "#ff7f0e",
-    }
-    all_y = [0]  # 包含 0，讓零軸參考線不會被縮出視野邊界外
-    for label, series in detail_history["series"].items():
-        cumulative = []
-        running_total = 0
-        for net in series:
-            running_total += net
-            cumulative.append(running_total)
-        all_y.extend(cumulative)
-        chart.plot(
-            x,
-            cumulative,
-            pen=pg.mkPen(detail_colors.get(label, COLOR_TEXT), width=2),
-            name=label,
-        )
-
-    chart.addLine(y=0, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine, width=1))
-    chart.setLabel("left", "累計淨買賣超（股）", color=COLOR_TEXT)
-    chart.setTitle(
-        f"法人分別累計買賣超｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt"
-    )
-    _limit_zoom_to_data(chart, x, all_y)
-    # 同 _populate_flow_chart：這張圖可能是 QTabWidget 裡目前沒被切到的隱藏分頁，
-    # enableAutoRange() 算出來的範圍不可靠，改用算好的資料範圍直接 setRange。
-    y_lo, y_hi = min(all_y), max(all_y)
-    y_pad = max((y_hi - y_lo) * 0.1, 1.0)
-    chart.setXRange(min(x), max(x), padding=0.02)
-    chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
+    """法人分別累計買賣超：跟 _populate_flow_chart（合併三大類）同一種畫法，
+    但畫的是五個細項各自一條線（外資／外資自營商／投信／自營商(自行)／
+    自營商(避險)，見 tradingnote_finmind.INSTITUTIONAL_DETAIL_BUCKETS），讓
+    使用者看得出「哪一類法人在持續進出」。detail_history 是
+    fetch_institutional_investors_detailed_history() 的回傳值。"""
+    _populate_cumulative_flow_chart(chart, detail_history, "法人分別累計買賣超")
 
 
 def _populate_margin_chart(chart, margin_history):
-    """融資融券餘額趨勢圖：跟 _populate_flow_chart 不同，這裡的資料本來就是
-    「餘額」（TodayBalance），不是逐日買賣超流量，所以直接畫原始值，不能再
-    累加一次（累加會變成「餘額的餘額」，數字沒有意義）。"""
+    """融資融券餘額趨勢圖：資料本來就是「餘額」（TodayBalance），不是逐日
+    買賣超流量，所以直接畫原始值，不能再累加一次。"""
     chart.clear()
     if margin_history is None or not margin_history["dates"]:
         return
 
     dates = margin_history["dates"]
-    if isinstance(chart, StockChart):
-        chart.dates = list(dates)
-    x = list(range(len(dates)))
-    set_date_ticks(chart, dates)
-
-    series_colors = {"融資餘額": "#9467bd", "融券餘額": "#ff7f0e"}
+    x = _start_series_chart(chart, dates)
     all_y = []
-    for label, series in margin_history["series"].items():
+    for index, (label, series) in enumerate(margin_history["series"].items()):
         all_y.extend(series)
-        chart.plot(
-            x,
-            series,
-            pen=pg.mkPen(series_colors.get(label, COLOR_TEXT), width=2),
-            name=label,
-        )
+        line(chart, x, series, label, index=index)
 
-    chart.setLabel("left", "餘額（張）", color=COLOR_TEXT)
-    chart.setTitle(f"融資融券餘額｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
-    _limit_zoom_to_data(chart, x, all_y)
-    # 同 _populate_flow_chart：這張圖也可能是 QTabWidget 裡目前沒被切到的
-    # 分頁，enableAutoRange() 不可靠，改用算好的資料範圍直接 setRange。
-    y_lo, y_hi = min(all_y), max(all_y)
-    y_pad = max((y_hi - y_lo) * 0.1, 1.0)
-    chart.setXRange(min(x), max(x), padding=0.02)
-    chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
+    set_axis_label(chart, "left", "餘額（張）")
+    set_title(chart, f"融資融券餘額｜近 {len(dates)} 個交易日")
+    fit_series(chart, x, all_y)
 
 
 def _mark_latest_value(chart, x, dates, series, color, value_fmt="{:.1f}"):
@@ -265,7 +141,7 @@ def _mark_latest_value(chart, x, dates, series, color, value_fmt="{:.1f}"):
     目前值，不用把滑鼠移到線的最右端去對。"""
     latest_y = series[-1]
     latest_label = f"{value_fmt.format(latest_y)}｜{dates[-1]}"
-    chart.addLine(y=latest_y, pen=pg.mkPen(color, style=QtCore.Qt.DashLine, width=1))
+    ref_line(chart, y=latest_y, color=color)
     text = pg.TextItem(latest_label, color=color, anchor=(0, 0.5))
     text.setPos(min(x), latest_y)
     chart.addItem(text)
@@ -277,115 +153,82 @@ def _populate_vpt_chart(chart, vpt_mfi_history):
         return
 
     dates = vpt_mfi_history["dates"]
-    if isinstance(chart, StockChart):
-        chart.dates = list(dates)
-    x = list(range(len(dates)))
-    set_date_ticks(chart, dates)
-
+    x = _start_series_chart(chart, dates)
     series = vpt_mfi_history["vpt"]
-    chart.plot(x, series, pen=pg.mkPen("#17becf", width=2), name="VPT")
-    chart.setLabel("left", "VPT", color=COLOR_TEXT)
-    chart.setTitle(f"VPT 量價趨勢｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
-    _limit_zoom_to_data(chart, x, series)
-    # 這個區塊可能一開始被 QScrollArea 捲到看不見的地方，widget 還沒有真正的
-    # 版面尺寸時呼叫 enableAutoRange()／chart.autoRange() 算出來的範圍不可靠
-    # （實測會卡在 ±1 附近的退化值）。直接用剛剛算好的資料範圍 setRange，不
-    # 依賴 pyqtgraph 的自動偵測；y_pad 下限跟 _limit_zoom_to_data 的 y_floor
-    # 同樣抓 1.0，避免 VPT 全程沒有變化（min==max）時 setYRange 收斂成高度 0
-    # 的退化範圍。
-    y_lo, y_hi = min(series), max(series)
-    y_pad = max((y_hi - y_lo) * 0.1, 1.0)
-    chart.setXRange(min(x), max(x), padding=0.02)
-    chart.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
-    _mark_latest_value(chart, x, dates, series, "#17becf", "{:,.0f}")
+    line(chart, x, series, "VPT")
+    set_axis_label(chart, "left", "VPT")
+    set_title(chart, f"VPT 量價趨勢｜近 {len(dates)} 個交易日")
+    fit_series(chart, x, series)
+    _mark_latest_value(chart, x, dates, series, series_color("VPT"), "{:,.0f}")
 
 
 def _populate_mfi_chart(chart, vpt_mfi_history):
     """MFI 值域固定在 0～100，圖上加 80／20 兩條參考線（超買／超賣，MFI
-    標準慣例），跟 _populate_flow_chart 的零軸參考線同一種畫法。"""
+    標準慣例）。"""
     chart.clear()
     if vpt_mfi_history is None or not vpt_mfi_history["dates"]:
         return
 
     dates = vpt_mfi_history["dates"]
-    if isinstance(chart, StockChart):
-        chart.dates = list(dates)
-    x = list(range(len(dates)))
-    set_date_ticks(chart, dates)
-
+    x = _start_series_chart(chart, dates)
     series = vpt_mfi_history["mfi"]
-    chart.plot(x, series, pen=pg.mkPen("#bcbd22", width=2), name="MFI")
-    chart.addLine(y=80, pen=pg.mkPen(COLOR_LOSS, style=QtCore.Qt.DashLine, width=1))
-    chart.addLine(y=20, pen=pg.mkPen(COLOR_GAIN, style=QtCore.Qt.DashLine, width=1))
-    chart.setLabel("left", "MFI", color=COLOR_TEXT)
-    chart.setTitle(f"MFI 資金流量｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
-    _limit_zoom_to_data(chart, x, series + [0, 100])
+    line(chart, x, series, "MFI")
+    ref_line(chart, y=80, color=COLOR_LOSS)
+    ref_line(chart, y=20, color=COLOR_GAIN)
+    set_axis_label(chart, "left", "MFI")
+    set_title(chart, f"MFI 資金流量｜近 {len(dates)} 個交易日")
+    limit_zoom_to_data(chart, x, series + [0, 100])
     chart.setXRange(min(x), max(x), padding=0.02)
     chart.setYRange(0, 100, padding=0.02)
-    _mark_latest_value(chart, x, dates, series, "#bcbd22", "{:.1f}")
+    _mark_latest_value(chart, x, dates, series, series_color("MFI"), "{:.1f}")
+
+
+def _populate_single_series_chart(chart, data, name, unit_label, title):
+    chart.clear()
+    if data is None or not data.get("dates"):
+        return
+
+    dates = data["dates"]
+    x = _start_series_chart(chart, dates)
+    series = data["series"][name]
+    line(chart, x, series, name)
+    set_axis_label(chart, "left", unit_label)
+    set_title(chart, f"{title}｜近 {len(dates)} 個交易日")
+    fit_series(chart, x, series)
 
 
 def _populate_short_sale_balance_chart(chart, sbl_balance):
     """借券賣出餘額（股）趨勢圖：跟 _populate_margin_chart 一樣是「餘額」，直接
-    畫原始值。這是證券商辦理有價證券借貸的餘額，單位是股，跟融資融券頁籤的
-    「張」不是同一個量級，所以是獨立分頁，不是加進融資融券那張圖。"""
-    chart.clear()
-    if sbl_balance is None or not sbl_balance.get("dates"):
-        return
-
-    dates = sbl_balance["dates"]
-    if isinstance(chart, StockChart):
-        chart.dates = list(dates)
-    x = list(range(len(dates)))
-    set_date_ticks(chart, dates)
-
-    series = sbl_balance["series"]["借券賣出餘額"]
-    chart.plot(x, series, pen=pg.mkPen(COLOR_ACCENT, width=2), name="借券賣出餘額")
-    chart.setLabel("left", "餘額（股）", color=COLOR_TEXT)
-    chart.setTitle(f"借券賣出餘額｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
+    畫原始值。單位是股，跟融資融券頁籤的「張」不是同一個量級，所以是獨立分頁。"""
+    _populate_single_series_chart(chart, sbl_balance, "借券賣出餘額", "餘額（股）", "借券賣出餘額")
 
 
 def _populate_lending_volume_chart(chart, lending):
-    """借券成交量（張）趨勢圖：借券市場的每日成交量，跟借券賣出餘額是不同性質
-    的數字（一個是累積餘額，一個是當日流量），單位也不同（股 vs 張），所以
-    分開兩張圖，不合併成一張雙軸圖。"""
-    chart.clear()
-    if lending is None or not lending.get("dates"):
-        return
-
-    dates = lending["dates"]
-    if isinstance(chart, StockChart):
-        chart.dates = list(dates)
-    x = list(range(len(dates)))
-    set_date_ticks(chart, dates)
-
-    series = lending["series"]["借券成交量"]
-    chart.plot(x, series, pen=pg.mkPen(COLOR_SPECIAL, width=2), name="借券成交量")
-    chart.setLabel("left", "成交量（張）", color=COLOR_TEXT)
-    chart.setTitle(f"借券成交量｜近 {len(dates)} 個交易日", color=COLOR_TEXT, size="11pt")
+    """借券成交量（張）趨勢圖：當日流量，跟借券賣出餘額（累積餘額、單位股）
+    性質不同，所以分開兩張圖。"""
+    _populate_single_series_chart(chart, lending, "借券成交量", "成交量（張）", "借券成交量")
 
 
-def _plot_technical_series(chart, dates, series, color, name):
-    points = [
-        (index, value)
-        for index, value in enumerate(series or ())
-        if value is not None
-    ]
-    if not points:
+def _plot_technical_series(chart, series, index, name):
+    values = [value for value in (series or ()) if value is not None]
+    if not values:
         return []
-    x, y = zip(*points)
-    chart.plot(list(range(len(series))), [float("nan") if value is None else value for value in series], connect="finite", pen=pg.mkPen(color, width=2), name=name)
-    return list(y)
+    line(
+        chart,
+        list(range(len(series))),
+        [float("nan") if value is None else value for value in series],
+        name,
+        index=index,
+        connect="finite",
+    )
+    return values
 
 
 def _populate_technical_chart(chart, technical_data, mode="kd"):
     """繪製本地計算的 KD／MACD／均線圖。"""
     chart.clear()
     if not technical_data or not technical_data.get("dates"):
-        empty = pg.TextItem("尚無足夠歷史價格資料可計算技術指標", color=COLOR_MUTED)
-        chart.addItem(empty)
-        empty.setPos(0, 0)
-        chart.setTitle("技術分析", color=COLOR_TEXT, size="11pt")
+        empty_state(chart, "尚無足夠歷史價格資料可計算技術指標", title="技術分析")
         return
 
     dates = technical_data["dates"]
@@ -393,27 +236,31 @@ def _populate_technical_chart(chart, technical_data, mode="kd"):
         chart.dates = list(dates)
     spec = technical_data.get("charts", {}).get(mode)
     if not spec:
-        chart.setTitle("此快取尚無指標，請重新載入資料")
+        set_title(chart, "此快取尚無指標，請重新載入資料")
         return
     values = []
-    colors = ("#409cff", "#ffab40", "#43c59e", "#dc709f", "#b399ff", "#b8c85a", "#cccccc")
     for index, (name, series) in enumerate(spec["series"].items()):
-        values += _plot_technical_series(chart, dates, series, colors[index % len(colors)], name)
+        values += _plot_technical_series(chart, series, index, name)
     for level in spec["levels"]:
-        chart.addLine(y=level, pen=pg.mkPen(COLOR_MUTED, style=QtCore.Qt.DashLine))
-    chart.setTitle(spec["title"], color=COLOR_TEXT, size="11pt")
-    chart.setLabel("left", spec["unit"])
+        ref_line(chart, y=level)
+    set_title(chart, spec["title"])
+    set_axis_label(chart, "left", spec["unit"])
     set_date_ticks(chart, dates, max_labels=6)
-    chart.setXRange(0, max(1,len(dates)-1), padding=.02)
+    x = list(range(max(2, len(dates))))
     if values:
         lo, hi = min(values), max(values)
-        pad = max(abs(lo)*.02, 1) if lo == hi else (hi-lo)*.1
-        chart.setYRange(lo-pad, hi+pad, padding=0)
+        y_floor = max(abs(lo) * .02, 1) if lo == hi else 1e-9
+        limit_zoom_to_data(chart, x, values, y_floor=y_floor)
+        pad = y_floor if lo == hi else (hi - lo) * .1
+        chart.setXRange(0, max(1, len(dates) - 1), padding=.02)
+        chart.setYRange(lo - pad, hi + pad, padding=0)
     else:
+        clear_zoom_limits(chart)
+        chart.setXRange(0, max(1, len(dates) - 1), padding=.02)
         chart.setYRange(0, 1)
         empty = pg.TextItem("資料不足：缺少必要欄位或尚未滿計算期數", color=COLOR_MUTED)
         chart.addItem(empty)
-        empty.setPos(0,.5)
+        empty.setPos(0, .5)
 
 
 class TechnicalAnalysisWidget(QtWidgets.QWidget):
@@ -740,21 +587,18 @@ class DetailChartPanel:
         for tab_label, _group_label, data_key, populate_fn, _series_fn in _DETAIL_CHART_SPECS:
             state = {"chart": None}
             self._chart_states.append(state)
-            extra_setup = _setup_price_chart_click if data_key == "price_history" else None
-            self._lazy.add_tab(tab_label, self._make_chart_build(state, data_key, populate_fn, extra_setup))
+            self._lazy.add_tab(tab_label, self._make_chart_build(state, data_key, populate_fn))
         self._technical_state = {"widget": None}
         self._lazy.add_tab("技術分析", self._build_technical_tab)
         self._comparison_state = {"widget": None}
         self._lazy.add_tab("雙資料比較", self._build_comparison_tab)
 
-    def _make_chart_build(self, state, data_key, populate_fn, extra_setup):
+    def _make_chart_build(self, state, data_key, populate_fn):
         def build(container):
             chart = state["chart"]
             if chart is None:
                 chart = StockChart()
                 apply_chart_theme(chart)
-                if extra_setup is not None:
-                    extra_setup(chart)
                 container.layout().addWidget(chart_page(chart))
                 state["chart"] = chart
             populate_fn(chart, (self._data or {}).get(data_key))

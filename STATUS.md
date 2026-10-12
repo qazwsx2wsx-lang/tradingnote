@@ -1,9 +1,17 @@
 # tradingnote 現況（STATUS.md）
 
-## 必讀簡介（2026-10-11）
+## 必讀簡介（2026-10-13）
+- **Claude（2026-10-10，製圖統一化，已合併進 `main`（2026-10-13，rebase 到 origin 的 `964f945` 之後））**：新增 `ui/charts/base.py`
+  當製圖唯一入口——**建圖一律 `new_plot()`／繼承 `ChartWidget`，顏色一律 `series_color()`／`signed_bars()`
+  （來源是 `ui/theme.py` 新增的 `CHART_*`／`SERIES_PALETTE`／`ENTITY_COLORS`）**，不要再直接 `pg.PlotWidget()`
+  或寫 hex，`test_chart_style.py` 會擋。背景統一 `CHART_BG`（＝卡片底色）、外資藍／投信琥珀／自營商紫全 app 一致、
+  每張可縮放的圖都有觸控板捏合縮放＋縮小下限、排行類橫條圖鎖滑鼠。順手修了「法人方向」發散圖買超綠／賣超紅
+  （09-15 紅綠對調時漏改的 hardcode RGB）。驗證：83 題只剩既有的 `test_tradingnote_flow_gui` 1 個失敗；
+  offscreen 用合成資料渲染全部圖截圖確認。**未做**：沒有實機開 GUI 用滑鼠／觸控板操作過。詳見 `CHANGELOG.md` 2026-10-10。
+  另一個 session 同時做了「法人資金流去哪？」併頁（`fd9a70d`），rebase 時以它為準，這邊的重複版本已捨棄。
 - git：「法人資金流去哪？」已併進「資金流向」頁當第 6 個分類按鈕，左側導覽變 6 頁（已 push，`fd9a70d`）。
   未實機看過版面。下方舊段落提到的「左側導覽第 2 頁／七個分頁」以此為準已過時。
-- **未 commit**：「更新法人資料」狀態列會顯示抓取失敗天數（`ih.backfill(failures=)`、`institutional_flow_page._update_summary`）；
+- 已 commit（`964f945`）：「更新法人資料」狀態列會顯示抓取失敗天數（`ih.backfill(failures=)`、`institutional_flow_page._update_summary`）；
   法人資料已手動補到 10/8（9/28 被標非交易日，未確認）。詳見 `CHANGELOG.md` 2026-10-11。
 - `refactor/gui-split` 已 fast-forward 合併進 `main` 並已 push（2026-10-05）：結構整理，**純搬移、不改行為**。
 - 既有測試失敗：`test_tradingnote_flow_gui`（疑似跟當天日期／價格資料天數有關，另有暫存 `history.db` 被鎖住刪不掉），
@@ -35,7 +43,7 @@
   補缺口，可以視節流是否解除決定要不要再試。
 - **Claude（2026-09-26，「法人資金流去哪？」GUI 頁＋三大法人歷史）**：
   新增 `tradingnote_institutional_history.py`（6 張自有表＋讀取函式）、
-  `ui/pages/institutional_flow_page.py`（左側導覽第 2 頁）、`scripts/`
+  `ui/pages/institutional_flow_page.py`（2026-10-13 起是「資金流向」頁的分類按鈕）、`scripts/`
   （backfill／fetch_daily／recompute／launchd 範本，說明見 `scripts/README.md`）、
   `sector_overrides.json`、`test_tradingnote_institutional_history.py`；
   改 `tradingnote_history.py`（新增 `fetch_tpex_historical_day`，上櫃歷史收盤
@@ -134,9 +142,9 @@ tradingnote/
     └── history.db                # SQLite：股票歷史價格／產業分類／估值／週誌快照 + 期貨大額交易人歷史
 ```
 
-## GUI 現況：七個分頁（左側導覽列，2026-09-14 由上方分頁改版）
+## GUI 現況：六個分頁（左側導覽列，2026-09-14 由上方分頁改版；2026-10-13「法人資金流去哪？」併進資金流向）
 1. **資金流向分析**（預設頁）：pyqtgraph 泡泡圖，2026-09-16 改版——**泡泡填色＝所屬分類**（`_category_color()`，依名稱雜湊決定色相，同一分類永遠同一顏色，跟下方清單「分類」欄的色塊 icon 對照一致）、**外框顏色＝方向**（原本整顆泡泡只有紅/綠/灰三色代表當日量價方向，現在改成外框加粗表達，填色跟方向分開兩個視覺通道）。`ScatterPlotItem` 加 `antialias=False`（只針對這個 widget，不動全域抗鋸齒設定）修正 hover 時的卡頓。可觸控板/滾輪縮放平移，點擊泡泡看該產業前十大成分股；工具列「泡泡圖模式」三選一：「動能」（X＝N日累積漲跌%、Y＝量比）／「估值」（X＝最新一筆 PER/PBR 加權中位數、Y＝近5日均額÷近20日均額）／**「主力同步買超」**（新增，X＝三大法人方向一致性分數 -3～+3、Y＝三大法人合計買賣超金額億元，外框依一致性分數而非當日漲跌決定；資料僅反映最新一筆三大法人快照，不受「流向區間」影響，見下方已知缺口）。三種模式都有四象限淡色底與 hover 解讀。下方按分類切換：資金動向清單（「分類」欄已加色塊 icon）、產業熱度排行、個股資金流入前50、個股量比異常清單。另有「法人方向」子頁：從 TWSE T86、TPEx `tpex_3insti_daily_trading` 取得全市場真實淨買賣股數，依族群聚合後以三張左右發散圖顯示外資／投信／自營商（真實買賣超，淨額為股數×收盤價估算，跟新的「主力同步買超」泡泡模式共用同一份 `dashboard.institutional_flow`）。日期選擇一律用日曆式起始日期選擇器，沒有歷史資料的日期反白不能選，結束日固定今天／最新資料。
-2. **法人資金流去哪？**（2026-09-26 新增，`ui/pages/institutional_flow_page.py`）：讀 `tradingnote_institutional_history` 預先算好的表。上方盤後結論（一句摘要＋外資／投信／自營商／合計四張 StatCard，金額採交易所公布值）；下方四個分類按鈕切換：法人資金流向泡泡圖（X＝近 5 日、Y＝加速流入、大小可切成交金額／近 20 日絕對值，可展開「過去 30 天」）、今日法人買賣榜、近 5 日土洋操作、可排序熱力圖；右側「法人」切換合計／外資／投信／自營。點泡泡或熱力圖列開 `SectorDetailDialog`（30 日柱狀＋累計線、成分股表）。資料日期下拉只列有資料的交易日；「更新法人資料」背景跑 `ih.backfill()`。
+2. **法人資金流去哪？**（2026-09-26 新增；2026-10-13 起不再是獨立分頁，是「資金流向」頁「顯示分類」裡的一個按鈕，`ui/pages/institutional_flow_page.py`）：讀 `tradingnote_institutional_history` 預先算好的表。上方盤後結論（一句摘要＋外資／投信／自營商／合計四張 StatCard，金額採交易所公布值）；下方四個分類按鈕切換：法人資金流向泡泡圖（X＝近 5 日、Y＝加速流入、大小可切成交金額／近 20 日絕對值，可展開「過去 30 天」）、今日法人買賣榜、近 5 日土洋操作、可排序熱力圖；右側「法人」切換合計／外資／投信／自營。點泡泡或熱力圖列開 `SectorDetailDialog`（30 日柱狀＋累計線、成分股表）。資料日期下拉只列有資料的交易日；「更新法人資料」背景跑 `ih.backfill()`。
 3. **部位紀錄**：`QTableWidget`（含族群／概念股欄位），新增/刪除/查價/重新整理；下方詳細資訊區塊選取部位時背景查 FinMind，跟「個股」頁 `StockDetailDialog` 共用同一套 8 張趨勢圖（歷史股價／三大法人／法人分別／融資融券／VPT／MFI／借券賣出餘額／借券成交）。概念股清單來自 `concepts.json`（人工維護，見 `tradingnote_concepts.py`）。
 4. **交易週誌**（2026-09-10 新增）：週一至週日七張卡片顯示持股合計金額變化、絕對變動最大前三檔與日誌摘要；選取日期可看全部持股並編輯自由文字日誌；前/後週、本週、日期跳轉、Ctrl+S、切換日期與關閉程式時自動保存；未來日期不可編輯。
 5. **個股**：`QTreeWidget` 依產業族群列出全市場約1700檔股票，選取項目即時顯示右側摘要卡（含趨勢/動能/量能徽章），雙擊叫 FinMind API 查本益比/殖利率/股價淨值比/三大法人（`StockDetailDialog`，同樣有趨勢徽章）。彈窗「顯示完整籌碼面資訊」按鈕點下去才查跟部位紀錄頁相同的詳細資料＋分頁（歷史股價／三大法人／法人分別／融資融券／VPT／MFI／借券賣出餘額／借券成交／技術分析，共 8 張圖），技術分析可切換 KD／MACD／均線／RSI 等 24 類指標（純本地 SQLite 計算，不額外呼叫 API）。
