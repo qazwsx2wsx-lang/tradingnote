@@ -1,6 +1,11 @@
 # tradingnote 現況（STATUS.md）
 
 ## 必讀簡介（2026-10-13）
+- **Claude（2026-10-13，「最強族群排行」，未 commit）**：資金流向頁散佈圖上方新增橫向堆疊長條圖
+  （`flow_chart.compute_strength_ranking`／`populate_strength_chart`、`flow_tab` 的 `flow_strength_chart`）：
+  強度＝法人買超 50%＋價格動能 30%＋量能 20%，皆為同批族群內百分位；法人項＝區間法人買超 ÷（今日成交額×天數）去掉族群大小
+  （分母是近似值）；缺法人資料的族群只用動能＋量能並標＊。**注意**：`directional_flow_value`（成交額×當日漲跌）是推估，不是真實淨流入，
+  排行刻意不用它；法人歷史未涵蓋整個流向區間時，法人項會退回最新單日快照。新增 `StrengthRankingTests`。**未做**：實機看過。
 - **Claude（2026-10-13，資金流向象限圖改版，未 commit）**：改 `ui/charts/flow_chart.py`／`ui/charts/base.py`／
   `ui/theme.py`／`ui/tabs/flow_tab.py`／`ui/pages/institutional_flow_page.py`。象限底色加濃（重點象限更濃）、
   象限名稱用 `set_corner_labels` 釘在視窗角落（縮放不消失）、泡泡填色改成方向（紅買綠賣灰中性，不再用分類雜湊色，

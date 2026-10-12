@@ -17,6 +17,8 @@ from ui import app_paths
 from ui.badges import _flow_momentum_insight
 from ui.charts.flow_chart import (
     FlowChartWidget,
+    compute_strength_ranking,
+    populate_strength_chart,
     _populate_institutional_direction_chart,
     populate_flow_chart,
 )
@@ -34,6 +36,8 @@ from ui.theme import (
     COLOR_LOSS,
     COLOR_MUTED,
     COLOR_TEXT,
+    ENTITY_COLORS,
+    SERIES_PALETTE,
 )
 from ui.widgets import _set_standard_icon
 
@@ -242,6 +246,18 @@ class FlowTabMixin:
         layout.addWidget(self.flow_picks_label)
         layout.addSpacing(8)
 
+        # 最強族群排行：先看這張找出誰最強，再用下方散佈圖理解為什麼（法人權重最高）。
+        self.flow_strength_legend = QtWidgets.QLabel(
+            f'<span style="color:{ENTITY_COLORS["外資"]};">■ 法人買超 50%</span>　'
+            f'<span style="color:{SERIES_PALETTE[1]};">■ 價格動能 30%</span>　'
+            f'<span style="color:{SERIES_PALETTE[2]};">■ 量能 20%</span>'
+        )
+        self.flow_strength_legend.setTextFormat(QtCore.Qt.RichText)
+        layout.addWidget(self.flow_strength_legend)
+        self.flow_strength_chart = new_plot(min_height=300, grid="x", interaction="static")
+        layout.addWidget(self.flow_strength_chart)
+        layout.addSpacing(8)
+
         self.flow_insight_card = InsightCard("資料載入中...", tone="neutral")
         layout.addWidget(self.flow_insight_card)
         layout.addSpacing(4)
@@ -427,6 +443,11 @@ class FlowTabMixin:
             overlapping_groups=overlapping_groups,
         )
         self._refresh_flow_picks(picks)
+        populate_strength_chart(
+            self.flow_strength_chart,
+            compute_strength_ranking(dashboard),
+            on_industry_click=self._on_industry_bubble_clicked,
+        )
         self._refresh_flow_summary(dashboard)
         self._refresh_institutional_direction(dashboard)
         self.refresh_flow_list(dashboard)

@@ -6,7 +6,11 @@ import statistics
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from tradingnote_history import compute_industry_flow, compute_valuation_flow
+from tradingnote_history import (
+    _cross_sectional_percentile,
+    compute_industry_flow,
+    compute_valuation_flow,
+)
 
 from ui.charts.base import (
     ChartWidget,
@@ -35,6 +39,8 @@ from ui.theme import (
     COLOR_SPECIAL_TINT,
     COLOR_TEXT,
     COLOR_WARNING_TINT,
+    ENTITY_COLORS,
+    SERIES_PALETTE,
 )
 
 
@@ -452,3 +458,109 @@ def populate_flow_chart(
         "focus_name": quadrant_specs[focus_key][0],
         "avoid_name": quadrant_specs[avoid_key][0],
     }
+
+
+# 強度分數權重：法人是唯一非推估的資金數據，佔比最高；缺法人資料時其餘兩項重新正規化。
+STRENGTH_WEIGHTS = (("inst", "法人買超", 0.5), ("mom", "價格動能", 0.3), ("vol", "量能", 0.2))
+
+
+def compute_strength_ranking(dashboard, limit=10):
+    """「最強族群」排行：法人買超強度 50%＋區間動能 30%＋量能 20%，各項先在同批族群中
+    轉成 0～100 百分位再加權。
+
+    法人強度＝區間法人合計買超 ÷（今日成交額 × 區間交易日數），把族群大小的影響拿掉
+    （用絕對金額會永遠偏向大族群）；分母用今日成交額乘天數是近似值。沒有法人資料的
+    族群只用動能＋量能（權重重新正規化）並標記 has_inst=False。"""
+    if dashboard is None:
+        return []
+    days = max(len(dashboard.period.actual_dates), 1)
+    inst_by_group = {
+        r.group: r for r in (dashboard.institutional_flow or ()) if r.covered_stocks > 0
+    }
+    flows = [
+        f for f in dashboard.industry_flow
+        if f.avg_change_pct is not None and f.volume_ratio is not None
+    ]
+    inst_strength = {
+        f.industry: inst_by_group[f.industry].total_value / (f.total_trading_value * days)
+        for f in flows
+        if f.industry in inst_by_group and f.total_trading_value > 0
+    }
+    inst_values = list(inst_strength.values())
+    mom_values = [f.avg_change_pct for f in flows]
+    vol_values = [f.volume_ratio for f in flows]
+    rows = []
+    for f in flows:
+        percentiles = {
+            "inst": _cross_sectional_percentile(inst_strength.get(f.industry), inst_values),
+            "mom": _cross_sectional_percentile(f.avg_change_pct, mom_values),
+            "vol": _cross_sectional_percentile(f.volume_ratio, vol_values),
+        }
+        available = [(key, w) for key, _label, w in STRENGTH_WEIGHTS if percentiles[key] is not None]
+        total_weight = sum(w for _key, w in available)
+        parts = {key: percentiles[key] * w / total_weight for key, w in available}
+        inst = inst_by_group.get(f.industry)
+        rows.append({
+            "group": f.industry,
+            "score": sum(parts.values()),
+            "parts": parts,
+            "has_inst": "inst" in parts,
+            "inst_value": inst.total_value if inst else None,
+            "change_pct": f.avg_change_pct,
+            "volume_ratio": f.volume_ratio,
+        })
+    rows.sort(key=lambda r: -r["score"])
+    return rows[:limit]
+
+
+def populate_strength_chart(chart, rows, on_industry_click=None):
+    """最強族群橫向堆疊長條：長度＝強度分數（0～100），三段顏色＝法人／動能／量能貢獻。"""
+    chart.clear()
+    plot = chart.getPlotItem()
+    if not rows:
+        empty_state(chart, "尚無足夠資料計算族群強度", title="最強族群排行")
+        return
+    ranked = list(reversed(rows))  # y 軸由下往上，最強的放最上面
+    colors = (ENTITY_COLORS.get("外資") or SERIES_PALETTE[0], SERIES_PALETTE[1], SERIES_PALETTE[2])
+    left = [0.0] * len(ranked)
+    for (key, label, _w), color in zip(STRENGTH_WEIGHTS, colors):
+        widths = [r["parts"].get(key, 0.0) for r in ranked]
+        chart.addItem(pg.BarGraphItem(
+            x0=left, y=list(range(len(ranked))), height=0.62, width=widths,
+            brush=pg.mkBrush(QtGui.QColor(color)), pen=pg.mkPen(None),
+        ))
+        left = [a + b for a, b in zip(left, widths)]
+    spots = []
+    for index, r in enumerate(ranked):
+        inst_text = (
+            f"法人區間買賣超：{_compact_money(r['inst_value'])}"
+            if r["inst_value"] is not None else "法人：無資料（僅用動能＋量能）"
+        )
+        spots.append({
+            "pos": (r["score"], index),
+            "size": 16,
+            "brush": pg.mkBrush(QtGui.QColor(0, 0, 0, 0)),
+            "pen": pg.mkPen(None),
+            "data": {"industry": r["group"], "tip": (
+                f"{r['group']}｜強度 {r['score']:.0f}\n{inst_text}\n"
+                f"區間漲跌：{r['change_pct']:+.2f}%　量比：{r['volume_ratio']:.2f} 倍\n"
+                f"法人 {r['parts'].get('inst', 0):.0f}＋動能 {r['parts'].get('mom', 0):.0f}"
+                f"＋量能 {r['parts'].get('vol', 0):.0f}\n點擊查看成分股"
+            )},
+        })
+    chart.addItem(bubble_scatter(
+        spots,
+        on_click=(lambda data: on_industry_click(data["industry"])) if on_industry_click else None,
+    ))
+    for index, r in enumerate(ranked):
+        label = pg.TextItem(
+            f"{r['score']:.0f}" + ("" if r["has_inst"] else "＊"), color=COLOR_TEXT, anchor=(0, 0.5)
+        )
+        label.setPos(r["score"] + 1, index)
+        chart.addItem(label)
+    plot.getAxis("left").setTicks([[(i, r["group"]) for i, r in enumerate(ranked)]])
+    plot.getAxis("left").setWidth(130)  # 族群名稱長短不一，固定寬度避免軸被壓縮到看不到字
+    plot.setXRange(0, 108, padding=0)
+    plot.setYRange(-0.7, len(ranked) - 0.3, padding=0)
+    set_title(chart, "最強族群排行（強度分數 0～100，＊＝無法人資料）")
+    set_axis_label(chart, "bottom", "強度分數＝法人買超 50%＋價格動能 30%＋量能 20%（同批族群內的百分位）")

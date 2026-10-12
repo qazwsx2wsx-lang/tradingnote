@@ -72,3 +72,28 @@ class ChartStyleTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StrengthRankingTests(unittest.TestCase):
+    def _dashboard(self):
+        from types import SimpleNamespace as NS
+        flow = [
+            NS(industry=name, avg_change_pct=chg, volume_ratio=vol, total_trading_value=1e9)
+            for name, chg, vol in (("A", 5, 2.0), ("B", 1, 1.0), ("C", -3, 0.5))
+        ]
+        inst = [
+            NS(group="A", covered_stocks=3, total_value=2e8),
+            NS(group="B", covered_stocks=3, total_value=-1e8),
+        ]
+        return NS(industry_flow=flow, institutional_flow=inst,
+                  period=NS(actual_dates=["d1", "d2"]))
+
+    def test_ranks_strongest_first_and_flags_missing_institutional(self):
+        from ui.charts.flow_chart import compute_strength_ranking
+        rows = compute_strength_ranking(self._dashboard())
+        self.assertEqual([r["group"] for r in rows], ["A", "B", "C"])
+        self.assertTrue(rows[0]["has_inst"])
+        self.assertFalse(rows[2]["has_inst"])  # C 沒有法人資料
+        self.assertAlmostEqual(rows[0]["score"], 100.0)
+        self.assertAlmostEqual(sum(rows[2]["parts"].values()), rows[2]["score"])
+        self.assertEqual(compute_strength_ranking(None), [])
