@@ -1,6 +1,11 @@
 # tradingnote 現況（STATUS.md）
 
 ## 必讀簡介（2026-10-13）
+- **Claude（2026-10-13，最強族群修正，未 commit）**：`FlowDashboardData` 新增 `institutional_covers_period`／
+  `institutional_missing_dates`；法人歷史沒涵蓋整個流向區間時，排行**整項排除法人**（動能 60／量能 40）並在頁面顯示缺哪幾天的警告。
+  排行移到獨立第一個分類按鈕「最強族群」（預設頁），散佈圖在第二個。同步模式 X 抖動加寬、兩個混合象限改名
+  （偏賣但金額買超／偏買但金額賣超）、角落不標名；提示文字註明泡泡色（今日）與象限（區間）可能不同。
+  用真實資料 offscreen 開 app 截圖確認（目前缺 2026-10-12 法人資料，按「更新法人資料」可補）。`test_tradingnote_flow_gui` 仍是既有失敗。
 - **Claude（2026-10-13，「最強族群排行」，未 commit）**：資金流向頁散佈圖上方新增橫向堆疊長條圖
   （`flow_chart.compute_strength_ranking`／`populate_strength_chart`、`flow_tab` 的 `flow_strength_chart`）：
   強度＝法人買超 50%＋價格動能 30%＋量能 20%，皆為同批族群內百分位；法人項＝區間法人買超 ÷（今日成交額×天數）去掉族群大小

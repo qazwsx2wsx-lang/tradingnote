@@ -84,6 +84,10 @@ class FlowDashboardData:
     classification_mode: str = CLASSIFICATION_INDUSTRY
     classification_scope: str | None = None
     institutional_flow: tuple = ()
+    # True＝institutional_flow 是整個流向區間的加總；False＝歷史法人表沒涵蓋整段區間，
+    # institutional_flow 只是最新單日快照（或空），不能當區間數據用。
+    institutional_covers_period: bool = False
+    institutional_missing_dates: tuple = ()
 
 
 class FlowAnalysisService:
@@ -246,9 +250,16 @@ class FlowAnalysisService:
             )
             history_flow = tuple(computed) if computed is not None else False
             self._remember(self._institutional_group_cache, history_key, history_flow)
-        if history_flow is not False:
+        institutional_covers_period = history_flow is not False
+        institutional_missing_dates = ()
+        if institutional_covers_period:
             institutional_flow = history_flow
-        elif self.institutional_cache_path is not None:
+        else:
+            have = set(institutional_history.completed_dates(self.db_path))
+            institutional_missing_dates = tuple(
+                d for d in period.actual_dates if d not in have
+            )
+        if not institutional_covers_period and self.institutional_cache_path is not None:
             institutional_rows = load_cached_institutional_snapshot(
                 self.institutional_cache_path
             )
@@ -279,6 +290,8 @@ class FlowAnalysisService:
             classification_mode=classification_mode,
             classification_scope=classification_scope,
             institutional_flow=institutional_flow,
+            institutional_covers_period=institutional_covers_period,
+            institutional_missing_dates=institutional_missing_dates,
         )
 
         if bubble_mode != "valuation":

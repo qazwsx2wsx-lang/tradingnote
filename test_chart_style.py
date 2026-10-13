@@ -97,3 +97,10 @@ class StrengthRankingTests(unittest.TestCase):
         self.assertAlmostEqual(rows[0]["score"], 100.0)
         self.assertAlmostEqual(sum(rows[2]["parts"].values()), rows[2]["score"])
         self.assertEqual(compute_strength_ranking(None), [])
+
+    def test_ranking_ignores_institutional_when_period_not_covered(self):
+        from ui.charts.flow_chart import compute_strength_ranking
+        dash = self._dashboard()
+        dash.institutional_covers_period = False
+        rows = compute_strength_ranking(dash)
+        self.assertTrue(rows and not any(r["has_inst"] for r in rows))

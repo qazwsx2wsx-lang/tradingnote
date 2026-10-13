@@ -36,6 +36,7 @@ from ui.theme import (
     COLOR_LOSS,
     COLOR_MUTED,
     COLOR_TEXT,
+    COLOR_WARNING,
     ENTITY_COLORS,
     SERIES_PALETTE,
 )
@@ -143,6 +144,7 @@ class FlowTabMixin:
         )
 
         sections = (
+            ("最強族群", self._build_flow_strength_section),
             ("族群泡泡圖", self._build_flow_chart_section),
             ("法人方向", self._build_institutional_direction_section),
             ("族群熱度排行", self._build_flow_list_section),
@@ -221,6 +223,52 @@ class FlowTabMixin:
         ):
             _populate_institutional_direction_chart(chart, rows, value_attr, title)
 
+    def _build_flow_strength_section(self, layout):
+        """最強族群排行：進頁面先看這張找出誰最強（法人權重最高），再到「族群泡泡圖」
+        看散佈位置來理解原因。"""
+        header = QtWidgets.QLabel("最強族群排行")
+        header.setProperty("header", True)
+        layout.addWidget(header)
+        self.flow_strength_warning = QtWidgets.QLabel()
+        self.flow_strength_warning.setWordWrap(True)
+        self.flow_strength_warning.setTextFormat(QtCore.Qt.RichText)
+        self.flow_strength_warning.setVisible(False)
+        layout.addWidget(self.flow_strength_warning)
+        self.flow_strength_legend = QtWidgets.QLabel()
+        self.flow_strength_legend.setTextFormat(QtCore.Qt.RichText)
+        layout.addWidget(self.flow_strength_legend)
+        self.flow_strength_chart = new_plot(min_height=380, grid="x", interaction="static")
+        layout.addWidget(self.flow_strength_chart, 1)
+
+    def _refresh_flow_strength(self, dashboard):
+        covered = getattr(dashboard, "institutional_covers_period", True)
+        inst_part = (
+            f'<span style="color:{ENTITY_COLORS["外資"]};">■ 法人買超 50%</span>　'
+            if covered else
+            f'<span style="color:{COLOR_MUTED};">■ 法人買超（本區間未計入）</span>　'
+        )
+        self.flow_strength_legend.setText(
+            inst_part
+            + f'<span style="color:{SERIES_PALETTE[1]};">■ 價格動能{" 30%" if covered else ""}</span>　'
+            + f'<span style="color:{SERIES_PALETTE[2]};">■ 量能{" 20%" if covered else ""}</span>'
+        )
+        if covered:
+            self.flow_strength_warning.setVisible(False)
+        else:
+            missing = dashboard.institutional_missing_dates
+            shown = "、".join(missing[:4]) + ("…" if len(missing) > 4 else "")
+            self.flow_strength_warning.setText(
+                f'<span style="color:{COLOR_WARNING};">⚠ 法人歷史資料未涵蓋此區間'
+                f'{f"（缺 {len(missing)} 天：{shown}）" if missing else ""}，'
+                "排行暫以價格動能＋量能計算，法人買超未計入。請到「法人資金流去哪？」按「更新法人資料」補齊。</span>"
+            )
+            self.flow_strength_warning.setVisible(True)
+        populate_strength_chart(
+            self.flow_strength_chart,
+            compute_strength_ranking(dashboard),
+            on_industry_click=self._on_industry_bubble_clicked,
+        )
+
     def _build_flow_chart_section(self, layout):
         self.flow_chart_header = QtWidgets.QLabel("官方產業資金流向圖")
         self.flow_chart_header.setProperty("header", True)
@@ -246,18 +294,6 @@ class FlowTabMixin:
         layout.addWidget(self.flow_picks_label)
         layout.addSpacing(8)
 
-        # 最強族群排行：先看這張找出誰最強，再用下方散佈圖理解為什麼（法人權重最高）。
-        self.flow_strength_legend = QtWidgets.QLabel(
-            f'<span style="color:{ENTITY_COLORS["外資"]};">■ 法人買超 50%</span>　'
-            f'<span style="color:{SERIES_PALETTE[1]};">■ 價格動能 30%</span>　'
-            f'<span style="color:{SERIES_PALETTE[2]};">■ 量能 20%</span>'
-        )
-        self.flow_strength_legend.setTextFormat(QtCore.Qt.RichText)
-        layout.addWidget(self.flow_strength_legend)
-        self.flow_strength_chart = new_plot(min_height=300, grid="x", interaction="static")
-        layout.addWidget(self.flow_strength_chart)
-        layout.addSpacing(8)
-
         self.flow_insight_card = InsightCard("資料載入中...", tone="neutral")
         layout.addWidget(self.flow_insight_card)
         layout.addSpacing(4)
@@ -277,7 +313,7 @@ class FlowTabMixin:
         layout.addSpacing(4)
 
         self.flow_chart_hint = QtWidgets.QLabel(
-            "泡泡顏色＝方向（見上方圖例）、大小＝資金比重；標名的是值得關注象限的大型族群，"
+            "泡泡顏色＝今日方向（可能與象限的區間狀態不同）、大小＝資金比重；標名的是值得關注象限的大型族群，"
             "其餘淡化，滑鼠移至泡泡查看數值。"
         )
         self.flow_chart_hint.setProperty("muted", True)
@@ -413,13 +449,13 @@ class FlowTabMixin:
             )
         elif overlapping_groups:
             self.flow_chart_hint.setText(
-                "泡泡顏色＝當日量價方向（見上方圖例）；"
+                "泡泡顏色＝今日量價方向（見上方圖例），象限＝區間狀態，兩者可能不同；"
                 "泡泡大小為成交涵蓋率。概念可重疊，各群組合計可能"
                 "超過 100%。先看淡色象限判斷區間狀態，滑鼠移至泡泡可看完整數值。"
             )
         else:
             self.flow_chart_hint.setText(
-                "泡泡顏色＝當日量價方向（見上方圖例）；"
+                "泡泡顏色＝今日量價方向（見上方圖例），象限＝區間狀態，兩者可能不同；"
                 "泡泡大小為成交佔比。先看淡色象限判斷區間狀態，"
                 "滑鼠移至泡泡可看完整數值與象限解讀。"
             )
@@ -443,11 +479,7 @@ class FlowTabMixin:
             overlapping_groups=overlapping_groups,
         )
         self._refresh_flow_picks(picks)
-        populate_strength_chart(
-            self.flow_strength_chart,
-            compute_strength_ranking(dashboard),
-            on_industry_click=self._on_industry_bubble_clicked,
-        )
+        self._refresh_flow_strength(dashboard)
         self._refresh_flow_summary(dashboard)
         self._refresh_institutional_direction(dashboard)
         self.refresh_flow_list(dashboard)

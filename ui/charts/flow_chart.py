@@ -67,10 +67,10 @@ def _flow_quadrant_specs(mode):
         }
     if mode == "institutional_sync":
         return {
-            (False, True): ("訊號不一致", "同步偏賣・金額卻偏買超", COLOR_WARNING_TINT),
+            (False, True): ("偏賣但金額買超", "多數法人賣・合計卻買超", COLOR_WARNING_TINT),
             (True, True): ("主力同步買超", "同步偏買・買超金額大", COLOR_GAIN_TINT_STRONG),
             (False, False): ("主力同步賣超", "同步偏賣・賣超金額大", COLOR_LOSS_TINT_STRONG),
-            (True, False): ("訊號不一致", "同步偏買・金額卻偏賣超", COLOR_WARNING_TINT),
+            (True, False): ("偏買但金額賣超", "多數法人買・合計卻賣超", COLOR_WARNING_TINT),
         }
     return {
         (False, True): ("放量承壓", "區間下跌・今日放量", COLOR_LOSS_TINT),
@@ -318,12 +318,23 @@ def populate_flow_chart(
         for f in plotted:
             n = seen.get(xs_of(f), 0)
             seen[xs_of(f)] = n + 1
-            jitter[f.industry] = ((n % 5) - 2) * 0.07
+            jitter[f.industry] = ((n % 7) - 3) * 0.09
     x_span = (x_max - x_min) or 1
     y_span = (y_max - y_min) or 1
+
+    def in_corner_label_zone(x, y):
+        # 象限名稱釘在四個角落；落在這些角落的泡泡不標名，避免文字疊在象限名稱上。
+        fx = (x - view_bounds[0]) / ((view_bounds[1] - view_bounds[0]) or 1)
+        fy = (y - view_bounds[2]) / ((view_bounds[3] - view_bounds[2]) or 1)
+        return (fx < 0.2 or fx > 0.8) and (fy < 0.15 or fy > 0.85)
+
     labeled = set(
         select_bubble_labels(
-            [(f.industry, xs_of(f) + jitter.get(f.industry, 0), ys_of(f)) for f in ranked],
+            [
+                (f.industry, xs_of(f) + jitter.get(f.industry, 0), ys_of(f))
+                for f in ranked
+                if not in_corner_label_zone(xs_of(f) + jitter.get(f.industry, 0), ys_of(f))
+            ],
             limit=8,
             span_x=x_span,
             span_y=y_span,
@@ -474,8 +485,12 @@ def compute_strength_ranking(dashboard, limit=10):
     if dashboard is None:
         return []
     days = max(len(dashboard.period.actual_dates), 1)
+    # 歷史法人資料沒涵蓋整個區間時，institutional_flow 只是單日快照，跟區間動能／量能
+    # 的時間口徑不一致——整項排除（其餘兩項重新正規化），由 UI 顯示警告。
     inst_by_group = {
-        r.group: r for r in (dashboard.institutional_flow or ()) if r.covered_stocks > 0
+        r.group: r
+        for r in (dashboard.institutional_flow or ())
+        if r.covered_stocks > 0 and getattr(dashboard, "institutional_covers_period", True)
     }
     flows = [
         f for f in dashboard.industry_flow
@@ -563,4 +578,9 @@ def populate_strength_chart(chart, rows, on_industry_click=None):
     plot.setXRange(0, 108, padding=0)
     plot.setYRange(-0.7, len(ranked) - 0.3, padding=0)
     set_title(chart, "最強族群排行（強度分數 0～100，＊＝無法人資料）")
-    set_axis_label(chart, "bottom", "強度分數＝法人買超 50%＋價格動能 30%＋量能 20%（同批族群內的百分位）")
+    set_axis_label(
+        chart, "bottom",
+        "強度分數＝法人買超 50%＋價格動能 30%＋量能 20%（同批族群內的百分位）"
+        if any(r["has_inst"] for r in rows)
+        else "強度分數＝價格動能 60%＋量能 40%（法人資料不足，未計入；同批族群內的百分位）",
+    )
