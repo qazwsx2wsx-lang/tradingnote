@@ -114,6 +114,13 @@ class TdccHistoryBackfillTests(unittest.TestCase):
             self.assertEqual(chips.pending_tdcc_pairs(db, ["A", "B", "NONE"], ["20261002", "20260925"]), [])
             self.assertEqual(len(chips.holder_summary(db, "A")), 2)
 
+    def test_weeks_limits_dates(self):
+        with tempfile.TemporaryDirectory() as d:
+            client = FakeClient()
+            r = chips.backfill_tdcc_history(Path(d) / "h.db", ["A"], None, None, delay_seconds=0,
+                                            client=client, weeks=1)
+            self.assertEqual((r["total"], client.calls), (1, [("A", "20261002")]))
+
     def test_holder_total_falls_back_to_level_16(self):
         with tempfile.TemporaryDirectory() as d:
             db = Path(d) / "h.db"
@@ -122,6 +129,27 @@ class TdccHistoryBackfillTests(unittest.TestCase):
             conn.commit()
             conn.close()
             self.assertEqual(chips.holder_summary(db, "X")[0]["holders"], 500)
+
+
+class BigHolderChangeTests(unittest.TestCase):
+    def test_delta_between_base_week_and_latest_week(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "h.db"
+            conn = chips._connect(db)
+            conn.executemany("INSERT INTO tdcc_holders VALUES (?,?,?,?,?,?)", [
+                ("2026-09-25", "A", 12, 1, 1, 10.0), ("2026-09-25", "A", 15, 1, 1, 50.0),
+                ("2026-10-08", "A", 12, 1, 1, 12.0), ("2026-10-08", "A", 15, 1, 1, 51.0),
+                ("2026-10-08", "A", 5, 1, 1, 30.0),   # 小戶級距不算
+                ("2026-10-08", "B", 15, 1, 1, 9.0),    # B 沒有基準週
+            ])
+            conn.commit()
+            conn.close()
+            result, dates = chips.big_holder_changes(db, ["A", "B"], "2026-10-05", "2026-10-13")
+            self.assertEqual(dates, ("2026-09-25", "2026-10-08"))
+            self.assertAlmostEqual(result["A"]["delta"], 3.0)
+            self.assertNotIn("B", result)
+            # 區間開始前沒有任何週資料 → 不顯示
+            self.assertEqual(chips.big_holder_changes(db, ["A"], "2026-09-01", "2026-10-13"), ({}, None))
 
 
 if __name__ == "__main__":

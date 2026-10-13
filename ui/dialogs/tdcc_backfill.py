@@ -30,7 +30,7 @@ class TdccBackfillDialog(DialogBase):
         self._stop_event = None
 
         intro = QtWidgets.QLabel(
-            "從集保官網逐檔逐週補約一年的大戶持股分布（每筆間隔 1 秒）。可隨時暫停或關閉，"
+            "從集保官網逐檔逐週補約一年的大戶持股分布（每筆間隔 1 秒）。「只補最近 2 週」每檔只多查 1 次，前 50 名約 1 分鐘。可隨時暫停或關閉，"
             "下次按「開始」會從沒查過的地方繼續；補資料時其他功能照常使用。"
         )
         intro.setWordWrap(True)
@@ -39,6 +39,11 @@ class TdccBackfillDialog(DialogBase):
         self.scope_combo = QtWidgets.QComboBox()
         self.scope_combo.addItem(f"目前資金流入前 50 名（{len(self._scopes[SCOPE_TOP])} 檔）", SCOPE_TOP)
         self.scope_combo.addItem(f"全市場個股（{len(self._scopes[SCOPE_ALL])} 檔，需數小時以上）", SCOPE_ALL)
+
+        self.weeks_combo = QtWidgets.QComboBox()
+        for label, weeks in (("只補最近 2 週（最快，夠算大戶占比變化）", 2),
+                             ("最近 8 週", 8), ("全部約一年", None)):
+            self.weeks_combo.addItem(label, weeks)
 
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -63,6 +68,7 @@ class TdccBackfillDialog(DialogBase):
         layout.addWidget(intro)
         layout.addSpacing(8)
         layout.addWidget(self.scope_combo)
+        layout.addWidget(self.weeks_combo)
         layout.addSpacing(8)
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.status_label)
@@ -77,6 +83,7 @@ class TdccBackfillDialog(DialogBase):
     def _set_running(self, running):
         self.start_button.setEnabled(not running)
         self.scope_combo.setEnabled(not running)
+        self.weeks_combo.setEnabled(not running)
         self.stop_button.setEnabled(running)
 
     def _start(self):
@@ -88,13 +95,14 @@ class TdccBackfillDialog(DialogBase):
             return
         self._stop_event = stop = threading.Event()
         db_path = app_paths.HISTORY_DB_PATH
+        weeks = self.weeks_combo.currentData()
 
         def work(_cancel_event, emit):
             # 取消只用自己的 stop 事件：BackgroundTask.cancel 會連「完成」回呼一起丟掉，
             # 這樣就沒辦法在暫停後正確還原按鈕。
             return chips.backfill_tdcc_history(
                 db_path, tickers, cancel_event=stop, progress=emit,
-                delay_seconds=REQUEST_DELAY_SECONDS)
+                delay_seconds=REQUEST_DELAY_SECONDS, weeks=weeks)
 
         self._set_running(True)
         self.status_label.setText("連線集保官網…")

@@ -380,13 +380,13 @@ def pending_tdcc_pairs(db_path, tickers, dates):
 
 
 def backfill_tdcc_history(db_path, tickers, cancel_event=None, progress=None,
-                          delay_seconds=1.0, client=None):
+                          delay_seconds=1.0, client=None, weeks=None):
     """逐檔逐週補集保歷史。可隨時由 cancel_event 中斷，下次呼叫會從沒查過的組合繼續
     （每查完一筆就已寫入並標記）。progress(done, total, label) 的 done／total 含先前已完成的，
     所以續跑時進度條從原本的位置接續。連續失敗 MAX_CONSECUTIVE_FAILURES 次就拋
-    PriceFetchError（避免被限流時空轉）。回傳 {"done", "total", "stopped", "failed"}。"""
+    PriceFetchError（避免被限流時空轉）。weeks 只補最近幾週（None＝官網全部約一年）。回傳 {"done", "total", "stopped", "failed"}。"""
     client = client or TdccQueryClient()
-    dates = client.dates
+    dates = client.dates[:weeks] if weeks else client.dates  # 官網日期新到舊
     tickers = list(tickers)
     total = len(tickers) * len(dates)
     pairs = pending_tdcc_pairs(db_path, tickers, dates)
@@ -422,3 +422,34 @@ def backfill_tdcc_history(db_path, tickers, cancel_event=None, progress=None,
             progress(done, total, f"{ticker}　{iso}")
         time.sleep(delay_seconds)
     return {"done": done, "total": total, "stopped": stopped, "failed": failed}
+
+
+def big_holder_changes(db_path, tickers, start_date, end_date):
+    """流向區間內 400 張以上大戶持股占比的變化（百分點）。
+
+    集保是週資料，所以取「end_date 以前最新的一週」對照「start_date 之前最新的一週」
+    （區間開始前的基準）。回傳 {ticker: {"latest","base","delta"}} 與 (base_date, end_date)；
+    任一週沒有資料就回傳 ({}, None)。"""
+    tickers = list(tickers)
+    conn = _connect(db_path)
+    try:
+        end = conn.execute(
+            "SELECT MAX(data_date) FROM tdcc_holders WHERE data_date <= ?", (end_date,)).fetchone()[0]
+        base = conn.execute(
+            "SELECT MAX(data_date) FROM tdcc_holders WHERE data_date < ?", (start_date,)).fetchone()[0]
+        if not end or not base or end == base or not tickers:
+            return {}, None
+        marks = ",".join("?" * len(tickers))
+        pct = {}
+        for date in (base, end):
+            pct[date] = dict(conn.execute(
+                f"SELECT ticker, SUM(pct) FROM tdcc_holders WHERE data_date = ? "
+                f"AND level BETWEEN {BIG_HOLDER_LEVEL} AND {HUGE_HOLDER_LEVEL} "
+                f"AND ticker IN ({marks}) GROUP BY ticker", (date, *tickers)).fetchall())
+    finally:
+        conn.close()
+    result = {
+        t: {"latest": pct[end][t], "base": pct[base][t], "delta": pct[end][t] - pct[base][t]}
+        for t in tickers if t in pct[end] and t in pct[base]
+    }
+    return result, (base, end)

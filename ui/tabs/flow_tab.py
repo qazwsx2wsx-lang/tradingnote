@@ -9,6 +9,7 @@ from datetime import date
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from tradingnote_concepts import CLASSIFICATION_INDUSTRY, CLASSIFICATION_LABELS, CLASSIFICATION_VALUE_CHAIN_LEAF
+import tradingnote_chips as chips
 import tradingnote_institutional_history as ih
 from tradingnote_flow import FlowPeriod
 from tradingnote_history import VOLUME_RATIO_TIERS, get_available_dates, get_data_revision, get_industry_map
@@ -711,7 +712,8 @@ class FlowTabMixin:
 
         self._stock_flow_hint_base = (
             "依區間累積成交金額排序（反映熱門程度，不代表買進）；「法人買賣超」是三大法人"
-            "在同一區間的實際淨買賣金額（紅買超、綠賣超），可看出高成交是被買還是被賣。"
+            "在同一區間的實際淨買賣金額（紅買超、綠賣超），可看出高成交是被買還是被賣；"
+            "「大戶占比Δ」是集保 400 張以上持股占比相對區間前一週的增減（百分點，週資料，滑鼠移上去看日期）。"
             "雙擊股票可查看完整個股資訊。"
         )
         hint = self.stock_capital_flow_hint = QtWidgets.QLabel(self._stock_flow_hint_base)
@@ -721,7 +723,7 @@ class FlowTabMixin:
         layout.addSpacing(8)
 
         self.stock_capital_flow_list = QtWidgets.QTreeWidget()
-        self.stock_capital_flow_list.setColumnCount(10)
+        self.stock_capital_flow_list.setColumnCount(11)
         self.stock_capital_flow_list.setHeaderLabels(
             [
                 "排名",
@@ -734,6 +736,7 @@ class FlowTabMixin:
                 "量比",
                 "全市場比重%",
                 "法人買賣超(億)",
+                "大戶占比Δ(pp)",
             ]
         )
         self.stock_capital_flow_list.setRootIsDecorated(False)
@@ -768,6 +771,12 @@ class FlowTabMixin:
             [stock.ticker for stock in stocks],
             dashboard.institutional_dates,
         )
+        # 400 張以上大戶持股占比的週變化（集保週資料；沒有基準週就留「—」）
+        holder_delta, holder_dates = chips.big_holder_changes(
+            app_paths.HISTORY_DB_PATH, [stock.ticker for stock in stocks],
+            dashboard.period.actual_dates[0] if dashboard.period.actual_dates else dashboard.period.start_date,
+            dashboard.period.end_date or dashboard.period.start_date,
+        )
         note = self._institutional_coverage_note(dashboard)
         self.stock_capital_flow_list.headerItem().setText(9, "法人買賣超(億)")
         self.stock_capital_flow_hint.setText(self._stock_flow_hint_base + (f"　{note}" if note else ""))
@@ -796,6 +805,10 @@ class FlowTabMixin:
                         f"{inst_net.get(stock.ticker, 0) / 1e8:+,.2f}"
                         if inst_net is not None else "—"
                     ),
+                    (
+                        f"{holder_delta[stock.ticker]['delta']:+.2f}"
+                        if stock.ticker in holder_delta else "—"
+                    ),
                 ]
             )
             item.setData(0, QtCore.Qt.UserRole, stock.ticker)
@@ -804,7 +817,15 @@ class FlowTabMixin:
                 item.setToolTip(9, "沒有此區間的歷史法人資料，請到「法人資金流去哪？」更新法人資料")
             else:
                 item.setForeground(9, QtGui.QColor(gain_loss_color(inst_net.get(stock.ticker, 0))))
-            for col in (0, 1, 3, 4, 5, 6, 7, 8, 9):
+            hd = holder_delta.get(stock.ticker)
+            if hd is not None:
+                item.setForeground(10, QtGui.QColor(gain_loss_color(hd["delta"])))
+                item.setToolTip(10, (
+                    f"400 張以上大戶持股 {hd['base']:.2f}%（{holder_dates[0]}）→ "
+                    f"{hd['latest']:.2f}%（{holder_dates[1]}）"))
+            else:
+                item.setToolTip(10, "沒有區間前後兩週的集保資料，可按右上「補集保大戶歷史…」補資料")
+            for col in (0, 1, 3, 4, 5, 6, 7, 8, 9, 10):
                 item.setTextAlignment(col, QtCore.Qt.AlignCenter)
             if stock.change_pct is not None:
                 color = gain_loss_color(stock.change_pct)
