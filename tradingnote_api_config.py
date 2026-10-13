@@ -77,3 +77,6 @@ TWSE_MARGIN_URL = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
 TPEX_MARGIN_URL = "https://www.tpex.org.tw/www/zh-tw/margin/balance"
 # 集保戶股權分散表（每週一次、全市場、只有最新一週的 CSV）
 TDCC_HOLDERS_URL = "https://opendata.tdcc.com.tw/getOD.ashx?id=1-5"
+# 集保官網「集保戶股權分散表」歷史查詢（約一年、逐檔逐週、免驗證碼；表單 token 一次性，
+# 每次回應都會帶下一個）
+TDCC_QUERY_URL = "https://www.tdcc.com.tw/portal/zh/smWeb/qryStock"

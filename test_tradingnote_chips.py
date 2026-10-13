@@ -65,5 +65,64 @@ class TdccTests(unittest.TestCase):
             self.assertEqual(len(chips.tdcc_dates(db)), 1)
 
 
+class FakeClient:
+    dates = ["20261002", "20260925"]
+
+    def __init__(self):
+        self.calls = []
+
+    def query(self, ticker, ymd):
+        self.calls.append((ticker, ymd))
+        if ticker == "NONE":
+            return []
+        iso = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}"
+        return [(iso, ticker, 16, 10, 100, 100.0)]
+
+
+class TdccHistoryBackfillTests(unittest.TestCase):
+    def test_parse_query_html(self):
+        html = (
+            '<tr><td align="center">15</td><td align="center">1,000,001以上</td>'
+            '<td align="right">1,481</td><td align="right">21,966,711,289</td>'
+            '<td align="right">84.70</td></tr>'
+        )
+        self.assertEqual(chips.parse_tdcc_query(html, "2026-09-18", "2330"),
+                         [("2026-09-18", "2330", 15, 1481, 21966711289, 84.7)])
+
+    def test_interrupt_and_resume(self):
+        import threading
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "h.db"
+            client, stop, seen = FakeClient(), threading.Event(), []
+
+            def progress(done, total, label):
+                seen.append((done, total))
+                if done == 2:
+                    stop.set()
+
+            first = chips.backfill_tdcc_history(db, ["A", "B", "NONE"], stop, progress,
+                                                delay_seconds=0, client=client)
+            self.assertTrue(first["stopped"])
+            self.assertEqual(first["done"], 2)
+            self.assertEqual(first["total"], 6)
+            resumed = FakeClient()
+            second = chips.backfill_tdcc_history(db, ["A", "B", "NONE"], None, None,
+                                                 delay_seconds=0, client=resumed)
+            self.assertFalse(second["stopped"])
+            self.assertEqual(second["done"], 6)
+            self.assertEqual(len(resumed.calls), 4)  # 前兩筆不重查
+            self.assertEqual(chips.pending_tdcc_pairs(db, ["A", "B", "NONE"], ["20261002", "20260925"]), [])
+            self.assertEqual(len(chips.holder_summary(db, "A")), 2)
+
+    def test_holder_total_falls_back_to_level_16(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "h.db"
+            conn = chips._connect(db)
+            conn.execute("INSERT INTO tdcc_holders VALUES ('2026-01-02','X',16,500,10,100.0)")
+            conn.commit()
+            conn.close()
+            self.assertEqual(chips.holder_summary(db, "X")[0]["holders"], 500)
+
+
 if __name__ == "__main__":
     unittest.main()

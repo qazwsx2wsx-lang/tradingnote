@@ -11,7 +11,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from tradingnote_concepts import CLASSIFICATION_INDUSTRY, CLASSIFICATION_LABELS, CLASSIFICATION_VALUE_CHAIN_LEAF
 import tradingnote_institutional_history as ih
 from tradingnote_flow import FlowPeriod
-from tradingnote_history import VOLUME_RATIO_TIERS, get_available_dates, get_data_revision
+from tradingnote_history import VOLUME_RATIO_TIERS, get_available_dates, get_data_revision, get_industry_map
 from tradingnote_tasks import run_background_task
 
 from ui import app_paths
@@ -28,6 +28,7 @@ from ui.components.insight_card import InsightCard
 from ui.components.section_card import SectionCard
 from ui.components.signal_badge import SignalBadge
 from ui.components.stat_card import StatCard
+from ui.dialogs.tdcc_backfill import TdccBackfillDialog
 from ui.dialogs.stock_detail import IndustryTopStocksDialog, StockDetailDialog
 from ui.dialogs.trading_date import TradingDateDialog
 from ui.format import gain_loss_color
@@ -698,7 +699,14 @@ class FlowTabMixin:
     def _build_stock_capital_flow_section(self, layout):
         header = QtWidgets.QLabel("個股資金流入前 50 名")
         header.setProperty("header", True)
-        layout.addWidget(header)
+        header_row = QtWidgets.QHBoxLayout()
+        header_row.addWidget(header)
+        header_row.addStretch(1)
+        tdcc_button = QtWidgets.QPushButton("補集保大戶歷史…")
+        tdcc_button.setToolTip("從集保官網補約一年的大戶持股分布，可隨時暫停、之後繼續")
+        tdcc_button.clicked.connect(self._open_tdcc_backfill)
+        header_row.addWidget(tdcc_button)
+        layout.addLayout(header_row)
         layout.addSpacing(4)
 
         self._stock_flow_hint_base = (
@@ -736,6 +744,19 @@ class FlowTabMixin:
             self._on_stock_capital_flow_double_clicked
         )
         layout.addWidget(self.stock_capital_flow_list)
+
+    def _open_tdcc_backfill(self):
+        existing = getattr(self, "_tdcc_dialog", None)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        top = [stock.ticker for stock in self.flow_service.analyze(
+            self.snapshot, self.flow_period).stock_capital_flow]
+        everyone = sorted(t for t in get_industry_map(app_paths.HISTORY_DB_PATH)
+                          if t.isdigit() and len(t) == 4)
+        self._tdcc_dialog = TdccBackfillDialog(self, top, everyone)
+        self._tdcc_dialog.show()
 
     def refresh_stock_capital_flow_list(self, dashboard=None):
         if dashboard is None:

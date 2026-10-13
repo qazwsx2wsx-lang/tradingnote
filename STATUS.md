@@ -1,6 +1,11 @@
 # tradingnote 現況（STATUS.md）
 
 ## 必讀簡介（2026-10-14）
+- **Claude（2026-10-14，集保歷史回補小模組，未 commit）**：`tradingnote_chips.backfill_tdcc_history`（集保官網逐檔逐週查詢，約一年、免驗證碼，
+  表單 token 一次性所以循序請求）＋`ui/dialogs/tdcc_backfill.py` 非強制回應對話框，入口是「個股資金流入前 50 名」標題旁「補集保大戶歷史…」。
+  背景執行緒、進度條、可暫停／關閉；每筆寫入並記在 `tdcc_checked`，續跑接續進度。範圍：前 50 或全市場四碼個股（全市場約 12 萬次、數小時以上）。
+  FinMind `TaiwanStockHoldingSharesPer` 需付費等級，不可用。**注意**：較舊週沒有「差異數調整」列，合計在級別 16（`holder_summary` 已處理）。
+  驗證：單元測試（解析、中斷續跑）＋offscreen 對真實官網跑對話框（開始→暫停→續跑→完成）。**未做**：實機點按鈕、全市場長跑。
 - **Claude（2026-10-14，籌碼資料只存檔，未 commit）**：新增 `tradingnote_chips.py`（表 `daily_margin`＝個股融資融券逐日餘額（張），
   `tdcc_holders`＝集保戶股權分散表（週）），`scripts/fetch_daily.py`／`scripts/backfill.py` 會一併更新。**還沒接進任何分析或畫面**
   （user 說先存資料）。**注意**：集保 CSV 只有最新一週，歷史只能從第一次存檔起累積；融資融券用 `daily_prices` 的日期當交易日曆，

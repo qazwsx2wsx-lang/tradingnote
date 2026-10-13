@@ -6,6 +6,7 @@
 擁有的表（ARCHITECTURE.md「一個模組管一張表」）：
   daily_margin   個股融資融券逐日餘額（上市＋上櫃，單位：張）
   tdcc_holders   集保戶股權分散表（個股 × 持股分級 × 週資料日；人數、股數、占比）
+  tdcc_checked   集保歷史逐檔查詢已完成的（週資料日, 代號），含「查無資料」，讓回補可中斷續跑
 
 融資融券只補 daily_prices 已有的交易日（交易日曆來源），所以不需要自己判斷休市。
 集保 CSV 只提供最新一週，歷史只能從開始儲存那天起累積。
@@ -14,14 +15,17 @@
 """
 
 import csv
+import http.cookiejar
 import io
+import re
 import sqlite3
 import time
+import urllib.parse
 from pathlib import Path
-from urllib.request import Request, urlopen
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 import tradingnote_history as history
-from tradingnote_api_config import TDCC_HOLDERS_URL, TPEX_MARGIN_URL, TWSE_MARGIN_URL
+from tradingnote_api_config import TDCC_HOLDERS_URL, TDCC_QUERY_URL, TPEX_MARGIN_URL, TWSE_MARGIN_URL
 from tradingnote_http import PriceFetchError, http_get_json, to_float, to_int
 
 DEFAULT_TARGET_DAYS = 60
@@ -68,6 +72,11 @@ def _connect(db_path):
         );
         CREATE INDEX IF NOT EXISTS idx_tdcc_holders_ticker
             ON tdcc_holders (ticker, data_date DESC);
+        CREATE TABLE IF NOT EXISTS tdcc_checked (
+            data_date TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            PRIMARY KEY (data_date, ticker)
+        );
         """
     )
     return conn
@@ -270,10 +279,146 @@ def holder_summary(db_path, ticker):
     by_date = {}
     for date, level, holders, pct in rows:
         d = by_date.setdefault(date, {"date": date, "holders": 0, "big_pct": 0.0, "huge_pct": 0.0})
-        if level == TOTAL_LEVEL:
+        # 合計列通常是 17；沒有「差異數調整」列的週，合計就在 16
+        if level == TOTAL_LEVEL or (level == TOTAL_LEVEL - 1 and holders and not d["holders"]):
             d["holders"] = holders
         if BIG_HOLDER_LEVEL <= level <= HUGE_HOLDER_LEVEL:
             d["big_pct"] += pct
         if level == HUGE_HOLDER_LEVEL:
             d["huge_pct"] += pct
     return list(by_date.values())
+
+
+# ---------- 集保歷史回補（官網逐檔逐週查詢） ----------
+
+_TOKEN_RE = re.compile(r'SYNCHRONIZER_TOKEN" value="([^"]*)')
+_DATE_RE = re.compile(r'<option value="(\d{8})"')
+_ROW_RE = re.compile(
+    r'<tr>\s*<td align="center">(\d+)</td>\s*<td[^>]*>[^<]*</td>\s*'
+    r'<td align="right">([^<]*)</td>\s*<td align="right">([^<]*)</td>\s*'
+    r'<td align="right">([^<]*)</td>', re.S)
+MAX_CONSECUTIVE_FAILURES = 5
+
+
+def parse_tdcc_query(html, iso, ticker):
+    """官網查詢結果 HTML → [(data_date, ticker, level, holders, shares, pct)]；查無資料回傳 []。"""
+    rows = []
+    for level, holders, shares, pct in _ROW_RE.findall(html):
+        rows.append((iso, ticker, int(level), _n(holders), _n(shares), to_float(pct.replace(",", "")) or 0.0))
+    return rows
+
+
+class TdccQueryClient:
+    """集保官網查詢的 session：表單 token 是一次性的，每次回應帶下一個，所以請求要循序進行。"""
+
+    def __init__(self, timeout=30):
+        self._opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self._opener.addheaders = [("User-Agent", "Mozilla/5.0")]
+        self._timeout = timeout
+        self._token = None
+        self._dates = []
+        self._load_form()
+
+    def _load_form(self):
+        try:
+            page = self._opener.open(TDCC_QUERY_URL, timeout=self._timeout).read().decode("utf-8", "replace")
+        except (OSError, ValueError) as exc:
+            raise PriceFetchError(f"集保查詢頁連線失敗：{exc}") from exc
+        match = _TOKEN_RE.search(page)
+        if not match:
+            raise PriceFetchError("集保查詢頁格式改變（找不到表單 token）")
+        self._token = match.group(1)
+        self._dates = _DATE_RE.findall(page)
+
+    @property
+    def dates(self):
+        """官網可查的週資料日（YYYYMMDD，新到舊）。"""
+        return list(self._dates)
+
+    def query(self, ticker, ymd):
+        """查一檔一週；回傳 parse_tdcc_query 的列（查無資料為 []）。失敗拋 PriceFetchError。"""
+        if self._token is None:
+            self._load_form()
+        data = urllib.parse.urlencode({
+            "SYNCHRONIZER_TOKEN": self._token, "SYNCHRONIZER_URI": "/portal/zh/smWeb/qryStock",
+            "method": "submit", "firDate": self._dates[0] if self._dates else ymd,
+            "scaDate": ymd, "sqlMethod": "StockNo", "stockNo": ticker, "stockName": "",
+        }).encode()
+        self._token = None  # token 已用掉；回應沒帶新的就下次重新載入表單
+        try:
+            page = self._opener.open(TDCC_QUERY_URL, data, timeout=self._timeout).read().decode("utf-8", "replace")
+        except (OSError, ValueError) as exc:
+            raise PriceFetchError(f"集保查詢連線失敗：{exc}") from exc
+        match = _TOKEN_RE.search(page)
+        if match:
+            self._token = match.group(1)
+        iso = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}"
+        rows = parse_tdcc_query(page, iso, ticker)
+        if rows:
+            return rows
+        if "查無此資料" in page:
+            return []
+        raise PriceFetchError("集保查詢回應格式無法辨識（可能被限流或 token 失效）")
+
+
+def pending_tdcc_pairs(db_path, tickers, dates):
+    """還沒查過的 [(ticker, YYYYMMDD)]：依代號分組（同一檔連續查完），週由新到舊。
+    已有資料（CSV 或先前查詢）或已確認查無資料的組合不再出現。"""
+    conn = _connect(db_path)
+    try:
+        have = {(r[0], r[1]) for r in conn.execute("SELECT DISTINCT data_date, ticker FROM tdcc_holders")}
+        have |= {(r[0], r[1]) for r in conn.execute("SELECT data_date, ticker FROM tdcc_checked")}
+    finally:
+        conn.close()
+    pairs = []
+    for ticker in tickers:
+        for ymd in dates:
+            iso = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}"
+            if (iso, ticker) not in have:
+                pairs.append((ticker, ymd))
+    return pairs
+
+
+def backfill_tdcc_history(db_path, tickers, cancel_event=None, progress=None,
+                          delay_seconds=1.0, client=None):
+    """逐檔逐週補集保歷史。可隨時由 cancel_event 中斷，下次呼叫會從沒查過的組合繼續
+    （每查完一筆就已寫入並標記）。progress(done, total, label) 的 done／total 含先前已完成的，
+    所以續跑時進度條從原本的位置接續。連續失敗 MAX_CONSECUTIVE_FAILURES 次就拋
+    PriceFetchError（避免被限流時空轉）。回傳 {"done", "total", "stopped", "failed"}。"""
+    client = client or TdccQueryClient()
+    dates = client.dates
+    tickers = list(tickers)
+    total = len(tickers) * len(dates)
+    pairs = pending_tdcc_pairs(db_path, tickers, dates)
+    done = total - len(pairs)
+    failed = streak = 0
+    stopped = False
+    if progress:
+        progress(done, total, "準備中")
+    for ticker, ymd in pairs:
+        if cancel_event is not None and cancel_event.is_set():
+            stopped = True
+            break
+        iso = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}"
+        try:
+            rows = client.query(ticker, ymd)
+            streak = 0
+        except PriceFetchError as exc:
+            failed += 1
+            streak += 1
+            if streak >= MAX_CONSECUTIVE_FAILURES:
+                raise PriceFetchError(f"連續 {streak} 次查詢失敗，已停止：{exc}") from exc
+            time.sleep(delay_seconds * 3)
+            continue
+        conn = _connect(db_path)
+        try:
+            conn.executemany("INSERT OR REPLACE INTO tdcc_holders VALUES (?,?,?,?,?,?)", rows)
+            conn.execute("INSERT OR REPLACE INTO tdcc_checked VALUES (?, ?)", (iso, ticker))
+            conn.commit()
+        finally:
+            conn.close()
+        done += 1
+        if progress:
+            progress(done, total, f"{ticker}　{iso}")
+        time.sleep(delay_seconds)
+    return {"done": done, "total": total, "stopped": stopped, "failed": failed}
