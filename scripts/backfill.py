@@ -10,6 +10,7 @@
 import argparse
 
 import _bootstrap  # noqa: F401
+import tradingnote_chips as chips
 import tradingnote_institutional_history as ih
 from tradingnote_paths import APP_PATHS
 
@@ -21,6 +22,9 @@ def main():
     args = parser.parse_args()
     written = ih.backfill(APP_PATHS.history_db, target_days=args.days, delay_seconds=args.delay)
     print(f"完成：新寫入 {len(written)} 個交易日，資料庫共 {len(ih.completed_dates(APP_PATHS.history_db))} 天")
+    margin = chips.backfill_margin(APP_PATHS.history_db, target_days=args.days, delay_seconds=args.delay)
+    print(f"融資融券：新寫入 {len(margin)} 個交易日")
+    print(f"集保：最新一週 {chips.fetch_tdcc_snapshot(APP_PATHS.history_db)}")
 
 
 if __name__ == "__main__":

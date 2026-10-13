@@ -1,6 +1,13 @@
 # tradingnote 現況（STATUS.md）
 
-## 必讀簡介（2026-10-13）
+## 必讀簡介（2026-10-14）
+- **Claude（2026-10-14，籌碼資料只存檔，未 commit）**：新增 `tradingnote_chips.py`（表 `daily_margin`＝個股融資融券逐日餘額（張），
+  `tdcc_holders`＝集保戶股權分散表（週）），`scripts/fetch_daily.py`／`scripts/backfill.py` 會一併更新。**還沒接進任何分析或畫面**
+  （user 說先存資料）。**注意**：集保 CSV 只有最新一週，歷史只能從第一次存檔起累積；融資融券用 `daily_prices` 的日期當交易日曆，
+  上市／上櫃兩邊都有才算完成。持股分級 ≥12＝400 張以上、15＝1000 張以上（`holder_summary`）。
+  已有函式：`margin_history`、`holder_summary`。下一步建議：融資變化欄／強度分數的散戶槓桿扣分、集保大戶比欄位。
+
+## 前一輪（2026-10-13）
 - **Claude（2026-10-13，法人部分涵蓋＋個股法人欄，未 commit）**：`FlowAnalysisService` 改成用流向區間內「有歷史法人資料的日子」加總
   （新欄位 `FlowDashboardData.institutional_dates`），今天剛收盤、法人還沒公布時不再整項失效；最強族群排行與「資金流入前 50」
   都標示「法人資料 起～迄（n／m 日）；某日尚未公布」。完全沒有歷史資料才排除法人（動能 60／量能 40）。

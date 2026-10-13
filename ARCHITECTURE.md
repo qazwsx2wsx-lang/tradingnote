@@ -37,6 +37,7 @@
   tradingnote_history.py       股票歷史 SQLite／產業分類／資金流向與估值計算／量比異常
   tradingnote_institutional.py 全市場三大法人買賣超（獨立於 history.py，只共用 http/cache）
   tradingnote_institutional_history.py 三大法人逐日歷史＋類股指標預先計算（寫 daily_prices 只透過 history 的公開函式）
+  tradingnote_chips.py 融資融券逐日餘額＋集保戶股權分散表（只存檔，尚未接分析）
   tradingnote_flow.py          資金流向的期間模型＋儀表板結果＋分析服務（整合 history 的計算函式，加一層快取）
   tradingnote_technical.py     技術指標計算（純數學，吃 OHLCV list，不碰網路／DB）
   tradingnote_finmind.py       FinMind API（需 token；import tradingnote_core 的估值函式做上櫃 fallback）
@@ -104,6 +105,7 @@
 |---|---|---|
 | `daily_prices`／`industry_map`／`valuation_history` | 股票歷史價格／產業分類／估值歷史 | `tradingnote_history.py` |
 | `large_traders_history` | 期貨大額交易人未沖銷部位歷史 | `tradingnote_taifex.py` |
+| `daily_margin`／`tdcc_holders` | 融資融券逐日餘額、集保週分散表 | `tradingnote_chips.py` |
 | `daily_institutional`／`market_summary`／`institutional_calendar`／`sector_map`／`sector_metrics`／`stock_metrics` | 三大法人歷史、交易所公布金額、類股對照與預先計算指標 | `tradingnote_institutional_history.py` |
 | `journal_meta`／`journal_entries`／`portfolio_snapshots`／`portfolio_snapshot_positions` | 交易週誌與持股快照 | `tradingnote_journal.py` |
 

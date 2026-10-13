@@ -7,6 +7,7 @@
 import sys
 
 import _bootstrap  # noqa: F401
+import tradingnote_chips as chips
 import tradingnote_institutional_history as ih
 from tradingnote_paths import APP_PATHS
 
@@ -20,6 +21,13 @@ def main():
         print(f"補上 {', '.join(written)}；{today} 非交易日或尚未公布")
     else:
         print(f"{today}：沒有新資料（非交易日、尚未公布，或已是最新）")
+    # 籌碼資料：失敗只印訊息，不影響法人流程的結果與 exit code
+    try:
+        margin = chips.backfill_margin(APP_PATHS.history_db)
+        print(f"融資融券：新寫入 {len(margin)} 個交易日")
+        print(f"集保：最新一週 {chips.fetch_tdcc_snapshot(APP_PATHS.history_db)}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"籌碼資料更新失敗：{exc}")
     return 0
 
 

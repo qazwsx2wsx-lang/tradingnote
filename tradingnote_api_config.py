@@ -68,3 +68,12 @@ TAIFEX_LARGE_TRADERS_FUTURES_URL = (
 TAIFEX_LARGE_TRADERS_HISTORY_URL = "https://www.taifex.com.tw/cht/3/largeTraderFutDown"
 # 股票期貨契約代碼對照標的股票清單
 TAIFEX_SSF_LIST_URL = "https://openapi.taifex.com.tw/v1/SSFLists"
+
+# ---- 籌碼資料（tradingnote_chips.py） ----
+
+# 上市融資融券彙總，帶 date=YYYYMMDD&selectType=STOCK 可查歷史日；tables[1] 是個股明細
+TWSE_MARGIN_URL = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
+# 上櫃融資融券餘額，帶 date=YYYY/MM/DD 可查歷史日（新版網站端點）
+TPEX_MARGIN_URL = "https://www.tpex.org.tw/www/zh-tw/margin/balance"
+# 集保戶股權分散表（每週一次、全市場、只有最新一週的 CSV）
+TDCC_HOLDERS_URL = "https://opendata.tdcc.com.tw/getOD.ashx?id=1-5"
