@@ -206,6 +206,14 @@ class ComputeMetricsTests(unittest.TestCase):
             self.db, {"甲乙": {"1111"}}, [self.dates[-1], "2026-09-13"]))
 
 
+    def test_stock_net_for_dates_matches_group_total_and_requires_coverage(self):
+        dates = self.dates[-2:]
+        net = ih.stock_net_for_dates(self.db, ["1111", "2222"], dates)
+        flow = ih.aggregate_group_flow_for_dates(self.db, {"甲乙": {"1111", "2222"}}, dates)[0]
+        self.assertAlmostEqual(
+            sum(net.values()), flow.foreign_value + flow.trust_value + flow.dealer_value)
+        self.assertIsNone(ih.stock_net_for_dates(self.db, ["1111"], [dates[-1], "2026-09-13"]))
+
     def test_readers(self):
         self.assertEqual(ih.metric_dates(self.db)[0], self.dates[-1])
         rows = ih.sector_rows(self.db, self.dates[-1], "all")

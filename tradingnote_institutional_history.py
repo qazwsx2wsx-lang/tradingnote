@@ -583,6 +583,31 @@ def aggregate_group_flow_for_dates(db_path, groups, dates):
     return result
 
 
+def stock_net_for_dates(db_path, tickers, dates):
+    """指定個股在 dates 期間的三大法人合計買賣超金額（元，股數 × 當日收盤價加總）。
+    只回傳有資料的個股；dates 有任何一天沒有歷史法人資料時回傳 None（不拿不完整
+    的區間充數，跟 aggregate_group_flow_for_dates 同一個規則）。"""
+    dates, tickers = tuple(dates), tuple(tickers)
+    if not dates or not tickers or not set(dates) <= set(completed_dates(db_path)):
+        return None
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            f"""SELECT i.ticker, SUM((i.foreign_net_shares + i.trust_net_shares
+                                      + i.dealer_net_shares) * p.close)
+                FROM daily_institutional i
+                JOIN daily_prices p ON p.date = i.date AND p.ticker = i.ticker
+                WHERE i.date IN ({",".join("?" * len(dates))})
+                  AND i.ticker IN ({",".join("?" * len(tickers))})
+                  AND p.close IS NOT NULL
+                GROUP BY i.ticker""",
+            dates + tickers,
+        ).fetchall()
+    finally:
+        conn.close()
+    return {ticker: value for ticker, value in rows}
+
+
 # ---------- 讀取（給 ui/pages/institutional_flow_page.py；不含任何 Qt） ----------
 
 INVESTOR_LABELS = {"all": "合計", "foreign": "外資", "trust": "投信", "dealer": "自營商"}

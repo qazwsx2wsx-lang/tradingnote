@@ -88,6 +88,9 @@ class FlowDashboardData:
     # institutional_flow 只是最新單日快照（或空），不能當區間數據用。
     institutional_covers_period: bool = False
     institutional_missing_dates: tuple = ()
+    # 實際用來加總 institutional_flow 的日期（流向區間內「有歷史法人資料」的那幾天）；
+    # 空＝完全沒有歷史資料可用，institutional_flow 只是單日快照或空。
+    institutional_dates: tuple = ()
 
 
 class FlowAnalysisService:
@@ -241,25 +244,33 @@ class FlowAnalysisService:
         institutional_flow = ()
         # 歷史法人表（tradingnote_institutional_history）涵蓋整個期間時，改用期間
         # 加總，讓「主力同步買超」跟動能模式一樣反映流向區間；否則退回最新快照。
-        history_key = (group_key, "history", period.actual_dates,
+        # 流向區間裡法人資料還沒公布的最新幾天（例如今天剛收盤）不阻擋整個區間：
+        # 用「有資料的那幾天」加總，並把實際涵蓋日期交給 UI 標示。
+        have = set(institutional_history.completed_dates(self.db_path))
+        institutional_dates = tuple(d for d in period.actual_dates if d in have)
+        history_key = (group_key, "history", institutional_dates,
                        institutional_history.data_signature(self.db_path))
         history_flow = self._institutional_group_cache.get(history_key)
         if history_flow is None:
-            computed = institutional_history.aggregate_group_flow_for_dates(
-                self.db_path, groups, period.actual_dates
+            computed = (
+                institutional_history.aggregate_group_flow_for_dates(
+                    self.db_path, groups, institutional_dates
+                )
+                if institutional_dates else None
             )
             history_flow = tuple(computed) if computed is not None else False
             self._remember(self._institutional_group_cache, history_key, history_flow)
-        institutional_covers_period = history_flow is not False
-        institutional_missing_dates = ()
-        if institutional_covers_period:
+        institutional_missing_dates = tuple(
+            d for d in period.actual_dates if d not in have
+        )
+        institutional_covers_period = (
+            history_flow is not False and not institutional_missing_dates
+        )
+        if history_flow is not False:
             institutional_flow = history_flow
         else:
-            have = set(institutional_history.completed_dates(self.db_path))
-            institutional_missing_dates = tuple(
-                d for d in period.actual_dates if d not in have
-            )
-        if not institutional_covers_period and self.institutional_cache_path is not None:
+            institutional_dates = ()
+        if history_flow is False and self.institutional_cache_path is not None:
             institutional_rows = load_cached_institutional_snapshot(
                 self.institutional_cache_path
             )
@@ -292,6 +303,7 @@ class FlowAnalysisService:
             institutional_flow=institutional_flow,
             institutional_covers_period=institutional_covers_period,
             institutional_missing_dates=institutional_missing_dates,
+            institutional_dates=institutional_dates,
         )
 
         if bubble_mode != "valuation":

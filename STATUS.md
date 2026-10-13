@@ -1,6 +1,11 @@
 # tradingnote 現況（STATUS.md）
 
 ## 必讀簡介（2026-10-13）
+- **Claude（2026-10-13，法人部分涵蓋＋個股法人欄，未 commit）**：`FlowAnalysisService` 改成用流向區間內「有歷史法人資料的日子」加總
+  （新欄位 `FlowDashboardData.institutional_dates`），今天剛收盤、法人還沒公布時不再整項失效；最強族群排行與「資金流入前 50」
+  都標示「法人資料 起～迄（n／m 日）；某日尚未公布」。完全沒有歷史資料才排除法人（動能 60／量能 40）。
+  「資金流入前 50」新增「法人買賣超(億)」欄（`ih.stock_net_for_dates`，紅買綠賣）。**注意**：法人只涵蓋部分日子時，
+  法人項天數會比價格項少，頁面上有標示。法人 history 已補到 2026-10-12（10/13 尚未公布）。`test_tradingnote_flow_gui` 仍是既有失敗。
 - **Claude（2026-10-13，最強族群修正，未 commit）**：`FlowDashboardData` 新增 `institutional_covers_period`／
   `institutional_missing_dates`；法人歷史沒涵蓋整個流向區間時，排行**整項排除法人**（動能 60／量能 40）並在頁面顯示缺哪幾天的警告。
   排行移到獨立第一個分類按鈕「最強族群」（預設頁），散佈圖在第二個。同步模式 X 抖動加寬、兩個混合象限改名

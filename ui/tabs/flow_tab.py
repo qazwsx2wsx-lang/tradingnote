@@ -9,6 +9,7 @@ from datetime import date
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from tradingnote_concepts import CLASSIFICATION_INDUSTRY, CLASSIFICATION_LABELS, CLASSIFICATION_VALUE_CHAIN_LEAF
+import tradingnote_institutional_history as ih
 from tradingnote_flow import FlowPeriod
 from tradingnote_history import VOLUME_RATIO_TIERS, get_available_dates, get_data_revision
 from tradingnote_tasks import run_background_task
@@ -240,27 +241,39 @@ class FlowTabMixin:
         self.flow_strength_chart = new_plot(min_height=380, grid="x", interaction="static")
         layout.addWidget(self.flow_strength_chart, 1)
 
+    def _institutional_coverage_note(self, dashboard):
+        """法人資料實際涵蓋的日期說明；沒有任何歷史資料時回傳 None。"""
+        dates = getattr(dashboard, "institutional_dates", ())
+        if not dates:
+            return None
+        total = len(dashboard.period.actual_dates)
+        span = dates[0] if len(dates) == 1 else f"{dates[0]}～{dates[-1]}"
+        note = f"法人資料 {span}（{len(dates)}／{total} 日）"
+        if len(dates) < total:
+            note += f"；{'、'.join(dashboard.institutional_missing_dates)} 尚未公布"
+        return note
+
     def _refresh_flow_strength(self, dashboard):
-        covered = getattr(dashboard, "institutional_covers_period", True)
+        note = self._institutional_coverage_note(dashboard)
         inst_part = (
             f'<span style="color:{ENTITY_COLORS["外資"]};">■ 法人買超 50%</span>　'
-            if covered else
-            f'<span style="color:{COLOR_MUTED};">■ 法人買超（本區間未計入）</span>　'
+            if note else
+            f'<span style="color:{COLOR_MUTED};">■ 法人買超（無歷史資料，未計入）</span>　'
         )
         self.flow_strength_legend.setText(
             inst_part
-            + f'<span style="color:{SERIES_PALETTE[1]};">■ 價格動能{" 30%" if covered else ""}</span>　'
-            + f'<span style="color:{SERIES_PALETTE[2]};">■ 量能{" 20%" if covered else ""}</span>'
+            + f'<span style="color:{SERIES_PALETTE[1]};">■ 價格動能{" 30%" if note else ""}</span>　'
+            + f'<span style="color:{SERIES_PALETTE[2]};">■ 量能{" 20%" if note else ""}</span>'
         )
-        if covered:
-            self.flow_strength_warning.setVisible(False)
-        else:
-            missing = dashboard.institutional_missing_dates
-            shown = "、".join(missing[:4]) + ("…" if len(missing) > 4 else "")
+        if note is None:
             self.flow_strength_warning.setText(
-                f'<span style="color:{COLOR_WARNING};">⚠ 法人歷史資料未涵蓋此區間'
-                f'{f"（缺 {len(missing)} 天：{shown}）" if missing else ""}，'
-                "排行暫以價格動能＋量能計算，法人買超未計入。請到「法人資金流去哪？」按「更新法人資料」補齊。</span>"
+                f'<span style="color:{COLOR_WARNING};">⚠ 沒有此區間的歷史法人資料，'
+                "排行暫以價格動能＋量能計算。請到「法人資金流去哪？」按「更新法人資料」。</span>"
+            )
+            self.flow_strength_warning.setVisible(True)
+        else:
+            self.flow_strength_warning.setText(
+                f'<span style="color:{COLOR_MUTED};">{note}</span>'
             )
             self.flow_strength_warning.setVisible(True)
         populate_strength_chart(
@@ -688,17 +701,19 @@ class FlowTabMixin:
         layout.addWidget(header)
         layout.addSpacing(4)
 
-        hint = QtWidgets.QLabel(
-            "依上方資金動向清單的資料區間排序；「資金流入」以區間累積成交金額估算，"
-            "不代表法人淨買超。雙擊股票可查看完整個股資訊。"
+        self._stock_flow_hint_base = (
+            "依區間累積成交金額排序（反映熱門程度，不代表買進）；「法人買賣超」是三大法人"
+            "在同一區間的實際淨買賣金額（紅買超、綠賣超），可看出高成交是被買還是被賣。"
+            "雙擊股票可查看完整個股資訊。"
         )
+        hint = self.stock_capital_flow_hint = QtWidgets.QLabel(self._stock_flow_hint_base)
         hint.setProperty("muted", True)
         hint.setWordWrap(True)
         layout.addWidget(hint)
         layout.addSpacing(8)
 
         self.stock_capital_flow_list = QtWidgets.QTreeWidget()
-        self.stock_capital_flow_list.setColumnCount(9)
+        self.stock_capital_flow_list.setColumnCount(10)
         self.stock_capital_flow_list.setHeaderLabels(
             [
                 "排名",
@@ -710,6 +725,7 @@ class FlowTabMixin:
                 "區間漲跌%",
                 "量比",
                 "全市場比重%",
+                "法人買賣超(億)",
             ]
         )
         self.stock_capital_flow_list.setRootIsDecorated(False)
@@ -725,6 +741,15 @@ class FlowTabMixin:
         if dashboard is None:
             dashboard = self.flow_service.analyze(self.snapshot, self.flow_period)
         stocks = dashboard.stock_capital_flow
+        # 區間法人歷史不完整時不顯示（不拿單日快照冒充區間），欄位留「—」。
+        inst_net = ih.stock_net_for_dates(
+            app_paths.HISTORY_DB_PATH,
+            [stock.ticker for stock in stocks],
+            dashboard.institutional_dates,
+        )
+        note = self._institutional_coverage_note(dashboard)
+        self.stock_capital_flow_list.headerItem().setText(9, "法人買賣超(億)")
+        self.stock_capital_flow_hint.setText(self._stock_flow_hint_base + (f"　{note}" if note else ""))
 
         self.stock_capital_flow_list.setSortingEnabled(False)
         self.stock_capital_flow_list.clear()
@@ -746,11 +771,19 @@ class FlowTabMixin:
                     change_text,
                     volume_ratio_text,
                     f"{stock.capital_share_pct:.2f}%",
+                    (
+                        f"{inst_net.get(stock.ticker, 0) / 1e8:+,.2f}"
+                        if inst_net is not None else "—"
+                    ),
                 ]
             )
             item.setData(0, QtCore.Qt.UserRole, stock.ticker)
             item.setData(0, QtCore.Qt.UserRole + 1, stock.market)
-            for col in (0, 1, 3, 4, 5, 6, 7, 8):
+            if inst_net is None:
+                item.setToolTip(9, "沒有此區間的歷史法人資料，請到「法人資金流去哪？」更新法人資料")
+            else:
+                item.setForeground(9, QtGui.QColor(gain_loss_color(inst_net.get(stock.ticker, 0))))
+            for col in (0, 1, 3, 4, 5, 6, 7, 8, 9):
                 item.setTextAlignment(col, QtCore.Qt.AlignCenter)
             if stock.change_pct is not None:
                 color = gain_loss_color(stock.change_pct)

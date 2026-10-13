@@ -98,9 +98,16 @@ class StrengthRankingTests(unittest.TestCase):
         self.assertAlmostEqual(sum(rows[2]["parts"].values()), rows[2]["score"])
         self.assertEqual(compute_strength_ranking(None), [])
 
-    def test_ranking_ignores_institutional_when_period_not_covered(self):
+    def test_ranking_ignores_institutional_when_no_history_dates(self):
         from ui.charts.flow_chart import compute_strength_ranking
         dash = self._dashboard()
-        dash.institutional_covers_period = False
+        dash.institutional_dates = ()
         rows = compute_strength_ranking(dash)
         self.assertTrue(rows and not any(r["has_inst"] for r in rows))
+
+    def test_ranking_keeps_institutional_when_partially_covered(self):
+        from ui.charts.flow_chart import compute_strength_ranking
+        dash = self._dashboard()
+        dash.institutional_dates = ("d1",)  # 只有 2 天裡的 1 天有法人資料
+        rows = compute_strength_ranking(dash)
+        self.assertTrue(rows[0]["has_inst"])

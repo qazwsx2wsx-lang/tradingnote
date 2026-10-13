@@ -253,7 +253,12 @@ def populate_flow_chart(
         empty_title = f"{classification_label}主力同步買超"
         x_label = "三大法人同步方向（-3=全部賣超　0=不一致　+3=全部買超）"
         y_label = "三大法人合計買賣超金額（億元，正買超負賣超）"
-        title_prefix = f"{classification_label}主力同步買超｜三大法人方向一致性（僅最新一筆資料）"
+        inst_dates = getattr(dashboard, "institutional_dates", ()) if dashboard is not None else ()
+        data_note = (
+            f"法人資料 {inst_dates[0]}～{inst_dates[-1]}" if len(inst_dates) > 1
+            else f"法人資料 {inst_dates[0]}" if inst_dates else "僅最新一筆資料"
+        )
+        title_prefix = f"{classification_label}主力同步買超｜三大法人方向一致性（{data_note}）"
         x_ref_line, y_ref_line = 0, 0
     else:
         flow = (
@@ -485,12 +490,13 @@ def compute_strength_ranking(dashboard, limit=10):
     if dashboard is None:
         return []
     days = max(len(dashboard.period.actual_dates), 1)
-    # 歷史法人資料沒涵蓋整個區間時，institutional_flow 只是單日快照，跟區間動能／量能
-    # 的時間口徑不一致——整項排除（其餘兩項重新正規化），由 UI 顯示警告。
+    # institutional_dates 為空＝沒有任何歷史法人資料，institutional_flow 只是單日快照，
+    # 跟區間動能／量能的時間口徑不一致——整項排除（其餘兩項重新正規化）。
+    # 只涵蓋部分日期時仍使用（由 UI 標示實際涵蓋的日期）。
     inst_by_group = {
         r.group: r
         for r in (dashboard.institutional_flow or ())
-        if r.covered_stocks > 0 and getattr(dashboard, "institutional_covers_period", True)
+        if r.covered_stocks > 0 and getattr(dashboard, "institutional_dates", True)
     }
     flows = [
         f for f in dashboard.industry_flow
