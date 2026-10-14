@@ -1,6 +1,9 @@
 # tradingnote 現況（STATUS.md）
 
 ## 必讀簡介（2026-10-14）
+- **Claude（2026-10-14，成分股明細也顯示大戶占比Δ，未 commit）**：雙擊族群開的 `IndustryTopStocksDialog` 新增第 10 欄「大戶占比Δ(pp)」
+  （`holder_changes`／`holder_dates` 為選用參數，舊呼叫不受影響），資料來源同前 50 名的 `big_holder_changes`，區間用 `period.resolve` 後的日期。
+  驗證：offscreen 建對話框（有／無參數）＋真實資料數值。**未做**：實機雙擊。
 - **Claude（2026-10-14，族群層級大戶占比Δ，未 commit）**：資金流向「清單」（`flow_list`）新增第 12 欄「大戶占比Δ(pp)」，
   `tradingnote_chips.group_big_holder_changes`：股數加權（成分股大戶股數 ÷ 集保總股數），只算區間前後兩週都有資料的成分股，兩時點同一批股票；
   成分股有資料不到一半時加 *，tooltip 顯示兩週占比與 n／m 檔。新增 `FlowAnalysisService.group_members()`。

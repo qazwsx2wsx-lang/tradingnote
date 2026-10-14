@@ -281,8 +281,9 @@ class IndustryTopStocksDialog(DialogBase):
     API，開啟即顯示。days 來自資金流向頁最上方的共用期間，讓累積成交金額與
     近日均量都跟畫面上看到的分析口徑一致；本益比則取既有最新估值快取。"""
 
-    def __init__(self, parent, group_name, top_stocks, days):
+    def __init__(self, parent, group_name, top_stocks, days, holder_changes=None, holder_dates=None):
         super().__init__(parent)
+        holder_changes = holder_changes or {}
         self.setWindowTitle(
             f"{group_name}　近 {days} 日成交金額前 {len(top_stocks)} 大成分股"
         )
@@ -297,7 +298,7 @@ class IndustryTopStocksDialog(DialogBase):
                 f"分析期間：{first.get('start_date', '')} ～ {first.get('end_date', '')}；"
                 "1 日採當日漲跌，量比均量不含截止日。"
             ))
-        table = QtWidgets.QTableWidget(len(top_stocks), 9)
+        table = QtWidgets.QTableWidget(len(top_stocks), 10)
         table.setHorizontalHeaderLabels(
             [
                 "代號",
@@ -309,6 +310,7 @@ class IndustryTopStocksDialog(DialogBase):
                 "均量(張)",
                 "本益比",
                 "EPS",
+                "大戶占比Δ(pp)",
             ]
         )
         table.verticalHeader().setVisible(False)
@@ -316,6 +318,7 @@ class IndustryTopStocksDialog(DialogBase):
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
         for row, stock in enumerate(top_stocks):
+            holder = holder_changes.get(stock["ticker"])
             change_pct = stock["change_pct"]
             change_str = f"{change_pct:+.2f}%" if change_pct is not None else f"實際有 {stock.get('actual_days', 0)}／需要 {stock.get('required_days', days)} 個交易日（價格不足）"
             color = gain_loss_color(change_pct or 0)
@@ -332,13 +335,22 @@ class IndustryTopStocksDialog(DialogBase):
                 f"{avg_volume / 1000:,.0f}" if avg_volume is not None else f"實際有 {stock.get('actual_volume_days', 0)}／需要 {stock.get('required_volume_days', days)} 個歷史交易日",
                 f"{per:.2f}" if per is not None else "N/A",
                 f"{eps:.2f}" if eps is not None else "N/A",
+                f"{holder['delta']:+.2f}" if holder else "—",
             ]
             for col, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
-                if col in (0, 2, 3, 4, 5, 6, 7, 8):
+                if col in (0, 2, 3, 4, 5, 6, 7, 8, 9):
                     item.setTextAlignment(QtCore.Qt.AlignCenter)
                 if col == 3 and change_pct is not None:
                     item.setForeground(QtGui.QColor(color))
+                if col == 9:
+                    if holder:
+                        item.setForeground(QtGui.QColor(gain_loss_color(holder["delta"])))
+                        item.setToolTip(
+                            f"400 張以上大戶持股 {holder['base']:.2f}%（{holder_dates[0]}）→ "
+                            f"{holder['latest']:.2f}%（{holder_dates[1]}）")
+                    else:
+                        item.setToolTip("沒有區間前後兩週的集保資料，可在「個股資金流入前 50 名」按「補集保大戶歷史…」補資料")
                 table.setItem(row, col, item)
         table.resizeColumnsToContents()
         _, height_cap = _screen_fit_size(self, preferred_height=760, ratio=0.8)

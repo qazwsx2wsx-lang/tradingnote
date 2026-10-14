@@ -551,7 +551,16 @@ class FlowTabMixin:
             classification_scope=self._flow_classification_scope(),
             top_n=30,
         )
-        IndustryTopStocksDialog(self, industry, top_stocks, days=period.trading_days).exec()
+        resolved = period.resolve(app_paths.HISTORY_DB_PATH, self.snapshot)
+        holder_changes, holder_dates = chips.big_holder_changes(
+            app_paths.HISTORY_DB_PATH, [row["ticker"] for row in top_stocks],
+            resolved.actual_dates[0] if resolved.actual_dates else resolved.start_date,
+            resolved.end_date or resolved.start_date,
+        )
+        IndustryTopStocksDialog(
+            self, industry, top_stocks, days=period.trading_days,
+            holder_changes=holder_changes, holder_dates=holder_dates,
+        ).exec()
 
     def _on_industry_bubble_clicked(self, industry):
         # 泡泡圖本身就是共用流向期間的視覺化，點擊彈出的成分股
