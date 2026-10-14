@@ -575,6 +575,7 @@ class FlowTabMixin:
             "資料區間與上方「流向區間」一致。分數為同批產業的"
             "相對百分位（0～100）：人氣＝今日資金比重、動能＝區間漲跌、量能＝量比；"
             "綜合熱度為三者平均，清單預設依綜合熱度排序。"
+            "「大戶占比Δ」是集保 400 張以上持股占比的週變化（股數加權，標 * 表示只有不到一半成分股有資料）。"
         )
         self.flow_list_hint.setProperty("muted", True)
         self.flow_list_hint.setWordWrap(True)
@@ -582,7 +583,7 @@ class FlowTabMixin:
         layout.addSpacing(8)
 
         self.flow_list = QtWidgets.QTreeWidget()
-        self.flow_list.setColumnCount(11)
+        self.flow_list.setColumnCount(12)
         self.flow_list.setHeaderLabels(
             [
                 "熱度排名",
@@ -596,6 +597,7 @@ class FlowTabMixin:
                 "動能分數",
                 "量能分數",
                 "綜合熱度",
+                "大戶占比Δ(pp)",
             ]
         )
         self.flow_list.setRootIsDecorated(False)
@@ -630,6 +632,7 @@ class FlowTabMixin:
             f"分數為同批{classification_label}的相對百分位（0～100）："
             f"人氣＝{share_name}、動能＝區間漲跌、量能＝量比；"
             "綜合熱度為三者平均，清單預設依綜合熱度排序。"
+            "「大戶占比Δ」是集保 400 張以上持股占比的週變化（股數加權，標 * 表示只有不到一半成分股有資料）。"
         )
         # 進入畫面時直接把最能同時代表人氣／動能／量能的族群排在前面。
         flow = sorted(
@@ -639,6 +642,12 @@ class FlowTabMixin:
                 result.composite_score if result.composite_score is not None else -1,
             ),
             reverse=True,
+        )
+        holder_delta, holder_dates = chips.group_big_holder_changes(
+            app_paths.HISTORY_DB_PATH,
+            self.flow_service.group_members(dashboard.classification_mode, dashboard.classification_scope),
+            dashboard.period.actual_dates[0] if dashboard.period.actual_dates else dashboard.period.start_date,
+            dashboard.period.end_date or dashboard.period.start_date,
         )
         self.flow_list.clear()
         ranked_count = 0
@@ -673,10 +682,20 @@ class FlowTabMixin:
                     change_text,
                     volume_text,
                     *score_texts,
+                    self._group_holder_text(holder_delta.get(f.industry)),
                 ]
             )
             item.setData(0, QtCore.Qt.UserRole, f.industry)
-            for col in (0, 2, 3, 4, 5, 6, 7, 8, 9, 10):
+            hd = holder_delta.get(f.industry)
+            if hd is not None:
+                item.setForeground(11, QtGui.QColor(gain_loss_color(hd["delta"])))
+                item.setToolTip(11, (
+                    f"400 張以上大戶持股（股數加權）{hd['base']:.2f}%（{holder_dates[0]}）→ "
+                    f"{hd['latest']:.2f}%（{holder_dates[1]}）；"
+                    f"{hd['covered']}／{hd['total']} 檔有前後兩週集保資料"))
+            else:
+                item.setToolTip(11, "沒有區間前後兩週的集保資料，請到「個股資金流入前 50 名」按「補集保大戶歷史…」")
+            for col in (0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11):
                 item.setTextAlignment(col, QtCore.Qt.AlignCenter)
             if f.avg_change_pct is not None:
                 color = gain_loss_color(f.avg_change_pct)
@@ -694,6 +713,14 @@ class FlowTabMixin:
         # 數值項目時再次觸發原生排序，這在部分環境會造成程序中止。
         for col in range(self.flow_list.columnCount()):
             self.flow_list.resizeColumnToContents(col)
+
+    @staticmethod
+    def _group_holder_text(info):
+        if info is None:
+            return "—"
+        text = f"{info['delta']:+.2f}"
+        # 成分股有資料的不到一半時加 *，提醒這個數字只代表部分成分股
+        return text + ("*" if info["covered"] * 2 < info["total"] else "")
 
     # ---------- 個股資金流入前50名（以區間累積成交金額估算） ----------
 

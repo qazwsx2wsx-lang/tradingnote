@@ -332,6 +332,10 @@ class FlowAnalysisService:
 
         return replace(cached, valuation_flow=valuation_flow)
 
+    def group_members(self, classification_mode=CLASSIFICATION_INDUSTRY, classification_scope=None):
+        """目前分類下 {群組名: 成分股代號集合}（給族群層級的籌碼彙總用）。"""
+        return self._groups(classification_mode, classification_scope)[0]
+
     def get_industry_top_stocks(self, snapshot, period, industry, top_n=30):
         """取得產業明細，量／均量基準也跟隨共用期間。"""
         return get_industry_top_stocks_range(

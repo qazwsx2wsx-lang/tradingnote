@@ -152,5 +152,28 @@ class BigHolderChangeTests(unittest.TestCase):
             self.assertEqual(chips.big_holder_changes(db, ["A"], "2026-09-01", "2026-10-13"), ({}, None))
 
 
+class GroupHolderChangeTests(unittest.TestCase):
+    def test_share_weighted_delta_uses_same_members_both_weeks(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "h.db"
+            conn = chips._connect(db)
+            rows = []
+            for date, a_big, b_big in (("2026-09-25", 40, 20), ("2026-10-08", 50, 20)):
+                rows += [(date, "A", 12, 1, a_big, 0), (date, "A", 5, 1, 100 - a_big, 0),
+                         (date, "B", 12, 1, b_big, 0), (date, "B", 5, 1, 100 - b_big, 0)]
+            rows += [("2026-10-08", "C", 12, 1, 99, 0), ("2026-10-08", "C", 5, 1, 1, 0)]  # C 沒有基準週
+            conn.executemany("INSERT INTO tdcc_holders VALUES (?,?,?,?,?,?)", rows)
+            conn.commit()
+            conn.close()
+            result, dates = chips.group_big_holder_changes(
+                db, {"G": {"A", "B", "C"}, "Empty": {"Z"}}, "2026-10-05", "2026-10-13")
+            self.assertEqual(dates, ("2026-09-25", "2026-10-08"))
+            self.assertAlmostEqual(result["G"]["base"], 30.0)    # (40+20)/200
+            self.assertAlmostEqual(result["G"]["latest"], 35.0)  # (50+20)/200
+            self.assertAlmostEqual(result["G"]["delta"], 5.0)
+            self.assertEqual((result["G"]["covered"], result["G"]["total"]), (2, 3))
+            self.assertNotIn("Empty", result)
+
+
 if __name__ == "__main__":
     unittest.main()

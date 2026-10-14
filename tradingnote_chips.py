@@ -453,3 +453,46 @@ def big_holder_changes(db_path, tickers, start_date, end_date):
         for t in tickers if t in pct[end] and t in pct[base]
     }
     return result, (base, end)
+
+
+def group_big_holder_changes(db_path, groups, start_date, end_date):
+    """族群層級的 400 張以上大戶持股占比變化（百分點），用股數加權：
+    占比＝成分股大戶股數合計 ÷ 成分股集保總股數合計，只算「區間前後兩週都有資料」的成分股，
+    兩個時點用同一批股票，避免成員不同造成假變化。
+
+    groups：{族群名: 代號集合}。回傳 ({族群: {"delta","latest","base","covered","total"}}, (base, end))；
+    沒有基準週或最新週時回傳 ({}, None)。covered／total＝有資料的成分股數／成分股數。"""
+    members = {t for group in groups.values() for t in group}
+    conn = _connect(db_path)
+    try:
+        end = conn.execute(
+            "SELECT MAX(data_date) FROM tdcc_holders WHERE data_date <= ?", (end_date,)).fetchone()[0]
+        base = conn.execute(
+            "SELECT MAX(data_date) FROM tdcc_holders WHERE data_date < ?", (start_date,)).fetchone()[0]
+        if not end or not base or end == base or not members:
+            return {}, None
+        stock = {}
+        for date in (base, end):
+            stock[date] = {
+                t: (big or 0, total or 0)
+                for t, big, total in conn.execute(
+                    f"SELECT ticker, SUM(CASE WHEN level BETWEEN {BIG_HOLDER_LEVEL} AND {HUGE_HOLDER_LEVEL} "
+                    f"THEN shares ELSE 0 END), SUM(shares) FROM tdcc_holders "
+                    f"WHERE data_date = ? AND level < 16 GROUP BY ticker", (date,))
+                if t in members
+            }
+    finally:
+        conn.close()
+    result = {}
+    for name, tickers in groups.items():
+        both = [t for t in tickers if stock[base].get(t, (0, 0))[1] > 0 and stock[end].get(t, (0, 0))[1] > 0]
+        if not both:
+            continue
+        ratios = {}
+        for date in (base, end):
+            big = sum(stock[date][t][0] for t in both)
+            total = sum(stock[date][t][1] for t in both)
+            ratios[date] = big * 100.0 / total
+        result[name] = {"delta": ratios[end] - ratios[base], "latest": ratios[end],
+                        "base": ratios[base], "covered": len(both), "total": len(tickers)}
+    return result, (base, end)
