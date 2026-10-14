@@ -11,6 +11,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from tradingnote_concepts import CLASSIFICATION_INDUSTRY, CLASSIFICATION_LABELS, CLASSIFICATION_VALUE_CHAIN_LEAF
 import tradingnote_chips as chips
 import tradingnote_institutional_history as ih
+import tradingnote_screener as screener
 from tradingnote_flow import FlowPeriod
 from tradingnote_history import VOLUME_RATIO_TIERS, get_available_dates, get_data_revision, get_industry_map
 from tradingnote_tasks import run_background_task
@@ -152,6 +153,7 @@ class FlowTabMixin:
             ("法人方向", self._build_institutional_direction_section),
             ("族群熱度排行", self._build_flow_list_section),
             ("資金流入前 50", self._build_stock_capital_flow_section),
+            ("每日選股", self._build_screener_section),
             ("個股爆量", self._build_volume_outliers_section),
             ("法人資金流去哪？", self._build_institutional_flow_page_section),
         )
@@ -499,6 +501,7 @@ class FlowTabMixin:
         self._refresh_institutional_direction(dashboard)
         self.refresh_flow_list(dashboard)
         self.refresh_stock_capital_flow_list(dashboard)
+        self._refresh_screener_if_stale()
         self.refresh_volume_outliers_list(dashboard)
 
     def _refresh_flow_picks(self, picks):
@@ -879,6 +882,163 @@ class FlowTabMixin:
         market = item.data(0, QtCore.Qt.UserRole + 1)
         token = self.settings.get("finmind_token", "")
         StockDetailDialog(self, ticker, name, token, market=market).exec()
+
+    # ---------- 每日選股（條件定義在 tradingnote_screener.py，要改條件改那個檔案） ----------
+
+    def _build_screener_section(self, layout):
+        header = QtWidgets.QLabel("每日選股")
+        header.setProperty("header", True)
+        layout.addWidget(header)
+
+        rules = "；".join(f"{i}. {rule.description}" for i, rule in enumerate(screener.RULES, start=1))
+        intro = QtWidgets.QLabel(
+            f"條件（全部都要通過）：{rules}。每天資料更新後自動篩一次；要調整條件請改程式 "
+            "tradingnote_screener.py（參數與 RULES 清單），說明見 docs/SCREENER.md。"
+        )
+        intro.setProperty("muted", True)
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(QtWidgets.QLabel("篩選日期："))
+        self.screener_date_combo = QtWidgets.QComboBox()
+        self.screener_date_combo.currentIndexChanged.connect(self._on_screener_date_changed)
+        controls.addWidget(self.screener_date_combo)
+        self.screener_rerun_button = QtWidgets.QPushButton("重新篩選最新一天")
+        self.screener_rerun_button.clicked.connect(lambda: self._run_screener())
+        controls.addWidget(self.screener_rerun_button)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        self.screener_status = QtWidgets.QLabel("尚未篩選")
+        self.screener_status.setWordWrap(True)
+        layout.addWidget(self.screener_status)
+        layout.addSpacing(6)
+
+        self.screener_list = QtWidgets.QTreeWidget()
+        headers = ["代號", "名稱", "產業", "收盤", "漲跌%", "大戶占比Δ(pp)", "大戶占比走勢%",
+                   "融資連減(天)", "融資變化%", "量比", "MFI"]
+        self.screener_list.setColumnCount(len(headers))
+        self.screener_list.setHeaderLabels(headers)
+        self.screener_list.setRootIsDecorated(False)
+        self.screener_list.setAlternatingRowColors(True)
+        self.screener_list.setMinimumHeight(240)
+        self.screener_list.itemDoubleClicked.connect(self._on_screener_double_clicked)
+        layout.addWidget(self.screener_list)
+        self._screener_task = None
+        self._screener_loading = False
+
+    def _refresh_screener_if_stale(self):
+        """有比已存結果更新的可篩選日（資料剛更新）就在背景重篩；否則只載入已存結果。"""
+        if self._screener_task is not None:
+            return
+        db_path = app_paths.HISTORY_DB_PATH
+        dates = screener.screen_dates(db_path)
+        stored = screener.run_dates(db_path)
+        if dates and (not stored or stored[0] < dates[-1]):
+            self._run_screener()
+        else:
+            self._fill_screener_dates(stored)
+
+    def _fill_screener_dates(self, stored):
+        self._screener_loading = True
+        current = self.screener_date_combo.currentData()
+        self.screener_date_combo.clear()
+        for date in stored:
+            self.screener_date_combo.addItem(date, date)
+        index = self.screener_date_combo.findData(current)
+        self.screener_date_combo.setCurrentIndex(max(index, 0))
+        self._screener_loading = False
+        if stored:
+            self._show_screener_result(screener.load_run(
+                app_paths.HISTORY_DB_PATH, self.screener_date_combo.currentData()))
+        else:
+            self.screener_status.setText("還沒有可篩選的日子（需要完整報價與融資融券資料）")
+
+    def _on_screener_date_changed(self, _index):
+        date = self.screener_date_combo.currentData()
+        if date and not self._screener_loading:
+            self._show_screener_result(screener.load_run(app_paths.HISTORY_DB_PATH, date))
+
+    def _run_screener(self):
+        if self._screener_task is not None:
+            return
+        self.screener_rerun_button.setEnabled(False)
+        self.screener_status.setText("篩選中…")
+        db_path = app_paths.HISTORY_DB_PATH
+
+        def work(_cancel, _emit):
+            screener.run_screen(db_path)
+            return screener.run_dates(db_path)
+
+        def done(stored):
+            self._screener_task = None
+            self.screener_rerun_button.setEnabled(True)
+            self._fill_screener_dates(stored)
+
+        def failed(message):
+            self._screener_task = None
+            self.screener_rerun_button.setEnabled(True)
+            self.screener_status.setText(f"篩選失敗：{message}")
+
+        self._screener_task = run_background_task(self, work, done, failed)
+
+    def _show_screener_result(self, result):
+        self.screener_list.clear()
+        if result is None:
+            self.screener_status.setText("沒有這一天的篩選結果")
+            return
+        counts = result["rule_counts"]
+        parts = "、".join(
+            f"{rule.label} {counts.get(rule.key, 0)} 檔" for rule in screener.RULES)
+        base, latest = result["holder_dates"]
+        holder = f"集保比較 {base} → {latest}" if base else "集保資料不足（請先「補集保大戶歷史…」補最近 3 週）"
+        self.screener_status.setText(
+            f"{result['date']}　母體 {result['universe']} 檔，全部通過 {result['matched']} 檔。"
+            f"各條件單獨通過：{parts}。{holder}。")
+        for row in result["rows"]:
+            def fmt(value, pattern):
+                return pattern.format(value) if value is not None else "—"
+            item = QtWidgets.QTreeWidgetItem([
+                row["ticker"], row["name"] or "-", row["industry"] or "-",
+                fmt(row["close"], "{:.2f}"), fmt(row["change_pct"], "{:+.2f}%"),
+                fmt(row["big_delta"], "{:+.2f}"), self._screener_trail_text(row),
+                fmt(row["margin_down_days"], "{}"), fmt(row["margin_change_pct"], "{:+.2f}%"),
+                fmt(row["volume_ratio"], "{:.2f}"), fmt(row["mfi"], "{:.1f}"),
+            ])
+            item.setData(0, QtCore.Qt.UserRole, row["ticker"])
+            item.setData(0, QtCore.Qt.UserRole + 1, row.get("market"))
+            for col in range(3, 11):
+                item.setTextAlignment(col, QtCore.Qt.AlignCenter)
+            if row["change_pct"] is not None:
+                item.setForeground(4, QtGui.QColor(gain_loss_color(row["change_pct"])))
+            if row["big_delta"] is not None:
+                item.setForeground(5, QtGui.QColor(gain_loss_color(row["big_delta"])))
+            trail = row.get("big_trail")
+            if trail:
+                tip = "\n".join(f"{d}　{pct:.2f}%" for d, pct in trail)
+                item.setToolTip(5, "400 張以上大戶持股占比（每週）：\n" + tip)
+                item.setToolTip(6, tip)
+            if row["margin_change_pct"] is not None:
+                # 融資減少＝籌碼安定；配色沿用台股慣例的「減少用綠」
+                item.setForeground(8, QtGui.QColor(gain_loss_color(row["margin_change_pct"])))
+            self.screener_list.addTopLevelItem(item)
+        for col in range(self.screener_list.columnCount()):
+            self.screener_list.resizeColumnToContents(col)
+
+    @staticmethod
+    def _screener_trail_text(row):
+        """每週大戶占比由舊到新，例如「67.80 → 68.87 → 68.45」，看得出是持續增加還是先升後降。"""
+        trail = row.get("big_trail")
+        if trail:
+            return " → ".join(f"{pct:.2f}" for _d, pct in trail)
+        return f"{row['big_latest']:.2f}" if row.get("big_latest") is not None else "—"
+
+    def _on_screener_double_clicked(self, item, _column):
+        ticker = item.data(0, QtCore.Qt.UserRole)
+        if ticker:
+            StockDetailDialog(self, ticker, item.text(1), self.settings.get("finmind_token", ""),
+                              market=item.data(0, QtCore.Qt.UserRole + 1)).exec()
 
     # ---------- 個股量比異常清單（今日量 ÷ 近N日均量，逐檔股票各自比較自己的
     # 歷史均量，抓「個股」層級的爆量，不像資金動向清單是整個產業加總後的量比，

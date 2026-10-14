@@ -9,6 +9,7 @@ import sys
 import _bootstrap  # noqa: F401
 import tradingnote_chips as chips
 import tradingnote_institutional_history as ih
+import tradingnote_screener as screener
 from tradingnote_paths import APP_PATHS
 
 
@@ -28,6 +29,12 @@ def main():
         print(f"集保：最新一週 {chips.fetch_tdcc_snapshot(APP_PATHS.history_db)}")
     except Exception as exc:  # noqa: BLE001
         print(f"籌碼資料更新失敗：{exc}")
+    try:
+        result = screener.run_screen(APP_PATHS.history_db)
+        if result:
+            print(f"每日選股 {result['date']}：母體 {result['universe']} 檔，入選 {result['matched']} 檔")
+    except Exception as exc:  # noqa: BLE001
+        print(f"每日選股失敗：{exc}")
     return 0
 
 

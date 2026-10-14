@@ -30,7 +30,7 @@ class TdccBackfillDialog(DialogBase):
         self._stop_event = None
 
         intro = QtWidgets.QLabel(
-            "從集保官網逐檔逐週補約一年的大戶持股分布（每筆間隔 1 秒）。「只補最近 2 週」每檔只多查 1 次，前 50 名約 1 分鐘。可隨時暫停或關閉，"
+            "從集保官網逐檔逐週補約一年的大戶持股分布（每筆間隔 1 秒）。「只補最近 3 週」每檔只多查 2 次，前 50 名約 2 分鐘。可隨時暫停或關閉，"
             "下次按「開始」會從沒查過的地方繼續；補資料時其他功能照常使用。"
         )
         intro.setWordWrap(True)
@@ -41,7 +41,7 @@ class TdccBackfillDialog(DialogBase):
         self.scope_combo.addItem(f"全市場個股（{len(self._scopes[SCOPE_ALL])} 檔，需數小時以上）", SCOPE_ALL)
 
         self.weeks_combo = QtWidgets.QComboBox()
-        for label, weeks in (("只補最近 2 週（最快，夠算大戶占比變化）", 2),
+        for label, weeks in (("只補最近 3 週（最快，夠算兩週大戶變化與每日選股）", 3),
                              ("最近 8 週", 8), ("全部約一年", None)):
             self.weeks_combo.addItem(label, weeks)
 

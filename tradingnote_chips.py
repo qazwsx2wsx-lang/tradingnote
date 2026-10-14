@@ -15,6 +15,7 @@
 """
 
 import csv
+import http.client
 import http.cookiejar
 import io
 import re
@@ -226,7 +227,7 @@ def _fetch_tdcc_text(url=TDCC_HOLDERS_URL):
     try:
         with urlopen(Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=60) as resp:
             return resp.read().decode("utf-8-sig")
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, http.client.HTTPException) as exc:
         raise PriceFetchError(f"集保資料抓取失敗：{exc}") from exc
 
 
@@ -322,7 +323,7 @@ class TdccQueryClient:
     def _load_form(self):
         try:
             page = self._opener.open(TDCC_QUERY_URL, timeout=self._timeout).read().decode("utf-8", "replace")
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, http.client.HTTPException) as exc:
             raise PriceFetchError(f"集保查詢頁連線失敗：{exc}") from exc
         match = _TOKEN_RE.search(page)
         if not match:
@@ -347,7 +348,7 @@ class TdccQueryClient:
         self._token = None  # token 已用掉；回應沒帶新的就下次重新載入表單
         try:
             page = self._opener.open(TDCC_QUERY_URL, data, timeout=self._timeout).read().decode("utf-8", "replace")
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, http.client.HTTPException) as exc:
             raise PriceFetchError(f"集保查詢連線失敗：{exc}") from exc
         match = _TOKEN_RE.search(page)
         if match:
