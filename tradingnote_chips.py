@@ -429,7 +429,8 @@ def big_holder_changes(db_path, tickers, start_date, end_date):
     """流向區間內 400 張以上大戶持股占比的變化（百分點）。
 
     集保是週資料，所以取「end_date 以前最新的一週」對照「start_date 之前最新的一週」
-    （區間開始前的基準）。回傳 {ticker: {"latest","base","delta"}} 與 (base_date, end_date)；
+    （區間開始前的基準）。回傳 {ticker: {"latest","base","delta","trail"}} 與 (base_date, end_date)；
+    trail＝基準週到最新週之間每一週的 [(日期, 占比)]（由舊到新），看得出是持續增加還是先升後降。
     任一週沒有資料就回傳 ({}, None)。"""
     tickers = list(tickers)
     conn = _connect(db_path)
@@ -440,9 +441,12 @@ def big_holder_changes(db_path, tickers, start_date, end_date):
             "SELECT MAX(data_date) FROM tdcc_holders WHERE data_date < ?", (start_date,)).fetchone()[0]
         if not end or not base or end == base or not tickers:
             return {}, None
+        weeks = [r[0] for r in conn.execute(
+            "SELECT DISTINCT data_date FROM tdcc_holders WHERE data_date BETWEEN ? AND ? ORDER BY data_date",
+            (base, end))]
         marks = ",".join("?" * len(tickers))
         pct = {}
-        for date in (base, end):
+        for date in weeks:
             pct[date] = dict(conn.execute(
                 f"SELECT ticker, SUM(pct) FROM tdcc_holders WHERE data_date = ? "
                 f"AND level BETWEEN {BIG_HOLDER_LEVEL} AND {HUGE_HOLDER_LEVEL} "
@@ -450,7 +454,8 @@ def big_holder_changes(db_path, tickers, start_date, end_date):
     finally:
         conn.close()
     result = {
-        t: {"latest": pct[end][t], "base": pct[base][t], "delta": pct[end][t] - pct[base][t]}
+        t: {"latest": pct[end][t], "base": pct[base][t], "delta": pct[end][t] - pct[base][t],
+            "trail": [(d, round(pct[d][t], 2)) for d in weeks if t in pct[d]]}
         for t in tickers if t in pct[end] and t in pct[base]
     }
     return result, (base, end)

@@ -727,6 +727,15 @@ class FlowTabMixin:
             self.flow_list.resizeColumnToContents(col)
 
     @staticmethod
+    def _holder_trail_text(info, max_weeks=6):
+        """每週大戶占比由舊到新（太長只顯示最近 max_weeks 週，完整的在 tooltip）。"""
+        if not info or not info.get("trail"):
+            return "—"
+        values = [f"{p:.2f}" for _d, p in info["trail"]]
+        prefix = "… → " if len(values) > max_weeks else ""
+        return prefix + " → ".join(values[-max_weeks:])
+
+    @staticmethod
     def _group_holder_text(info):
         if info is None:
             return "—"
@@ -752,7 +761,7 @@ class FlowTabMixin:
         self._stock_flow_hint_base = (
             "依區間累積成交金額排序（反映熱門程度，不代表買進）；「法人買賣超」是三大法人"
             "在同一區間的實際淨買賣金額（紅買超、綠賣超），可看出高成交是被買還是被賣；"
-            "「大戶占比Δ」是集保 400 張以上持股占比相對區間前一週的增減（百分點，週資料，滑鼠移上去看日期）。"
+            "「大戶占比Δ」是集保 400 張以上持股占比相對區間前一週的增減（百分點，週資料，滑鼠移上去看日期）；「大戶占比走勢」列出每週占比。"
             "雙擊股票可查看完整個股資訊。"
         )
         hint = self.stock_capital_flow_hint = QtWidgets.QLabel(self._stock_flow_hint_base)
@@ -762,7 +771,7 @@ class FlowTabMixin:
         layout.addSpacing(8)
 
         self.stock_capital_flow_list = QtWidgets.QTreeWidget()
-        self.stock_capital_flow_list.setColumnCount(11)
+        self.stock_capital_flow_list.setColumnCount(12)
         self.stock_capital_flow_list.setHeaderLabels(
             [
                 "排名",
@@ -776,6 +785,7 @@ class FlowTabMixin:
                 "全市場比重%",
                 "法人買賣超(億)",
                 "大戶占比Δ(pp)",
+                "大戶占比走勢%",
             ]
         )
         self.stock_capital_flow_list.setRootIsDecorated(False)
@@ -848,6 +858,7 @@ class FlowTabMixin:
                         f"{holder_delta[stock.ticker]['delta']:+.2f}"
                         if stock.ticker in holder_delta else "—"
                     ),
+                    self._holder_trail_text(holder_delta.get(stock.ticker)),
                 ]
             )
             item.setData(0, QtCore.Qt.UserRole, stock.ticker)
@@ -859,12 +870,16 @@ class FlowTabMixin:
             hd = holder_delta.get(stock.ticker)
             if hd is not None:
                 item.setForeground(10, QtGui.QColor(gain_loss_color(hd["delta"])))
-                item.setToolTip(10, (
+                tip = (
                     f"400 張以上大戶持股 {hd['base']:.2f}%（{holder_dates[0]}）→ "
-                    f"{hd['latest']:.2f}%（{holder_dates[1]}）"))
+                    f"{hd['latest']:.2f}%（{holder_dates[1]}）\n"
+                    + "\n".join(f"{d}　{p:.2f}%" for d, p in hd["trail"])
+                )
+                item.setToolTip(10, tip)
+                item.setToolTip(11, tip)
             else:
                 item.setToolTip(10, "沒有區間前後兩週的集保資料，可按右上「補集保大戶歷史…」補資料")
-            for col in (0, 1, 3, 4, 5, 6, 7, 8, 9, 10):
+            for col in (0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11):
                 item.setTextAlignment(col, QtCore.Qt.AlignCenter)
             if stock.change_pct is not None:
                 color = gain_loss_color(stock.change_pct)

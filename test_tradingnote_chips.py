@@ -147,6 +147,7 @@ class BigHolderChangeTests(unittest.TestCase):
             result, dates = chips.big_holder_changes(db, ["A", "B"], "2026-10-05", "2026-10-13")
             self.assertEqual(dates, ("2026-09-25", "2026-10-08"))
             self.assertAlmostEqual(result["A"]["delta"], 3.0)
+            self.assertEqual(result["A"]["trail"], [("2026-09-25", 60.0), ("2026-10-08", 63.0)])
             self.assertNotIn("B", result)
             # 區間開始前沒有任何週資料 → 不顯示
             self.assertEqual(chips.big_holder_changes(db, ["A"], "2026-09-01", "2026-10-13"), ({}, None))
