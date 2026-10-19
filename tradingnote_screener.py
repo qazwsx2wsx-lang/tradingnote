@@ -8,7 +8,9 @@
 所有條件都通過才會入選。
 
 目前條件（2026-10-14 定義；同日移除「融資連續減少」條件，融資指標仍會算並顯示在名單，只是不參與篩選。
-要加回去：把下面 RULES 最前面註解起來的 margin_down 那條取消註解）：
+要加回去：把下面 RULES 最前面註解起來的 margin_down 那條取消註解。
+同日 screen_dates() 也不再要求融資融券已存（該資料常比收盤晚公布，若當作門檻會讓選股卡在舊日期不動）；
+重新啟用 margin_down 規則時不需要跟著恢復這個門檻，缺資料的日子一樣會被 compute_metrics 算成 None 而篩不過）：
   1. 兩週內大戶增加：集保 400 張以上持股占比，最新一週 比 兩週前 增加（百分點 > 0）
   2. 增量比 > 1：今日成交量 ÷ 前 5 日均量（即量比）> 1
   3. MFI < 80：14 日資金流量指標（資料庫沒有最高／最低價，典型價用收盤價近似，
@@ -118,7 +120,7 @@ def _connect(db_path):
 # ---------- 指標 ----------
 
 def screen_dates(db_path):
-    """可以篩選的交易日（由舊到新）：兩個市場報價都完整、且融資融券已存的日子。"""
+    """可以篩選的交易日（由舊到新）：兩個市場報價都完整的日子（不要求融資融券已存，見上方說明）。"""
     conn = history._connect(db_path)
     try:
         counts = defaultdict(dict)
@@ -127,10 +129,8 @@ def screen_dates(db_path):
             counts[date][market] = n
     finally:
         conn.close()
-    margin = set(chips.margin_dates(db_path))
     return sorted(d for d, c in counts.items()
-                  if c.get("TWSE", 0) >= MIN_PRICE_ROWS and c.get("TPEX", 0) >= MIN_PRICE_ROWS
-                  and d in margin)
+                  if c.get("TWSE", 0) >= MIN_PRICE_ROWS and c.get("TPEX", 0) >= MIN_PRICE_ROWS)
 
 
 def calculate_mfi(closes, trading_values, period=MFI_PERIOD):

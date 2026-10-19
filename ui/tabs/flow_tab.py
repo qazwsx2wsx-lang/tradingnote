@@ -968,7 +968,7 @@ class FlowTabMixin:
             self._show_screener_result(screener.load_run(
                 app_paths.HISTORY_DB_PATH, self.screener_date_combo.currentData()))
         else:
-            self.screener_status.setText("還沒有可篩選的日子（需要完整報價與融資融券資料）")
+            self.screener_status.setText("還沒有可篩選的日子（需要完整報價資料）")
 
     def _on_screener_date_changed(self, _index):
         date = self.screener_date_combo.currentData()

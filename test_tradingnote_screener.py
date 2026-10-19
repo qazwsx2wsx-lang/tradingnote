@@ -74,6 +74,33 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(loaded["rows"][0]["industry"], "半導體業")
             self.assertEqual([p for _d, p in loaded["rows"][0]["big_trail"]], [50.0, 50.5, 51.0])
 
+    def test_run_screen_does_not_require_margin_data(self):
+        """最新一天沒有融資融券資料（例如尚未公布）時，screen_dates／run_screen 仍要能選到那一天。"""
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "h.db"
+            days = [f"2026-09-{n:02d}" for n in range(1, 21)]
+            prices = []
+            for i, day in enumerate(days):
+                for market, base in (("TWSE", 1000), ("TPEX", 5000)):
+                    for k in range(screener.MIN_PRICE_ROWS):
+                        prices.append((day, f"{base + k}", market, "x", 10.0 + i * 0.1, 0.0, 1000, 1e4))
+                prices.append((day, "2330", "TWSE", "台積電", 100.0 - (i % 2), 0.0,
+                               5000 if i == len(days) - 1 else 1000, 1e6))
+            history.upsert_daily_prices(db, prices)
+            # 刻意不寫入任何 daily_margin 資料。
+            for date, pct in (("2026-09-06", 50.0), ("2026-09-13", 50.5), ("2026-09-20", 51.0)):
+                conn = chips._connect(db)
+                conn.execute("INSERT INTO tdcc_holders VALUES (?,?,?,?,?,?)", (date, "2330", 15, 1, 1, pct))
+                conn.commit()
+                conn.close()
+            directory = {"2330": {"name": "台積電", "industry": "半導體業", "market": "TWSE"}}
+            self.assertEqual(screener.screen_dates(db)[-1], days[-1])
+            result = screener.run_screen(db, directory=directory)
+            self.assertEqual(result["date"], days[-1])
+            row = result["rows"][0]
+            self.assertIsNone(row["margin_down_days"])
+            self.assertIsNone(row["margin_change_pct"])
+
 
 if __name__ == "__main__":
     unittest.main()
