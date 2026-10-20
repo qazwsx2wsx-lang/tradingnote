@@ -19,6 +19,8 @@ INDUSTRY_MAP_MAX_AGE_DAYS = 7
 DEFAULT_BACKFILL_TARGET_DAYS = 120
 DEFAULT_BACKFILL_LOOKBACK_CAP_DAYS = 200
 DEFAULT_BACKFILL_DELAY_SECONDS = 0.3
+MIN_MARKET_ROWS = 500          # 一個市場當天至少有幾檔報價才算「完整的一天」
+TPEX_GAP_STARTUP_DAYS = 30     # 每次 backfill_twse_history 順手補的上櫃缺漏天數上限（全補用 backfill_tpex_gaps）
 
 # 同一個行程（process）內最多只讓一個 backfill_twse_history 在跑：GUI 啟動時的自動
 # 資料連續性同步，跟使用者手動點「回補歷史資料」有可能前後腳同時觸發，兩個都寫同一個
@@ -268,10 +270,18 @@ def analysis_values(price, history, period, volume_days):
     selected = {row[0]: row for row in history}
     dates = period.actual_dates
     valid_today = price.date == period.end_date and price.date in dates and price.close is not None
-    actual = int(valid_today) + sum(
-        day in selected and selected[day][1] is not None
-        for day in dates if day != period.end_date
-    )
+    # 區間中途沒成交（沒有報價列或收盤價空白）的日子沿用前一個收盤價，仍算有價格；
+    # 第一天（基準）和截止日必須真的有收盤價，否則沒有可靠的起訖價可比
+    actual = int(valid_today)
+    carried = False
+    for day in dates:
+        if day == period.end_date:
+            continue
+        if day in selected and selected[day][1] is not None:
+            carried = True
+            actual += 1
+        elif carried:
+            actual += 1
     sufficient = period.sufficient and actual == period.trading_days
     change = None
     if sufficient:
@@ -567,9 +577,52 @@ def backfill_twse_history(
             DEFAULT_BACKFILL_LOOKBACK_CAP_DAYS, int(target_days * 1.6)
         )
     with _backfill_lock:
-        return _backfill_twse_history_locked(
+        done = _backfill_twse_history_locked(
             db_path, target_days, lookback_cap_days, delay_seconds, on_progress
         )
+        # 上市補完後順手補最近上櫃缺的日子（上櫃價格沒有自己的日期掃描，只靠這裡才不會漏）
+        backfill_tpex_gaps(db_path, max_days=TPEX_GAP_STARTUP_DAYS, delay_seconds=delay_seconds)
+        return done
+
+
+def missing_tpex_dates(db_path):
+    """上市有報價、上櫃卻沒有（不足 MIN_MARKET_ROWS 檔）的日期，由新到舊。
+    上市有報價就代表那天是交易日，所以上櫃查不到只可能是漏抓，不是休市。"""
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT date, SUM(market = 'TWSE'), SUM(market = 'TPEX') FROM daily_prices "
+            "GROUP BY date ORDER BY date DESC"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [d for d, twse, tpex in rows if (twse or 0) >= MIN_MARKET_ROWS and (tpex or 0) < MIN_MARKET_ROWS]
+
+
+def backfill_tpex_gaps(db_path, max_days=None, delay_seconds=DEFAULT_BACKFILL_DELAY_SECONDS,
+                       on_progress=None):
+    """用櫃買官網的歷史端點（免費、不吃 FinMind 額度）補 missing_tpex_dates；新到舊，
+    max_days 限制本次最多補幾天（None＝全部）。單日抓不到只略過，下次再補。
+    回傳 {"filled": 補到的天數, "total": 本次要補的天數, "failed": 抓不到的天數}。"""
+    pending = missing_tpex_dates(db_path)
+    if max_days is not None:
+        pending = pending[:max_days]
+    filled = failed = 0
+    for i, iso in enumerate(pending, 1):
+        records = fetch_tpex_historical_day(iso.replace("-", ""))
+        time.sleep(delay_seconds)
+        if records:
+            upsert_daily_prices(db_path, [
+                (iso, r["ticker"], r["market"], r["name"], r["close"], r["change_pct"],
+                 r["volume"], r["trading_value"])
+                for r in records
+            ])
+            filled += 1
+        else:
+            failed += 1
+        if on_progress:
+            on_progress(i, len(pending))
+    return {"filled": filled, "total": len(pending), "failed": failed}
 
 
 def _backfill_twse_history_locked(

@@ -8,6 +8,7 @@ import sys
 
 import _bootstrap  # noqa: F401
 import tradingnote_chips as chips
+import tradingnote_history as history
 import tradingnote_institutional_history as ih
 import tradingnote_screener as screener
 from tradingnote_paths import APP_PATHS
@@ -22,6 +23,12 @@ def main():
         print(f"補上 {', '.join(written)}；{today} 非交易日或尚未公布")
     else:
         print(f"{today}：沒有新資料（非交易日、尚未公布，或已是最新）")
+    try:
+        gaps = history.backfill_tpex_gaps(APP_PATHS.history_db, max_days=history.TPEX_GAP_STARTUP_DAYS)
+        if gaps["total"]:
+            print(f"上櫃價格缺漏：補上 {gaps['filled']}／{gaps['total']} 天")
+    except Exception as exc:  # noqa: BLE001
+        print(f"上櫃價格補缺失敗：{exc}")
     # 籌碼資料：失敗只印訊息，不影響法人流程的結果與 exit code
     try:
         margin = chips.backfill_margin(APP_PATHS.history_db)
