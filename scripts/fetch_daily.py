@@ -33,6 +33,8 @@ def main():
         result = screener.run_screen(APP_PATHS.history_db)
         if result:
             print(f"每日選股 {result['date']}：母體 {result['universe']} 檔，入選 {result['matched']} 檔")
+            for warning in result.get("warnings", []):
+                print(f"  注意：{warning}")
     except Exception as exc:  # noqa: BLE001
         print(f"每日選股失敗：{exc}")
     return 0

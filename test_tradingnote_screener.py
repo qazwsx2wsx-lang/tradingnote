@@ -17,6 +17,21 @@ class RuleTests(unittest.TestCase):
         closes = [10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10]
         self.assertAlmostEqual(screener.calculate_mfi(closes, [1.0] * 15), 100 * 7 / 14)
 
+    def test_holder_window_uses_calendar_gap(self):
+        ok = ["2026-09-25", "2026-10-02", "2026-10-09"]
+        base, latest, trail, problem = screener.holder_window(ok, "2026-10-14")
+        self.assertEqual((base, latest, trail, problem), ("2026-09-25", "2026-10-09", ok, None))
+        # 漏掉 10-02 時，不能拿更早的 09-18（21 天前）當兩週前
+        missing = ["2026-09-18", "2026-10-09"]
+        self.assertIsNone(screener.holder_window(missing, "2026-10-14")[0])
+        self.assertIsNotNone(screener.holder_window(missing, "2026-10-14")[3])
+
+    def test_holder_window_stale(self):
+        _, latest, _, problem = screener.holder_window(
+            ["2026-09-04", "2026-09-11", "2026-09-18"], "2026-10-14")
+        self.assertIsNone(latest)
+        self.assertIn("已", problem)
+
     def test_margin_down_days(self):
         self.assertEqual(screener._margin_down_days([10, 9, 8, 7]), 3)
         self.assertEqual(screener._margin_down_days([10, 12, 8, 7]), 2)

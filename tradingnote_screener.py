@@ -11,7 +11,7 @@
 要加回去：把下面 RULES 最前面註解起來的 margin_down 那條取消註解。
 同日 screen_dates() 也不再要求融資融券已存（該資料常比收盤晚公布，若當作門檻會讓選股卡在舊日期不動）；
 重新啟用 margin_down 規則時不需要跟著恢復這個門檻，缺資料的日子一樣會被 compute_metrics 算成 None 而篩不過）：
-  1. 兩週內大戶增加：集保 400 張以上持股占比，最新一週 比 兩週前 增加（百分點 > 0）
+  1. 兩週內大戶增加：集保 400 張以上持股占比，最新一週 比 兩週前 增加超過 BIG_HOLDER_MIN_DELTA_PP 個百分點（目前 0.1）
   2. 增量比 > 1：今日成交量 ÷ 前 5 日均量（即量比）> 1
   3. MFI < 80：14 日資金流量指標（資料庫沒有最高／最低價，典型價用收盤價近似，
      資金流用成交金額）
@@ -35,13 +35,16 @@ import tradingnote_history as history
 
 # ---------- 參數（要調整就改這裡） ----------
 BIG_HOLDER_WEEKS_BACK = 2     # 與幾週前的集保週資料比較
-BIG_HOLDER_MIN_DELTA_PP = 0.0  # 大戶占比至少要增加幾個百分點（> 這個值才通過）
+BIG_HOLDER_MIN_DELTA_PP = 0.1  # 大戶占比至少要增加幾個百分點（> 這個值才通過；過濾四捨五入等級的雜訊）
 MARGIN_DOWN_DAYS = 3          # 融資餘額連續減少幾個交易日（目前只用於顯示「融資連減」欄；規則已停用）
 VOLUME_RATIO_DAYS = 5         # 量比的均量天數（前 N 日，不含今日）
 VOLUME_RATIO_MIN = 1.0        # 量比要大於這個值
 MFI_PERIOD = 14
 MFI_MAX = 80.0                # MFI 要小於這個值
 MIN_PRICE_ROWS = 500          # 一個市場當天至少有幾檔報價才算「完整的一天」
+PRICE_SLACK_DAYS = 5          # 多抓幾個交易日，容許個股有幾天沒報價或收盤價空白
+HOLDER_GAP_TOLERANCE_DAYS = 3  # 基準週與最新週的間隔要在 7 × 週數 ± 這個天數內，否則視為缺週
+HOLDER_MAX_STALE_DAYS = 14    # 最新集保日距篩選日超過幾天，視為集保資料過舊
 
 
 @dataclass(frozen=True)
@@ -146,6 +149,29 @@ def calculate_mfi(closes, trading_values, period=MFI_PERIOD):
     return 100.0 if negative == 0 else 100 - 100 / (1 + positive / negative)
 
 
+def holder_window(holder_dates, as_of):
+    """由集保日期（由舊到新）決定比較區間，回傳 (base, latest, trail_dates, 問題說明或 None)。
+
+    以日曆天數驗證：基準週必須落在最新週往前 7 × BIG_HOLDER_WEEKS_BACK 天（±容許天數）內，
+    最新週也不能比篩選日舊太多；不符合就回傳 None 區間與原因，大戶條件會全部不通過。"""
+    holder_dates = [d for d in holder_dates if d <= as_of]
+    if not holder_dates:
+        return None, None, [], "沒有集保資料"
+    latest = holder_dates[-1]
+    latest_day = datetime.strptime(latest, "%Y-%m-%d").date()
+    stale = (datetime.strptime(as_of, "%Y-%m-%d").date() - latest_day).days
+    if stale > HOLDER_MAX_STALE_DAYS:
+        return None, None, [], f"集保最新資料 {latest} 距篩選日 {as_of} 已 {stale} 天，大戶條件已略過"
+    target = BIG_HOLDER_WEEKS_BACK * 7
+    candidates = [(abs((latest_day - datetime.strptime(d, "%Y-%m-%d").date()).days - target), d)
+                  for d in holder_dates[:-1]]
+    if not candidates or min(candidates)[0] > HOLDER_GAP_TOLERANCE_DAYS:
+        return None, None, [], (f"集保缺少 {latest} 往前 {BIG_HOLDER_WEEKS_BACK} 週的資料，"
+                                "大戶條件已略過（請補回集保歷史）")
+    base = min(candidates)[1]
+    return base, latest, [d for d in holder_dates if base <= d <= latest], None
+
+
 def _margin_down_days(balances):
     """由新到舊算融資餘額連續減少的天數（balances 由舊到新）。"""
     days = 0
@@ -157,17 +183,22 @@ def _margin_down_days(balances):
     return days
 
 
-def compute_metrics(db_path, as_of, directory=None):
-    """回傳 {ticker: 指標 dict}，母體＝as_of 當天有報價且在產業對照表內的四碼個股。"""
+def compute_metrics(db_path, as_of, directory=None, warnings=None):
+    """回傳 {ticker: 指標 dict}，母體＝as_of 當天有報價且在產業對照表內的四碼個股。
+    資料有問題（集保缺週／過舊、MFI 資料不足）時，說明文字會附加到傳入的 warnings 清單。"""
     # max_age_days 設很大：篩選只讀現有產業對照表，不觸發網路重抓（對照表由其他流程更新）
     directory = directory if directory is not None else history.get_industry_directory(
         db_path, max_age_days=10 ** 6)
     need_days = max(MFI_PERIOD + 1, VOLUME_RATIO_DAYS + 1)
+    warnings = [] if warnings is None else warnings
+    mfi_missing = 0
     conn = history._connect(db_path)
     try:
         dates = [r[0] for r in conn.execute(
             "SELECT DISTINCT date FROM daily_prices WHERE date <= ? ORDER BY date DESC LIMIT ?",
-            (as_of, need_days + 5))][::-1]
+            (as_of, need_days + PRICE_SLACK_DAYS))][::-1]
+        if not dates:
+            return {}, (None, None)
         series = defaultdict(list)
         for date, ticker, close, change, volume, value in conn.execute(
                 "SELECT date, ticker, close, change_pct, volume, trading_value FROM daily_prices "
@@ -190,13 +221,11 @@ def compute_metrics(db_path, as_of, directory=None):
     finally:
         conn.close()
 
-    holder_dates = chips.tdcc_dates(db_path)
-    holder_dates = [d for d in holder_dates if d <= as_of]
+    base, latest, trail_dates, holder_problem = holder_window(chips.tdcc_dates(db_path), as_of)
+    if holder_problem:
+        warnings.append(holder_problem)
     big = {}
-    trail_dates = []
-    if len(holder_dates) > BIG_HOLDER_WEEKS_BACK:
-        latest, base = holder_dates[-1], holder_dates[-1 - BIG_HOLDER_WEEKS_BACK]
-        trail_dates = holder_dates[-1 - BIG_HOLDER_WEEKS_BACK:]  # 基準週到最新週，每週都列
+    if latest:
         conn = chips._connect(db_path)
         try:
             for date in trail_dates:
@@ -206,16 +235,27 @@ def compute_metrics(db_path, as_of, directory=None):
                     "GROUP BY ticker", (date,)))
         finally:
             conn.close()
-    else:
-        latest = base = None
 
     metrics = {}
     for ticker, info in directory.items():
         rows = series.get(ticker)
         if not (len(ticker) == 4 and ticker.isdigit()) or not rows or rows[-1][0] != as_of:
             continue
-        closes = [r[1] for r in rows if r[1] is not None]
-        values = [r[4] or 0.0 for r in rows if r[1] is not None]
+        # 沒成交的日子（沒有報價列，或收盤價空白）以前一個收盤價延續、資金流算 0（平盤，不計入正負），
+        # 這樣冷門股停牌／沒成交也能算；第一個有收盤價之前的日子不補，所以新上市天數不足仍會是 None
+        by_date = {r[0]: r for r in rows}
+        closes, values = [], []
+        for d in dates:
+            r = by_date.get(d)
+            if r is not None and r[1] is not None:
+                closes.append(r[1])
+                values.append(r[4] or 0.0)
+            elif closes:
+                closes.append(closes[-1])
+                values.append(0.0)
+        mfi = calculate_mfi(closes, values)
+        if mfi is None:
+            mfi_missing += 1
         volumes = [r[3] for r in rows]
         today = rows[-1]
         prev = [v for v in volumes[:-1][-VOLUME_RATIO_DAYS:] if v is not None]
@@ -244,8 +284,10 @@ def compute_metrics(db_path, as_of, directory=None):
             "big_delta": big_delta, "big_latest": big_latest, "big_trail": big_trail,
             "margin_down_days": margin_down, "margin_change_pct": margin_change,
             "volume_ratio": volume_ratio,
-            "mfi": calculate_mfi(closes, values) if len(closes) == len(rows) else None,
+            "mfi": mfi,
         }
+    if mfi_missing:
+        warnings.append(f"{mfi_missing} 檔因有效報價不足 {MFI_PERIOD + 1} 筆（多半是新上市）無法計算 MFI")
     return metrics, (base, latest)
 
 
@@ -271,7 +313,8 @@ def run_screen(db_path, as_of=None, directory=None):
         as_of = dates[-1] if dates else None
     if as_of is None:
         return None
-    metrics, holder_dates = compute_metrics(db_path, as_of, directory)
+    warnings = []
+    metrics, holder_dates = compute_metrics(db_path, as_of, directory, warnings)
     matched, counts = apply_rules(metrics)
     conn = _connect(db_path)
     try:
@@ -289,7 +332,8 @@ def run_screen(db_path, as_of=None, directory=None):
     finally:
         conn.close()
     return {"date": as_of, "universe": len(metrics), "matched": len(matched),
-            "rule_counts": counts, "holder_dates": holder_dates, "rows": matched}
+            "rule_counts": counts, "holder_dates": holder_dates, "rows": matched,
+            "warnings": warnings}
 
 
 def run_dates(db_path):
