@@ -759,15 +759,32 @@ def get_ticker_history_day_counts(db_path, tickers, market=None):
 # ---------- 日期選擇（給資金流向頁的日曆式區間選擇器用，取代原本直接輸入天數；
 # 天數（avg_days）語意見 compute_industry_flow：今天以前 N 個交易日，不含今天） ----------
 
+_available_dates_cache = {}
+
+
 def get_available_dates(db_path):
     """回傳 daily_prices 裡所有出現過的交易日（ISO 字串，由舊到新排序），給 GUI
-    日期選擇器判斷「哪些日期有資料、該反白哪些日期」用；資料庫是空的回傳空清單。"""
+    日期選擇器判斷「哪些日期有資料、該反白哪些日期」用；資料庫是空的回傳空清單。
+
+    DISTINCT date 要掃過百萬列，而每次流向區間解析（FlowPeriod.resolve）都會呼叫，
+    所以以資料修訂號（daily_prices 任何寫入都會遞增）加資料庫檔案建立時間為鍵快取。"""
+    revision = get_data_revision(db_path)
+    try:
+        created = Path(db_path).stat().st_ctime_ns
+    except OSError:
+        created = None
+    key = (str(db_path), created)
+    cached = _available_dates_cache.get(key)
+    if cached is not None and cached[0] == revision:
+        return list(cached[1])
     conn = _connect(db_path)
     try:
         rows = conn.execute("SELECT DISTINCT date FROM daily_prices ORDER BY date").fetchall()
     finally:
         conn.close()
-    return [row[0] for row in rows]
+    dates = [row[0] for row in rows]
+    _available_dates_cache[key] = (revision, dates)
+    return list(dates)
 
 
 def trading_days_between(db_path, start_date, end_date=None):

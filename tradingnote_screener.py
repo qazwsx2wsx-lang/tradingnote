@@ -122,8 +122,19 @@ def _connect(db_path):
 
 # ---------- 指標 ----------
 
+_screen_dates_cache = {}
+
+
 def screen_dates(db_path):
-    """可以篩選的交易日（由舊到新）：兩個市場報價都完整的日子（不要求融資融券已存，見上方說明）。"""
+    """可以篩選的交易日（由舊到新）：兩個市場報價都完整的日子（不要求融資融券已存，見上方說明）。
+
+    全表 GROUP BY 在大資料庫要好幾秒，結果以資料修訂號（get_data_revision，每次寫入
+    daily_prices 都會遞增）為鍵快取，資料沒變就不重掃。"""
+    revision = history.get_data_revision(db_path)
+    key = str(db_path)
+    cached = _screen_dates_cache.get(key)
+    if cached is not None and cached[0] == revision:
+        return list(cached[1])
     conn = history._connect(db_path)
     try:
         counts = defaultdict(dict)
@@ -132,8 +143,10 @@ def screen_dates(db_path):
             counts[date][market] = n
     finally:
         conn.close()
-    return sorted(d for d, c in counts.items()
-                  if c.get("TWSE", 0) >= MIN_PRICE_ROWS and c.get("TPEX", 0) >= MIN_PRICE_ROWS)
+    dates = sorted(d for d, c in counts.items()
+                   if c.get("TWSE", 0) >= MIN_PRICE_ROWS and c.get("TPEX", 0) >= MIN_PRICE_ROWS)
+    _screen_dates_cache[key] = (revision, dates)
+    return list(dates)
 
 
 def calculate_mfi(closes, trading_values, period=MFI_PERIOD):

@@ -944,18 +944,12 @@ class FlowTabMixin:
         self._screener_loading = False
 
     def _refresh_screener_if_stale(self):
-        """有比已存結果更新的可篩選日（資料剛更新）就在背景重篩；否則只載入已存結果。"""
-        if self._screener_task is not None:
-            return
-        db_path = app_paths.HISTORY_DB_PATH
-        dates = screener.screen_dates(db_path)
-        stored = screener.run_dates(db_path)
-        if dates and (not stored or stored[0] < dates[-1]):
-            self._run_screener()
-        else:
-            self._fill_screener_dates(stored)
+        """有比已存結果更新的可篩選日（資料剛更新）就在背景重篩；否則只載入已存結果。
+        日期掃描（screen_dates 要掃全表）與讀取結果都在背景執行緒，GUI 只負責填畫面。"""
+        self._start_screener_task(force=False)
 
-    def _fill_screener_dates(self, stored):
+    def _fill_screener_dates(self, stored, run=None):
+        """run＝背景已讀好、對應目前選取日期的結果；沒給才同步讀（僅供沒有預讀的呼叫端）。"""
         self._screener_loading = True
         current = self.screener_date_combo.currentData()
         self.screener_date_combo.clear()
@@ -965,8 +959,10 @@ class FlowTabMixin:
         self.screener_date_combo.setCurrentIndex(max(index, 0))
         self._screener_loading = False
         if stored:
-            self._show_screener_result(screener.load_run(
-                app_paths.HISTORY_DB_PATH, self.screener_date_combo.currentData()))
+            if run is None:
+                run = screener.load_run(
+                    app_paths.HISTORY_DB_PATH, self.screener_date_combo.currentData())
+            self._show_screener_result(run)
         else:
             self.screener_status.setText("還沒有可篩選的日子（需要完整報價資料）")
 
@@ -976,26 +972,43 @@ class FlowTabMixin:
             self._show_screener_result(screener.load_run(app_paths.HISTORY_DB_PATH, date))
 
     def _run_screener(self):
+        self._start_screener_task(force=True)
+
+    def _start_screener_task(self, force):
         if self._screener_task is not None:
             return
-        self.screener_rerun_button.setEnabled(False)
-        self.screener_status.setText("篩選中…")
         db_path = app_paths.HISTORY_DB_PATH
+        current = self.screener_date_combo.currentData()
+        if force:
+            self.screener_rerun_button.setEnabled(False)
+            self.screener_status.setText("篩選中…")
 
         def work(_cancel, _emit):
-            screener.run_screen(db_path)
-            return screener.run_dates(db_path)
+            rescreen = force
+            if not rescreen:
+                dates = screener.screen_dates(db_path)
+                stored = screener.run_dates(db_path)
+                rescreen = bool(dates) and (not stored or stored[0] < dates[-1])
+            if rescreen:
+                screener.run_screen(db_path)
+            stored = screener.run_dates(db_path)
+            selected = current if current in stored else (stored[0] if stored else None)
+            run = screener.load_run(db_path, selected) if selected else None
+            return stored, run, rescreen
 
-        def done(stored):
+        def done(result):
+            stored, run, rescreened = result
             self._screener_task = None
             self.screener_rerun_button.setEnabled(True)
-            self._fill_screener_dates(stored)
+            self._fill_screener_dates(stored, run)
 
         def failed(message):
             self._screener_task = None
             self.screener_rerun_button.setEnabled(True)
             self.screener_status.setText(f"篩選失敗：{message}")
 
+        if not force and not self.screener_status.text():
+            self.screener_status.setText("載入中…")
         self._screener_task = run_background_task(self, work, done, failed)
 
     def _show_screener_result(self, result):

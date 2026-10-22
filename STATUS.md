@@ -1,6 +1,12 @@
 # tradingnote 現況（STATUS.md）
 
-## 必讀簡介（2026-10-14）
+## 必讀簡介（2026-10-21）
+- **Claude（2026-10-21，啟動／切頁卡頓，未 commit）**：量測後把 GUI thread 上最慢的同步 DB 查詢搬走：每日選股的日期掃描／重篩／讀結果改背景（`_start_screener_task`）、
+  `screen_dates`／`get_available_dates` 依資料修訂號快取、設定頁資料庫狀態改背景。副本實測啟動建構阻塞 6.3s→1.1s、GUI 最大停頓約 3.5s→0.15~0.27s。
+  **還沒做**：`_connect` 每次跑 DDL、前 50／族群清單的大戶與法人查詢仍在 GUI thread、`get_industry_map` 過期時 positions_tab 會在 GUI thread 連網（細節與依據見 CHANGELOG 2026-10-21）。
+  `test_tradingnote_flow_gui` 仍是既有失敗（與改前同一行）。
+
+## 前一輪（2026-10-14）
 - **Claude（2026-10-14，前 50 名也顯示每週大戶走勢，未 commit）**：「資金流入前 50 名」新增第 12 欄「大戶占比走勢%」（基準週→最新週每週占比，超過 6 週只顯示最近 6 週，
   完整在 tooltip）；`big_holder_changes` 回傳加 `trail`。國巨在 5 日區間顯示 `68.87 → 68.45`（基準是區間前一週）。族群清單與成分股明細尚未加走勢。
 - **Claude（2026-10-14，選股名單補每週大戶占比）**：user 檢查國巨（2327）覺得大戶變化不對——資料與集保官網一致，問題是條件 1 只比「兩週前 vs 最新」，

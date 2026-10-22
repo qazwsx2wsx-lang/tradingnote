@@ -6,6 +6,17 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 
 ---
 
+## 2026-10-21 啟動／切頁卡頓：耗時 DB 查詢移出 GUI thread
+
+**動機**：user 回報啟動與切頁不順；原則是 GUI thread 不做耗時工作。用 offscreen 載入真實資料庫副本、5ms QTimer 量 GUI thread 最大停頓＋cProfile，找到最大兩個同步瓶頸。
+**量測（改前→改後，副本、含 cProfile 開銷）**：視窗建構阻塞 6.3s→1.1s；啟動後與切分類時 GUI 最大停頓約 3.5s→0.15~0.27s。
+**改法**：①`_refresh_screener_if_stale`（`ui/tabs/flow_tab.py`）每次 dashboard 套用都在 GUI thread 跑 `screen_dates`（百萬列 GROUP BY，約 3s）→ 日期掃描、重篩、讀取結果全進背景（`_start_screener_task`，`_fill_screener_dates` 可吃預讀結果）；
+②`screen_dates`、`get_available_dates` 以 `get_data_revision`（daily_prices 任何寫入都遞增）為鍵快取；③設定頁 `_refresh_history_status`（`get_history_status` 約 1.8~5s）改背景，重疊呼叫合併成跑完再算一次。
+**驗證**：screener／flow／chips／institutional_history／tasks／journal_gui 單元測試 67 項通過；`test_tradingnote_flow_gui` 與改前同一行失敗（`flow_list` 無資料，已用 HEAD 副本確認），失敗收尾時多一個 temp 資料庫被背景執行緒佔住的 PermissionError。
+**未做**：①`_connect` 每次跑 DDL／trigger、`get_data_revision` 每秒輪詢（單次約 4ms，量測上不是主因）；②`group_big_holder_changes`／`big_holder_changes`／`stock_net_for_dates` 仍在 GUI thread（各約數十 ms）；③`positions_tab.refresh_table` 與 `flow_tab._open_tdcc_backfill`（取 `get_industry_map`）在產業對照超過 7 天未更新時會在 GUI thread 連網（啟動預載通常已更新，我在未預載的副本量到 35s）；④實機操作未驗證。
+
+---
+
 ## 2026-10-14 前 50 名顯示每週大戶走勢
 
 `big_holder_changes` 回傳每檔 `trail`（基準週到最新週每週占比），前 50 名新增「大戶占比走勢%」欄與 tooltip，讓它與每日選股一樣能看趨勢。驗證：單元測試、offscreen 真實 app（國巨 68.87 → 68.45）。**未做**：族群清單、成分股明細的走勢。

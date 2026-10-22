@@ -7,6 +7,7 @@ from PySide6 import QtCore, QtWidgets
 from tradingnote_core import save_settings
 from tradingnote_history import DEFAULT_BACKFILL_TARGET_DAYS, get_history_status
 from tradingnote_taifex import backfill_large_traders_history
+from tradingnote_tasks import run_background_task
 
 from ui import app_paths
 from ui.dialogs.progress import BackfillDialog, TpexBackfillDialog
@@ -232,8 +233,26 @@ class SettingsTabMixin:
         )
 
     def _refresh_history_status(self):
-        """本地 SQLite 聚合查詢（COUNT／MIN／MAX，非逐列讀取），即使累積到 ~200 天、
-        全市場資料量也只是毫秒等級，跟其他分頁的本地資料讀取一樣直接同步呼叫，
-        不需要另外開背景執行緒。"""
-        status = get_history_status(app_paths.HISTORY_DB_PATH)
-        self.history_status_label.setText(_format_history_status(status))
+        """COUNT(DISTINCT …) 要掃過全部報價列（百萬筆約數秒），所以在背景執行緒算，
+        算完再更新標籤；已有一次在跑時只記下「跑完要再算一次」，不重疊查詢。"""
+        if getattr(self, "_history_status_task", None) is not None:
+            self._history_status_again = True
+            return
+        self._history_status_again = False
+        db_path = app_paths.HISTORY_DB_PATH
+
+        def finish():
+            self._history_status_task = None
+            if self._history_status_again:
+                self._refresh_history_status()
+
+        def done(status):
+            self.history_status_label.setText(_format_history_status(status))
+            finish()
+
+        def failed(message):
+            self.history_status_label.setText(f"資料庫狀態讀取失敗：{message}")
+            finish()
+
+        self._history_status_task = run_background_task(
+            self, lambda _cancel, _emit: get_history_status(db_path), done, failed)
