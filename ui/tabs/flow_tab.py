@@ -555,6 +555,7 @@ class FlowTabMixin:
             top_n=30,
         )
         resolved = period.resolve(app_paths.HISTORY_DB_PATH, self.snapshot)
+        # TODO(perf): 此查詢仍在 GUI thread 同步執行（約數十 ms），應併入 analyze worker 的回傳。見 CHANGELOG 2026-10-21「未做」。
         holder_changes, holder_dates = chips.big_holder_changes(
             app_paths.HISTORY_DB_PATH, [row["ticker"] for row in top_stocks],
             resolved.actual_dates[0] if resolved.actual_dates else resolved.start_date,
@@ -655,6 +656,7 @@ class FlowTabMixin:
             ),
             reverse=True,
         )
+        # TODO(perf): 此查詢仍在 GUI thread 同步執行（約數十 ms），應併入 analyze worker 的回傳。見 CHANGELOG 2026-10-21「未做」。
         holder_delta, holder_dates = chips.group_big_holder_changes(
             app_paths.HISTORY_DB_PATH,
             self.flow_service.group_members(dashboard.classification_mode, dashboard.classification_scope),
@@ -805,6 +807,7 @@ class FlowTabMixin:
             return
         top = [stock.ticker for stock in self.flow_service.analyze(
             self.snapshot, self.flow_period).stock_capital_flow]
+        # TODO(perf): get_industry_map 在產業對照超過 7 天未更新時會在 GUI thread 連網；應改背景或只讀快取。見 CHANGELOG 2026-10-21「未做」。
         everyone = sorted(t for t in get_industry_map(app_paths.HISTORY_DB_PATH)
                           if t.isdigit() and len(t) == 4)
         self._tdcc_dialog = TdccBackfillDialog(self, top, everyone)
@@ -815,12 +818,14 @@ class FlowTabMixin:
             dashboard = self.flow_service.analyze(self.snapshot, self.flow_period)
         stocks = dashboard.stock_capital_flow
         # 區間法人歷史不完整時不顯示（不拿單日快照冒充區間），欄位留「—」。
+        # TODO(perf): 此查詢仍在 GUI thread 同步執行（約數十 ms），應併入 analyze worker 的回傳。見 CHANGELOG 2026-10-21「未做」。
         inst_net = ih.stock_net_for_dates(
             app_paths.HISTORY_DB_PATH,
             [stock.ticker for stock in stocks],
             dashboard.institutional_dates,
         )
         # 400 張以上大戶持股占比的週變化（集保週資料；沒有基準週就留「—」）
+        # TODO(perf): 此查詢仍在 GUI thread 同步執行（約數十 ms），應併入 analyze worker 的回傳。見 CHANGELOG 2026-10-21「未做」。
         holder_delta, holder_dates = chips.big_holder_changes(
             app_paths.HISTORY_DB_PATH, [stock.ticker for stock in stocks],
             dashboard.period.actual_dates[0] if dashboard.period.actual_dates else dashboard.period.start_date,

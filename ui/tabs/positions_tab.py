@@ -128,6 +128,7 @@ class PositionsTabMixin:
         has_pnl = False
         self.table.setRowCount(len(self.positions))
         try:
+            # TODO(perf): get_industry_map 在產業對照超過 7 天未更新時會在 GUI thread 連網；應改背景或只讀快取。見 CHANGELOG 2026-10-21「未做」。
             industry_map = get_industry_map(app_paths.HISTORY_DB_PATH)
         except PriceFetchError:
             # 族群只是輔助資訊，抓不到（例如離線、快取剛好過期又連不上網）不該
@@ -207,6 +208,7 @@ class PositionsTabMixin:
 
     def _load_position_detail(self, pos):
         try:
+            # TODO(perf): get_industry_map 在產業對照超過 7 天未更新時會在 GUI thread 連網；應改背景或只讀快取。見 CHANGELOG 2026-10-21「未做」。
             industry = get_industry_map(app_paths.HISTORY_DB_PATH).get(pos.ticker) or "未分類"
         except PriceFetchError:
             industry = "未分類"

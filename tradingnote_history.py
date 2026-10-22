@@ -118,6 +118,8 @@ def _cross_sectional_percentile(value, values):
 
 # ---------- DB ----------
 
+# TODO(perf): 每次呼叫都重跑 PRAGMA／CREATE TABLE／12 個 TRIGGER／INSERT＋commit（量測單次約 4ms）；
+#     應改成每個 process 初始化一次。見 CHANGELOG 2026-10-21「未做」。
 def _connect(db_path):
     p = Path(db_path)
     p.parent.mkdir(parents=True, exist_ok=True)
