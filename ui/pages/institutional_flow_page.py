@@ -1,16 +1,17 @@
 """「法人資金流去哪？」頁面：三大法人在各類股的買賣超、加速流入與土洋動向。
 
 資料全部來自 tradingnote_institutional_history 預先算好的表（sector_metrics／
-stock_metrics／market_summary），這裡只負責查詢與畫圖，不做任何指標計算；
-查詢都是單日／單一類股的小查詢，直接在主執行緒跑。只有「更新法人資料」
-（打 API 回補）走背景執行緒。
+stock_metrics／market_summary），這裡只負責查詢與畫圖，不做任何指標計算，也不
+負責回補資料——「更新法人資料」已搬到「設定」分頁（跟 TWSE 股價、期貨大額交易人
+歷史同一套「每次啟動自動檢測」＋手動按鈕機制），這裡只在 showEvent 透過
+reload_if_changed／data_signature 偵測資料有沒有變，變了就重新查詢顯示。
+查詢都是單日／單一類股的小查詢，直接在主執行緒跑。
 """
 
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import tradingnote_institutional_history as ih
-from tradingnote_tasks import run_background_task
 from ui.components.insight_card import InsightCard
 from ui.components.section_card import SectionCard
 from ui.components.signal_badge import SignalBadge
@@ -284,18 +285,6 @@ class SectorDetailDialog(QtWidgets.QDialog):
         self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
 
 
-def _update_summary(written, failures):
-    """更新完成後的狀態列文字；把「抓失敗」和「真的沒有新資料」分開講。"""
-    parts = [f"已更新 {len(written)} 個交易日" if written else "沒有新增資料"]
-    if failures:
-        parts.append(
-            f"{len(failures)} 天抓取失敗（最近：{max(failures)}），"
-            "可能被證交所／櫃買暫時擋住，稍後再按更新")
-    elif not written:
-        parts = ["已是最新（或今日資料尚未公布）"]
-    return "；".join(parts)
-
-
 class InstitutionalFlowPage(QtWidgets.QWidget):
     """左側導覽「法人資金流去哪？」頁。"""
 
@@ -315,7 +304,6 @@ class InstitutionalFlowPage(QtWidgets.QWidget):
         self.date = None
         self.rows = {inv: [] for inv in INVESTOR_ORDER}
         self._signature = None
-        self._update_task = None
         self._detail_dialog = None
         self._build()
 
@@ -339,14 +327,7 @@ class InstitutionalFlowPage(QtWidgets.QWidget):
         self.date_combo = QtWidgets.QComboBox()
         self.date_combo.currentIndexChanged.connect(lambda _i: self._load_date())
         toolbar.addWidget(self.date_combo)
-        toolbar.addSpacing(12)
-        self.update_button = QtWidgets.QPushButton("更新法人資料")
-        self.update_button.setToolTip("抓取最新交易日並補齊最近 60 個交易日（每個請求間隔 3 秒）")
-        self.update_button.clicked.connect(self._start_update)
-        toolbar.addWidget(self.update_button)
-        self.status_label = QtWidgets.QLabel()
-        self.status_label.setProperty("muted", True)
-        toolbar.addWidget(self.status_label, 1)
+        toolbar.addStretch(1)
         layout.addLayout(toolbar)
 
         summary_card = SectionCard("盤後結論")
@@ -499,7 +480,8 @@ class InstitutionalFlowPage(QtWidgets.QWidget):
             self.date = None
             self.insight.set_content(
                 "尚無法人歷史資料",
-                "按上方「更新法人資料」回補最近 60 個交易日（約 20 分鐘，可中途關閉程式，下次會接著補）。",
+                "請到「設定」分頁按「更新法人資料」回補（約 20 分鐘，可中途關閉程式，下次會接著補），"
+                "或開啟「每次啟動自動檢測」讓程式自動補齊。",
                 tone="warning",
             )
             return
@@ -763,29 +745,3 @@ class InstitutionalFlowPage(QtWidgets.QWidget):
             self.db_path, sector, self.date, self._investor(), self)
         self._detail_dialog.show()
 
-    def _start_update(self):
-        if self._update_task is not None:
-            return
-        self.update_button.setEnabled(False)
-        self.status_label.setText("更新中…（每個請求間隔 3 秒）")
-
-        def work(_cancel_event, emit):
-            failures = []
-            written = ih.backfill(self.db_path, log=emit, failures=failures)
-            return written, failures
-
-        def done(result):
-            written, failures = result
-            self._update_task = None
-            self.update_button.setEnabled(True)
-            self.status_label.setText(_update_summary(written, failures))
-            self.reload_if_changed()
-
-        def failed(message):
-            self._update_task = None
-            self.update_button.setEnabled(True)
-            self.status_label.setText(f"更新失敗：{message}")
-
-        # 回傳值一定要留住，否則 BackgroundTask 會被回收、done 永遠不會觸發（見 ARCHITECTURE.md）
-        self._update_task = run_background_task(
-            self, work, done, failed, on_progress=self.status_label.setText)

@@ -102,9 +102,11 @@ class TradingNoteWindow(
 
         self.continuity_note = ""
         self.large_traders_note = ""
+        self.institutional_note = ""
         self._total_pnl = None
         self._sync_timer = None
         self._large_traders_sync_timer = None
+        self._institutional_sync_task = None
 
         # 「有新資料可更新」提示：_known_data_date 是目前畫面上顯示的資料所屬交易日，
         # _dismissed_data_date 是使用者按過「✕」關閉、暫時不想再看到提示的那個交易日
@@ -236,6 +238,11 @@ class TradingNoteWindow(
             # 同一顆「回補天數」設定，在背景把缺的日期補進 large_traders_history，供
             # 「期貨」頁趨勢圖用（見 _sync_large_traders_history）。
             self._sync_large_traders_history()
+            # 三大法人買賣超歷史：同一個開關＋「回補天數」設定，在背景補進
+            # daily_institutional／sector_metrics，供「法人資金流去哪？」頁用（見
+            # _sync_institutional_history）；該頁只在被看到時用 data_signature 偵測
+            # 有沒有新資料，不需要這裡另外通知它重畫。
+            self._sync_institutional_history()
             # 估值歷史（valuation_history）不在這裡回補：泡泡圖「估值」模式改成只看
             # 每檔股票「最新一筆」PER/PBR（見 compute_valuation_flow），不需要長天期
             # 歷史。「最新一筆」資料靠每次「重新整理」／啟動都會呼叫的
@@ -381,9 +388,12 @@ class TradingNoteWindow(
         large_traders_note = (
             f"　{self.large_traders_note}" if self.large_traders_note else ""
         )
+        institutional_note = (
+            f"　{self.institutional_note}" if self.institutional_note else ""
+        )
         status_text = (
             f"{cache_note}　{total_note}{error_note}{staleness_note}"
-            f"{continuity_note}{large_traders_note}"
+            f"{continuity_note}{large_traders_note}{institutional_note}"
         )
         self.status_bar_label.setText(status_text)
         self.status_bar_label.setToolTip(status_text)

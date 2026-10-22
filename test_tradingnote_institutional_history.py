@@ -304,13 +304,13 @@ class BackfillSkipTests(unittest.TestCase):
 
 class UpdateSummaryTests(unittest.TestCase):
     def test_distinguishes_failure_from_up_to_date(self):
-        from ui.pages.institutional_flow_page import _update_summary
-        self.assertEqual(_update_summary([], []), "已是最新（或今日資料尚未公布）")
-        self.assertEqual(_update_summary(["2026-10-08"], []), "已更新 1 個交易日")
-        text = _update_summary([], ["2026-10-07", "2026-10-08"])
+        from ui.tabs.settings_tab import _format_institutional_update
+        self.assertEqual(_format_institutional_update([], []), "已是最新（或今日資料尚未公布）")
+        self.assertEqual(_format_institutional_update(["2026-10-08"], []), "已更新 1 個交易日")
+        text = _format_institutional_update([], ["2026-10-07", "2026-10-08"])
         self.assertIn("2 天抓取失敗", text)
         self.assertIn("2026-10-08", text)
-        self.assertIn("已更新 1 個交易日", _update_summary(["2026-10-06"], ["2026-10-07"]))
+        self.assertIn("已更新 1 個交易日", _format_institutional_update(["2026-10-06"], ["2026-10-07"]))
 
 
 if __name__ == "__main__":
