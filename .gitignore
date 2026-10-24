@@ -6,3 +6,5 @@ data/
 .claude/
 _qa*/
 bench_results_*.json
+build/
+dist/

@@ -31,12 +31,13 @@ from tradingnote_api_config import (
     TWSE_T86_HISTORY_URL,
 )
 from tradingnote_http import PriceFetchError, http_get_json, to_float, to_int
+from tradingnote_paths import APP_PATHS
 
 INVESTORS = ("all", "foreign", "trust", "dealer")
 DEFAULT_TARGET_DAYS = 60
 DEFAULT_DELAY_SECONDS = 3.0
 TAIPEI = ZoneInfo("Asia/Taipei")
-SECTOR_OVERRIDES_PATH = Path(__file__).resolve().parent / "sector_overrides.json"
+SECTOR_OVERRIDES_PATH = APP_PATHS.root / "sector_overrides.json"
 AMOUNT_UNIT = 1e8  # 億
 
 

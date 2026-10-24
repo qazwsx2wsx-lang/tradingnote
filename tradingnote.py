@@ -5,16 +5,12 @@ import re
 import unicodedata
 
 from tradingnote_core import (
-    add_position,
     compute_pnl,
+    find_position,
     get_market_snapshot,
-    load_positions,
     load_settings,
     lookup_price,
-    remove_position,
-    save_positions,
     snapshot_staleness_warnings,
-    update_position,
 )
 from tradingnote_history import (
     DEFAULT_BACKFILL_TARGET_DAYS,
@@ -24,7 +20,16 @@ from tradingnote_history import (
     record_snapshot,
 )
 from tradingnote_http import PriceFetchError
+from tradingnote_legacy_positions import archive_legacy_positions_file, load_legacy_positions
 from tradingnote_paths import APP_PATHS
+from tradingnote_tradejournal import (
+    cancel_empty_position,
+    list_open_positions,
+    migrate_legacy_position,
+    open_position,
+    record_execution,
+    update_position_plan,
+)
 
 DATA_DIR = APP_PATHS.data_dir
 POSITIONS_PATH = APP_PATHS.positions
@@ -52,16 +57,18 @@ def print_help():
     print(
         f"""
 {BOLD}指令說明{RESET}
-  add <代號> <股數> <成本價> <日期 YYYY-MM-DD> [備註...]   新增部位
-  edit <id> <股數> <成本價> <日期 YYYY-MM-DD> [備註...]    編輯部位（id 可用前綴，代號不可改）
-  list / ls                                                列出所有部位（含現價與損益）
-  remove <id> / rm <id>                                    刪除部位（id 可用前綴）
-  price <代號>                                              查詢單一股票現價（不新增部位）
-  refresh                                                  強制重新抓取台股價格（略過快取）
-  flow                                                     列出產業資金流向（成交金額排序）
-  backfill                                                 回補上市股票歷史資料（天數見 settings.json 的 backfill_target_days，僅需執行一次）
-  help                                                      顯示這個說明
-  quit / exit                                              離開程式
+  add <代號> <股數> <成本價> <日期 YYYY-MM-DD> <停損價> [備註...]   開新部位
+  buy <id> <股數> <價格> [成交時間]                                  加碼（新增一筆買進成交）
+  sell <id> <股數> <價格> [成交時間]                                 減碼／出場（新增一筆賣出成交，股數歸零會自動收盤）
+  edit <id> <停損價> [備註...]                                       編輯部位設定（只改停損價／備註，股數價格請用 buy/sell）
+  list / ls                                                          列出目前所有（OPEN）部位，含現價與損益
+  remove <id> / rm <id>                                              取消部位（僅限尚無成交記錄者）
+  price <代號>                                                        查詢單一股票現價（不新增部位）
+  refresh                                                            強制重新抓取台股價格（略過快取）
+  flow                                                               列出產業資金流向（成交金額排序）
+  backfill                                                           回補上市股票歷史資料（天數見 settings.json 的 backfill_target_days，僅需執行一次）
+  help                                                                顯示這個說明
+  quit / exit                                                        離開程式
 """
     )
 
@@ -198,7 +205,15 @@ def print_industry_flow(snapshot):
         print(" │ ".join(pad(c, w) for c, w in zip(r, widths)))
 
 
-def parse_command(cmd, positions, snapshot_ref, cache_path, settings):
+def _resolve_trade_id(db_path, position_id):
+    """沿用 find_position 的前綴比對，但只對目前 OPEN 的部位生效——這就是
+    tradingnote_tradejournal._recalculate_rollup 只會把 OPEN 轉成 CLOSED、
+    不會反向重新打開的直接後果：對非 OPEN 的部位操作沒有意義。"""
+    position = find_position(list_open_positions(db_path), position_id)
+    return int(position.id) if position is not None else None
+
+
+def parse_command(cmd, db_path, snapshot_ref, cache_path, settings):
     parts = cmd.split()
     if not parts:
         return snapshot_ref
@@ -213,7 +228,7 @@ def parse_command(cmd, positions, snapshot_ref, cache_path, settings):
         return snapshot_ref
 
     if head in ("list", "ls"):
-        print_positions_table(positions, snapshot_ref)
+        print_positions_table(list_open_positions(db_path, snapshot_ref), snapshot_ref)
         return snapshot_ref
 
     if head == "refresh":
@@ -255,27 +270,34 @@ def parse_command(cmd, positions, snapshot_ref, cache_path, settings):
         if len(parts) < 2:
             print("用法：remove <id>")
             return snapshot_ref
-        if remove_position(positions, parts[1]):
-            print("已刪除。")
-        else:
+        trade_id = _resolve_trade_id(db_path, parts[1])
+        if trade_id is None:
             print("找不到這個 id。")
+            return snapshot_ref
+        if cancel_empty_position(db_path, trade_id):
+            print("已取消。")
+        else:
+            print("這筆部位已經有成交記錄，請改用 sell 把股數全部賣出。")
         return snapshot_ref
 
     if head == "add":
-        if len(parts) < 5:
-            print("用法：add <代號> <股數> <成本價> <日期 YYYY-MM-DD> [備註...]")
+        if len(parts) < 6:
+            print("用法：add <代號> <股數> <成本價> <日期 YYYY-MM-DD> <停損價> [備註...]")
             return snapshot_ref
-        ticker, shares_s, price_s, entry_date = parts[1:5]
-        note = " ".join(parts[5:])
+        ticker, shares_s, price_s, entry_date, stop_loss_s = parts[1:6]
+        note = " ".join(parts[6:])
         try:
             shares = int(shares_s)
             entry_price = float(price_s)
+            initial_stop_loss = float(stop_loss_s)
         except ValueError:
-            print("股數需為整數、成本價需為數字。")
+            print("股數需為整數、成本價與停損價需為數字。")
             return snapshot_ref
         try:
-            pos = add_position(
-                positions, ticker, shares, entry_price, entry_date, note, snapshot_ref
+            pos = open_position(
+                db_path, ticker=ticker, shares=shares, entry_price=entry_price,
+                entry_date=entry_date, initial_stop_loss=initial_stop_loss,
+                note=note, snapshot=snapshot_ref,
             )
         except ValueError as e:
             print(f"新增失敗：{e}")
@@ -283,36 +305,101 @@ def parse_command(cmd, positions, snapshot_ref, cache_path, settings):
         print(f"已新增部位 {pos.id}：{pos.ticker} {pos.name or ''}".rstrip())
         return snapshot_ref
 
-    if head == "edit":
-        if len(parts) < 5:
-            print("用法：edit <id> <股數> <成本價> <日期 YYYY-MM-DD> [備註...]")
-            print("（代號不可修改，換股票請 remove 後重新 add）")
+    if head in ("buy", "sell"):
+        if len(parts) < 4:
+            print(f"用法：{head} <id> <股數> <價格> [成交時間]")
             return snapshot_ref
-        position_id, shares_s, price_s, entry_date = parts[1:5]
-        note = " ".join(parts[5:])
+        position_id, shares_s, price_s = parts[1:4]
+        executed_at = parts[4] if len(parts) > 4 else None
+        trade_id = _resolve_trade_id(db_path, position_id)
+        if trade_id is None:
+            print("找不到這個 id（或這筆部位已經不是 OPEN 狀態）。")
+            return snapshot_ref
         try:
-            shares = int(shares_s)
-            entry_price = float(price_s)
+            qty = float(shares_s)
+            price = float(price_s)
         except ValueError:
-            print("股數需為整數、成本價需為數字。")
+            print("股數與價格需為數字。")
+            return snapshot_ref
+        record_execution(
+            db_path, trade_id, action=head.upper(), price=price, qty=qty, executed_at=executed_at,
+        )
+        print("已記錄成交。")
+        return snapshot_ref
+
+    if head == "edit":
+        if len(parts) < 3:
+            print("用法：edit <id> <停損價> [備註...]")
+            print("（股數／成本價／日期不可直接改，請用 buy/sell 調整部位）")
+            return snapshot_ref
+        position_id, stop_loss_s = parts[1:3]
+        note = " ".join(parts[3:])
+        trade_id = _resolve_trade_id(db_path, position_id)
+        if trade_id is None:
+            print("找不到這個 id（或這筆部位已經不是 OPEN 狀態）。")
             return snapshot_ref
         try:
-            pos = update_position(
-                positions, position_id, shares, entry_price, entry_date, note, snapshot_ref
+            initial_stop_loss = float(stop_loss_s)
+        except ValueError:
+            print("停損價需為數字。")
+            return snapshot_ref
+        try:
+            update_position_plan(
+                db_path, trade_id, initial_stop_loss=initial_stop_loss, notes=note or None,
             )
         except ValueError as e:
             print(f"編輯失敗：{e}")
             return snapshot_ref
-        print(f"已更新部位 {pos.id}：{pos.ticker} {pos.name or ''}".rstrip())
+        print("已更新部位設定。")
         return snapshot_ref
 
     print("看不懂這個指令，輸入 help 查看說明。")
     return snapshot_ref
 
 
+def _prompt_legacy_migration():
+    """舊版 positions.json 一次性搬遷：trades.initial_stop_loss 是必填欄位，
+    舊部位從來沒有停損價，逐筆詢問使用者補填。先收集完全部停損價才開始寫入，
+    中途按 Ctrl-C／EOF 不會留下部分搬遷的狀態，原檔案也不會被改名，下次啟動
+    會再問一次（跟 GUI 的 LegacyPositionMigrationDialog 走同一套保證）。"""
+    legacy_positions = load_legacy_positions(POSITIONS_PATH)
+    if not legacy_positions:
+        return
+    print(
+        "偵測到舊版「部位紀錄」資料（positions.json）。新版把部位跟交易紀錄合併，"
+        "每筆部位都需要一個初始停損價，請為以下每筆部位補填："
+    )
+    rows = []
+    for position in legacy_positions:
+        while True:
+            raw = input(
+                f"  {position.ticker}（{position.shares} 股 @ {position.entry_price}，"
+                f"{position.entry_date}）停損價："
+            ).strip()
+            try:
+                stop_loss = float(raw)
+                if stop_loss <= 0:
+                    raise ValueError
+            except ValueError:
+                print("    請輸入大於 0 的數字。")
+                continue
+            rows.append((position, stop_loss))
+            break
+
+    for position, stop_loss in rows:
+        migrate_legacy_position(HISTORY_DB_PATH, position, stop_loss)
+    archive_legacy_positions_file(POSITIONS_PATH)
+    print("搬遷完成，positions.json 已改名為 positions.json.bak。\n")
+
+
 def main():
     print(f"{BOLD}=== tradingnote 台股部位紀錄 ==={RESET}\n")
-    positions = load_positions(POSITIONS_PATH)
+    try:
+        _prompt_legacy_migration()
+    except (EOFError, KeyboardInterrupt):
+        print("\n已取消搬遷，下次啟動會再次詢問。")
+        return
+
     try:
         snapshot = get_market_snapshot(CACHE_PATH)
         record_snapshot(HISTORY_DB_PATH, snapshot)
@@ -331,7 +418,7 @@ def main():
         except PriceFetchError:
             pass  # 資料連續性檢查失敗不應該擋住程式啟動，之後仍可用 backfill 指令手動重試
 
-    print_positions_table(positions, snapshot)
+    print_positions_table(list_open_positions(HISTORY_DB_PATH, snapshot), snapshot)
     print_help()
 
     while True:
@@ -341,12 +428,10 @@ def main():
             print("\n再見！")
             break
         try:
-            snapshot = parse_command(cmd, positions, snapshot, CACHE_PATH, settings)
+            snapshot = parse_command(cmd, HISTORY_DB_PATH, snapshot, CACHE_PATH, settings)
         except SystemExit:
             print("再見！")
             break
-        finally:
-            save_positions(POSITIONS_PATH, positions)
 
 
 if __name__ == "__main__":
