@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import os
+import sys
 from pathlib import Path
 
 
@@ -22,12 +23,40 @@ class AppPaths:
     settings: Path
 
 
+def _default_frozen_data_dir() -> Path:
+    """PyInstaller 打包後的 .app／.exe：資料不能寫進 bundle 裡（唯讀、簽章後也不該
+    改動），改用各平台慣例的使用者資料目錄。"""
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "TradingNote"
+    if sys.platform.startswith("win"):
+        base = os.environ.get("APPDATA") or str(Path.home())
+        return Path(base) / "TradingNote"
+    return Path.home() / ".tradingnote"
+
+
 def get_app_paths(root=None):
     """Return application paths, optionally overriding the data directory."""
 
-    root_path = Path(root) if root is not None else Path(__file__).resolve().parent
+    is_frozen = bool(getattr(sys, "frozen", False))
+    if root is not None:
+        root_path = Path(root)
+    elif is_frozen:
+        # PyInstaller 在 onefile／onedir 兩種模式下都會設定 sys._MEIPASS 指向
+        # 打包進去的資源所在目錄（onefile 是解壓到暫存資料夾，onedir 則是建置
+        # 時就展開好的目錄），concepts.json／sector_overrides.json／assets/
+        # 都是從這裡找，跟原始碼目錄結構一致。
+        root_path = Path(sys._MEIPASS)
+    else:
+        root_path = Path(__file__).resolve().parent
+
     configured_data_dir = os.environ.get("TRADINGNOTE_DATA_DIR")
-    data_dir = Path(configured_data_dir) if configured_data_dir else root_path / "data"
+    if configured_data_dir:
+        data_dir = Path(configured_data_dir)
+    elif is_frozen:
+        data_dir = _default_frozen_data_dir()
+    else:
+        data_dir = root_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
     return AppPaths(
         root=root_path,
         data_dir=data_dir,

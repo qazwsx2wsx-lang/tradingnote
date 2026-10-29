@@ -36,7 +36,7 @@ class FlowGuiTests(unittest.TestCase):
                     stack.enter_context(patch.object(app_paths, name, self.db.parent / value.name))
             app_paths.HISTORY_DB_PATH = self.db
             _patch_gui_name(stack, 'load_settings', return_value={'auto_check_continuity': False})
-            _patch_gui_name(stack, 'load_positions', return_value=[])
+            _patch_gui_name(stack, 'list_open_positions', return_value=[])
             _patch_gui_name(stack, 'build_classification_catalog', return_value=Mock(groups=Mock(return_value={'測試族群': {'1111'}}), revision='test', value_chain_scopes=[]))
             _patch_gui_name(stack, 'get_industry_map', return_value={'1111':'測試族群'})
             _patch_gui_name(stack, 'get_industry_directory', return_value={'1111':{'name':'測試', 'market':'TWSE','industry':'測試族群'}})

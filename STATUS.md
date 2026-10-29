@@ -165,6 +165,9 @@ tradingnote/
 ├── scripts/                     # backfill.py／fetch_daily.py／recompute.py／launchd 範本
 ├── tradingnote_technical.py    # 核心：由共用 OHLCV 計算 24 類技術指標（MA/EMA/KD/MACD/RSI/...）
 ├── tradingnote_journal.py      # 核心：交易週誌與持股週曆（2026-09-10 新增）
+├── tradingnote_tradejournal.py # 核心：部位／交易（策略／標籤／逐筆成交／復盤診斷），2026-10-24 新增；2026-10-24 再改：
+│                                 #   部位＝目前 OPEN 的交易，trades 取代 positions.json 成為唯一資料來源
+├── tradingnote_legacy_positions.py # 核心：舊版 positions.json 一次性搬遷用（讀取＋改名 .bak），之後可整個刪除
 ├── tradingnote_finmind.py      # 核心：FinMind API（本益比/殖利率/三大法人/融資融券等），僅 GUI 使用
 ├── tradingnote_concepts.py     # 核心：概念股分類（讀 concepts.json，人工維護、非 API 資料）
 ├── concepts.json                # 人工維護的概念股清單，跟 trade-journal/themes.json 無關、不共用
@@ -185,7 +188,7 @@ tradingnote/
 ├── ui/                           # GUI design system + reusable components（2026-09-15 新增，進行中）
 │   ├── pages/institutional_flow_page.py # 「法人資金流去哪？」頁（2026-09-26）
 │   ├── tabs/                    # 其餘六個分頁的 TradingNoteWindow mixin（flow／stocks／positions／journal／futures／settings）
-│   ├── dialogs/                 # progress／positions／stock_detail／futures／trading_date 對話框
+│   ├── dialogs/                 # progress／positions／legacy_position_migration／stock_detail／futures／trading_date 對話框
 │   ├── charts/                  # flow_chart.py（泡泡圖、法人方向圖）、detail.py（個股 8 張籌碼圖＋技術分析＋DetailChartPanel）
 │   ├── stock_charts.py          # StockChart／ComparisonWidget／LazyTabBuilder 圖表基礎元件
 │   ├── app_paths.py             # GUI 用的 data/ 檔案路徑（以 app_paths.X 存取，測試從這裡覆寫）
@@ -201,16 +204,16 @@ tradingnote/
 │       └── insight_card.py      # InsightCard(headline, detail, tone)：rule-based 數據轉敘述
 ├── ARCHITECTURE.md               # 本專案架構文件（模組邊界／依賴方向／資料流，2026-09-15 重寫）
 └── data/                         # 執行時自動建立，git 已忽略（.gitignore）
-    ├── positions.json            # 使用者紀錄的部位
+    ├── positions.json.bak        # 舊版部位資料，一次性搬遷成功後的備份（搬遷前叫 positions.json）
     ├── price_cache.json          # 全市場收盤價快取（30分鐘 TTL）
     ├── settings.json             # auto_check_continuity、finmind_token、backfill_target_days 等本機設定
-    └── history.db                # SQLite：股票歷史價格／產業分類／估值／週誌快照 + 期貨大額交易人歷史
+    └── history.db                # SQLite：股票歷史價格／產業分類／估值／週誌快照／部位與交易紀錄 + 期貨大額交易人歷史
 ```
 
-## GUI 現況：六個分頁（左側導覽列，2026-09-14 由上方分頁改版；2026-10-13「法人資金流去哪？」併進資金流向）
+## GUI 現況：六個分頁（左側導覽列，2026-09-14 由上方分頁改版；2026-10-13「法人資金流去哪？」併進資金流向；2026-10-24 部位紀錄與交易紀錄合併）
 1. **資金流向分析**（預設頁）：pyqtgraph 泡泡圖，2026-09-16 改版——**泡泡填色＝所屬分類**（`_category_color()`，依名稱雜湊決定色相，同一分類永遠同一顏色，跟下方清單「分類」欄的色塊 icon 對照一致）、**外框顏色＝方向**（原本整顆泡泡只有紅/綠/灰三色代表當日量價方向，現在改成外框加粗表達，填色跟方向分開兩個視覺通道）。`ScatterPlotItem` 加 `antialias=False`（只針對這個 widget，不動全域抗鋸齒設定）修正 hover 時的卡頓。可觸控板/滾輪縮放平移，點擊泡泡看該產業前十大成分股；工具列「泡泡圖模式」三選一：「動能」（X＝N日累積漲跌%、Y＝量比）／「估值」（X＝最新一筆 PER/PBR 加權中位數、Y＝近5日均額÷近20日均額）／**「主力同步買超」**（新增，X＝三大法人方向一致性分數 -3～+3、Y＝三大法人合計買賣超金額億元，外框依一致性分數而非當日漲跌決定；資料僅反映最新一筆三大法人快照，不受「流向區間」影響，見下方已知缺口）。三種模式都有四象限淡色底與 hover 解讀。下方按分類切換：資金動向清單（「分類」欄已加色塊 icon）、產業熱度排行、個股資金流入前50、個股量比異常清單。另有「法人方向」子頁：從 TWSE T86、TPEx `tpex_3insti_daily_trading` 取得全市場真實淨買賣股數，依族群聚合後以三張左右發散圖顯示外資／投信／自營商（真實買賣超，淨額為股數×收盤價估算，跟新的「主力同步買超」泡泡模式共用同一份 `dashboard.institutional_flow`）。日期選擇一律用日曆式起始日期選擇器，沒有歷史資料的日期反白不能選，結束日固定今天／最新資料。
 2. **法人資金流去哪？**（2026-09-26 新增；2026-10-13 起不再是獨立分頁，是「資金流向」頁「顯示分類」裡的一個按鈕，`ui/pages/institutional_flow_page.py`）：讀 `tradingnote_institutional_history` 預先算好的表。上方盤後結論（一句摘要＋外資／投信／自營商／合計四張 StatCard，金額採交易所公布值）；下方四個分類按鈕切換：法人資金流向泡泡圖（X＝近 5 日、Y＝加速流入、大小可切成交金額／近 20 日絕對值，可展開「過去 30 天」）、今日法人買賣榜、近 5 日土洋操作、可排序熱力圖；右側「法人」切換合計／外資／投信／自營。點泡泡或熱力圖列開 `SectorDetailDialog`（30 日柱狀＋累計線、成分股表）。資料日期下拉只列有資料的交易日；「更新法人資料」背景跑 `ih.backfill()`。
-3. **部位紀錄**：`QTableWidget`（含族群／概念股欄位），新增/刪除/查價/重新整理；下方詳細資訊區塊選取部位時背景查 FinMind，跟「個股」頁 `StockDetailDialog` 共用同一套 8 張趨勢圖（歷史股價／三大法人／法人分別／融資融券／VPT／MFI／借券賣出餘額／借券成交）。概念股清單來自 `concepts.json`（人工維護，見 `tradingnote_concepts.py`）。
+3. **部位紀錄**（2026-10-24 大改：跟原本獨立的「交易紀錄」分頁合併——部位＝目前 OPEN 的交易，`trades` 資料表取代 `positions.json` 成為唯一資料來源，見 `tradingnote_tradejournal.py`）：`QTableWidget`（族群／概念股／策略／狀態欄位），工具列「新增部位」（開新交易＋立刻記一筆對應成交，等同舊版「新增」）／「新增成交」（加碼或減碼，股數歸零自動收盤）／「編輯設定」（只改策略／停損／停利／風險金額，股數與均價開倉後不可直接改）／「收盤」／「取消交易」（僅限尚無成交記錄者）／「查價」，另有「顯示歷史（已收盤／已取消）」勾選框。下方詳細面板分兩個子分頁：「籌碼/技術」是原本選取部位時背景查 FinMind 的 8 張趨勢圖（歷史股價／三大法人／法人分別／融資融券／VPT／MFI／借券賣出餘額／借券成交，跟「個股」頁 `StockDetailDialog` 共用）；「交易設定與日誌」是逐筆成交明細、標籤（EMOTION／EXECUTION／MARKET_CONDITION 三類勾選式 chip，可即時新增）、交易筆記＋執行評分（1-5）＋復盤診斷 MAE/MFE/R 值（目前手動輸入，沒有自動從價格歷史計算的引擎），筆記/評分/診斷採跟交易週誌一樣的 dirty-flag 自動保存。概念股清單來自 `concepts.json`（人工維護，見 `tradingnote_concepts.py`）。首次啟動如偵測到舊版 `positions.json`，會先跳出一次性搬遷視窗逐筆請使用者補填停損價（`ui/dialogs/legacy_position_migration.py`），成功後改名為 `.bak`；CLI（`tradingnote.py`）也改走同一份 `trades` 資料，指令集相應調整（新增 `buy`/`sell`，`add` 多一個必填停損價參數，`edit` 改成只改停損價／備註，`remove` 僅限尚無成交記錄的部位）。
 4. **交易週誌**（2026-09-10 新增）：週一至週日七張卡片顯示持股合計金額變化、絕對變動最大前三檔與日誌摘要；選取日期可看全部持股並編輯自由文字日誌；前/後週、本週、日期跳轉、Ctrl+S、切換日期與關閉程式時自動保存；未來日期不可編輯。
 5. **個股**：`QTreeWidget` 依產業族群列出全市場約1700檔股票，選取項目即時顯示右側摘要卡（含趨勢/動能/量能徽章），雙擊叫 FinMind API 查本益比/殖利率/股價淨值比/三大法人（`StockDetailDialog`，同樣有趨勢徽章）。彈窗「顯示完整籌碼面資訊」按鈕點下去才查跟部位紀錄頁相同的詳細資料＋分頁（歷史股價／三大法人／法人分別／融資融券／VPT／MFI／借券賣出餘額／借券成交／技術分析，共 8 張圖），技術分析可切換 KD／MACD／均線／RSI 等 24 類指標（純本地 SQLite 計算，不額外呼叫 API）。
 6. **期貨**：預設列出 TAIFEX 全部期貨商品盤後行情，搜尋框輸入才篩選。「標的」欄對照股票期貨標的、大額前10買/賣/淨/買佔比摘要欄；點選某列看完整大額未沖銷部位明細＋趨勢圖，雙擊開大彈窗。大額歷史由背景自動回補（綁定「設定」頁回補天數）。細節較多，見 `CHANGELOG.md` 2026-08-14 那幾則。

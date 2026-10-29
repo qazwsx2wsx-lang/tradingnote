@@ -91,23 +91,10 @@ def save_settings(path, settings):
         json.dump(settings, f, ensure_ascii=False, indent=2)
 
 
-# ---------- 紀錄：部位 CRUD 與 JSON 持久化 ----------
-
-def load_positions(path):
-    p = Path(path)
-    if not p.exists():
-        return []
-    with p.open("r", encoding="utf-8") as f:
-        raw = json.load(f)
-    return [Position(**item) for item in raw]
-
-
-def save_positions(path, positions):
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump([asdict(pos) for pos in positions], f, ensure_ascii=False, indent=2)
-
+# ---------- 紀錄：部位欄位驗證與清單查找 ----------
+# 部位本身的新增／編輯／刪除已搬到 tradingnote_tradejournal.py（open_position／
+# update_position_plan／cancel_empty_position，寫入 trades 資料表），不再是
+# JSON 檔案；這裡只留下純欄位驗證跟泛用的清單查找，兩邊都還會用到。
 
 def validate_position_input(ticker, shares, entry_price, entry_date):
     if not TICKER_RE.match(ticker):
@@ -122,60 +109,11 @@ def validate_position_input(ticker, shares, entry_price, entry_date):
         raise ValueError("日期格式不正確（應為 YYYY-MM-DD）。")
 
 
-def add_position(positions, ticker, shares, entry_price, entry_date, note="", snapshot=None):
-    ticker = ticker.strip().upper()
-    validate_position_input(ticker, shares, entry_price, entry_date)
-    name, market = "", None
-    if snapshot is not None:
-        price = lookup_price(ticker, snapshot)
-        if price is not None:
-            name, market = price.name, price.market
-    pos = Position(
-        ticker=ticker,
-        shares=shares,
-        entry_price=entry_price,
-        entry_date=entry_date,
-        note=note,
-        name=name,
-        market=market,
-        updated_at=date.today().isoformat(),
-    )
-    positions.append(pos)
-    return pos
-
-
 def find_position(positions, position_id):
     for pos in positions:
         if pos.id == position_id or pos.id.startswith(position_id):
             return pos
     return None
-
-
-def update_position(positions, position_id, shares, entry_price, entry_date, note="", snapshot=None):
-    """修改既有部位的股數／成本價／日期／備註，代號不可變更（換股票語意上該用
-    刪除+新增，不是編輯）。找不到這個 id 時丟 ValueError，訊息可直接顯示給使用者。"""
-    pos = find_position(positions, position_id)
-    if pos is None:
-        raise ValueError("找不到這個部位。")
-    validate_position_input(pos.ticker, shares, entry_price, entry_date)
-    pos.shares = shares
-    pos.entry_price = entry_price
-    pos.entry_date = entry_date
-    pos.note = note
-    if snapshot is not None:
-        price = lookup_price(pos.ticker, snapshot)
-        if price is not None:
-            pos.name, pos.market = price.name, price.market
-    pos.updated_at = date.today().isoformat()
-    return pos
-
-
-def remove_position(positions, position_id):
-    pos = find_position(positions, position_id)
-    if pos is None:
-        return False
-    positions.remove(pos)
-    return True
 
 
 # ---------- 查價：台股 TWSE／TPEX 價格擷取 ----------

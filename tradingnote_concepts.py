@@ -10,9 +10,10 @@ import hashlib
 import json
 from collections import OrderedDict
 from dataclasses import dataclass
-from pathlib import Path
 
-CONCEPTS_PATH = Path(__file__).parent / "concepts.json"
+from tradingnote_paths import APP_PATHS
+
+CONCEPTS_PATH = APP_PATHS.root / "concepts.json"
 
 CLASSIFICATION_INDUSTRY = "industry"
 CLASSIFICATION_VALUE_CHAIN_THEME = "value_chain_theme"

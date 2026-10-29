@@ -2,6 +2,7 @@
 """tradingnote - 圖形介面版本（PySide6 + pyqtgraph）"""
 
 import gc
+import sys
 
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
@@ -10,15 +11,18 @@ from tradingnote_cache import TTLCache
 from tradingnote_concepts import build_classification_catalog, build_ticker_concept_map, load_concepts
 from tradingnote_core import (
     get_market_snapshot,
-    load_positions,
     load_settings,
     snapshot_staleness_warnings,
 )
 from tradingnote_flow import FlowAnalysisService
 from tradingnote_journal import initialize_journal
+from tradingnote_legacy_positions import archive_legacy_positions_file, load_legacy_positions
+from tradingnote_single_instance import ensure_single_instance
 from tradingnote_tasks import wait_for_background_tasks
+from tradingnote_tradejournal import list_open_positions, migrate_legacy_position
 
 from ui import app_paths
+from ui.dialogs.legacy_position_migration import LegacyPositionMigrationDialog
 from ui.dialogs.progress import RefreshDialog, StartupProgressDialog
 from ui.format import _format_fetched_at, _snapshot_date
 from ui.pages.institutional_flow_page import InstitutionalFlowPage
@@ -64,7 +68,7 @@ class TradingNoteWindow(
         _center_on_screen(self)
 
         self.settings = load_settings(app_paths.SETTINGS_PATH)
-        self.positions = load_positions(app_paths.POSITIONS_PATH)
+        self.positions = list_open_positions(app_paths.HISTORY_DB_PATH, snapshot=snapshot)
         initialize_journal(app_paths.HISTORY_DB_PATH, self.positions)
         # 概念目錄在啟動時讀入一次；重建 concepts.json 後需重開程式，
         # 才會讓持股概念標籤與資金流向分類同時更新。
@@ -102,9 +106,11 @@ class TradingNoteWindow(
 
         self.continuity_note = ""
         self.large_traders_note = ""
+        self.institutional_note = ""
         self._total_pnl = None
         self._sync_timer = None
         self._large_traders_sync_timer = None
+        self._institutional_sync_task = None
 
         # 「有新資料可更新」提示：_known_data_date 是目前畫面上顯示的資料所屬交易日，
         # _dismissed_data_date 是使用者按過「✕」關閉、暫時不想再看到提示的那個交易日
@@ -125,7 +131,7 @@ class TradingNoteWindow(
         # QTabWidget，讓主導覽與頁內切換有清楚的視覺層級。
         self._page_specs = (
             (self.flow_tab, "資金流向", "市場族群、排行與法人方向"),
-            (self.positions_tab, "部位紀錄", "持股損益與個股明細"),
+            (self.positions_tab, "部位紀錄", "持股損益、交易設定與日誌"),
             (self.journal_tab, "交易週誌", "每週持股變化與交易筆記"),
             (self.stocks_tab, "個股查詢", "全市場股票搜尋與基本資料"),
             (self.futures_tab, "期貨行情", "期貨盤後與大額交易人部位"),
@@ -236,6 +242,11 @@ class TradingNoteWindow(
             # 同一顆「回補天數」設定，在背景把缺的日期補進 large_traders_history，供
             # 「期貨」頁趨勢圖用（見 _sync_large_traders_history）。
             self._sync_large_traders_history()
+            # 三大法人買賣超歷史：同一個開關＋「回補天數」設定，在背景補進
+            # daily_institutional／sector_metrics，供「法人資金流去哪？」頁用（見
+            # _sync_institutional_history）；該頁只在被看到時用 data_signature 偵測
+            # 有沒有新資料，不需要這裡另外通知它重畫。
+            self._sync_institutional_history()
             # 估值歷史（valuation_history）不在這裡回補：泡泡圖「估值」模式改成只看
             # 每檔股票「最新一筆」PER/PBR（見 compute_valuation_flow），不需要長天期
             # 歷史。「最新一筆」資料靠每次「重新整理」／啟動都會呼叫的
@@ -381,9 +392,12 @@ class TradingNoteWindow(
         large_traders_note = (
             f"　{self.large_traders_note}" if self.large_traders_note else ""
         )
+        institutional_note = (
+            f"　{self.institutional_note}" if self.institutional_note else ""
+        )
         status_text = (
             f"{cache_note}　{total_note}{error_note}{staleness_note}"
-            f"{continuity_note}{large_traders_note}"
+            f"{continuity_note}{large_traders_note}{institutional_note}"
         )
         self.status_bar_label.setText(status_text)
         self.status_bar_label.setToolTip(status_text)
@@ -409,7 +423,7 @@ class TradingNoteWindow(
         self._refresh_history_status()
 
     def closeEvent(self, event):
-        """離開前保存使用者正在編輯的週誌內容。"""
+        """離開前保存使用者正在編輯的週誌內容與部位的交易筆記/診斷。"""
         try:
             if hasattr(self, "journal_note_edit"):
                 self._save_journal_if_dirty()
@@ -418,6 +432,17 @@ class TradingNoteWindow(
                 self,
                 "週誌尚未儲存",
                 f"交易週誌儲存失敗：{exc}\n\n請先處理問題後再關閉程式。",
+            )
+            event.ignore()
+            return
+        try:
+            if hasattr(self, "position_notes_edit"):
+                self._save_position_detail_if_dirty()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "部位紀錄尚未儲存",
+                f"部位紀錄儲存失敗：{exc}\n\n請先處理問題後再關閉程式。",
             )
             event.ignore()
             return
@@ -439,6 +464,38 @@ def main():
     gc.freeze()
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    # 擋掉同一份資料目錄被兩個 GUI process 同時開啟：兩個 process 都會各自把
+    # positions.json / settings.json 等檔案載進記憶體，誰後存檔誰贏，完全沒有
+    # 跨 process 協調——tradingnote_cache.py 的 _file_lock／_atomic_json_write
+    # 只防同一個 process 內的執行緒互撞與寫壞檔案，擋不住這個。
+    single_instance_server = ensure_single_instance(app_paths.DATA_DIR)
+    if single_instance_server is None:
+        QtWidgets.QMessageBox.warning(
+            None,
+            "提示",
+            "TradingNote 已經在執行中，請切換到原本開啟的視窗。",
+        )
+        sys.exit(0)
+
+    # 舊版 positions.json 一次性搬遷：新版把部位併進 trades 資料表，但
+    # trades.initial_stop_loss 是必填欄位，舊部位從來沒有停損價，所以搬遷前
+    # 要先跳出視窗讓使用者逐筆補填（見 ui/dialogs/legacy_position_migration.py）。
+    # 必須在這裡（splash／背景預載開始之前）同步完成，之後的視窗初始化
+    # 才能直接從 trades 讀到正確的部位資料。
+    legacy_positions = load_legacy_positions(app_paths.POSITIONS_PATH)
+    if legacy_positions:
+        def _migrate_legacy_positions(rows):
+            for position, stop_loss in rows:
+                migrate_legacy_position(app_paths.HISTORY_DB_PATH, position, stop_loss)
+            archive_legacy_positions_file(app_paths.POSITIONS_PATH)
+
+        migration_dialog = LegacyPositionMigrationDialog(
+            None, _migrate_legacy_positions, legacy_positions
+        )
+        if migration_dialog.exec() != QtWidgets.QDialog.Accepted:
+            sys.exit(0)
+
     app.setStyle("Fusion")
     app.setStyleSheet(STYLESHEET)
     pg.setConfigOptions(antialias=True, background=CHART_BG, foreground=COLOR_TEXT)

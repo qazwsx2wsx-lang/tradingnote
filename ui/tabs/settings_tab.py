@@ -4,6 +4,7 @@
 
 from PySide6 import QtCore, QtWidgets
 
+import tradingnote_institutional_history as ih
 from tradingnote_core import save_settings
 from tradingnote_history import DEFAULT_BACKFILL_TARGET_DAYS, get_history_status
 from tradingnote_taifex import backfill_large_traders_history
@@ -14,6 +15,18 @@ from ui.dialogs.progress import BackfillDialog, TpexBackfillDialog
 from ui.format import _format_history_status, _futures_snapshot_date, _snapshot_date
 from ui.widgets import _set_standard_icon, accent_button
 from ui.workers import run_backfill_in_thread, run_task_in_thread
+
+
+def _format_institutional_update(written, failures):
+    """法人資料更新完成後的文字；把「抓失敗」和「真的沒有新資料」分開講。"""
+    parts = [f"已更新 {len(written)} 個交易日" if written else "沒有新增資料"]
+    if failures:
+        parts.append(
+            f"{len(failures)} 天抓取失敗（最近：{max(failures)}），"
+            "可能被證交所／櫃買暫時擋住，稍後再按更新")
+    elif not written:
+        parts = ["已是最新（或今日資料尚未公布）"]
+    return "；".join(parts)
 
 
 class SettingsTabMixin:
@@ -102,6 +115,53 @@ class SettingsTabMixin:
             self, work, on_done, on_error
         )
 
+    def _sync_institutional_history(self):
+        """三大法人買賣超歷史（daily_institutional／sector_metrics，供「法人資金流
+        去哪？」頁用）背景回補。跟 _sync_history_continuity／_sync_large_traders_history
+        同一套設計：同一個「每次啟動自動檢測」開關＋同一顆「回補天數」設定；這裡也是
+        設定頁「更新法人資料」按鈕按下去實際呼叫的方法，手動按跟自動同步共用同一條路。
+        ih.backfill 內部每抓完一天會呼叫一次 log()，這裡轉成狀態列的即時進度；寫入
+        新資料後，「法人資金流去哪？」頁要等使用者切過去時，靠該頁 showEvent 的
+        reload_if_changed／data_signature 自己偵測並重新載入，這裡不用主動通知它。"""
+        if self._institutional_sync_task is not None:
+            return
+        target_days = self.settings.get("backfill_target_days", DEFAULT_BACKFILL_TARGET_DAYS)
+        self.institutional_update_button.setEnabled(False)
+
+        def work(_cancel_event, emit):
+            failures = []
+            written = ih.backfill(
+                app_paths.HISTORY_DB_PATH, target_days=target_days, log=emit, failures=failures
+            )
+            return written, failures
+
+        def on_done(result):
+            written, failures = result
+            self._institutional_sync_task = None
+            self.institutional_note = ""
+            self._update_status_bar()
+            self.institutional_update_button.setEnabled(True)
+            self.institutional_status_label.setText(_format_institutional_update(written, failures))
+
+        def on_error(message):
+            self._institutional_sync_task = None
+            self.institutional_note = ""
+            self._update_status_bar()
+            self.institutional_update_button.setEnabled(True)
+            self.institutional_status_label.setText(f"更新失敗：{message}")
+
+        def on_progress(message):
+            self.institutional_note = message
+            self._update_status_bar()
+            self.institutional_status_label.setText(message)
+
+        self.institutional_note = "法人買賣超歷史回補中..."
+        self._update_status_bar()
+        # 回傳值一定要留住，否則 BackgroundTask 會被回收、on_done 永遠不會觸發（見 ARCHITECTURE.md）
+        self._institutional_sync_task = run_background_task(
+            self, work, on_done, on_error, on_progress=on_progress
+        )
+
     # ---------- 設定頁 ----------
 
     def _build_settings_tab(self):
@@ -141,7 +201,8 @@ class SettingsTabMixin:
         layout.addSpacing(20)
 
         self.auto_check_box = QtWidgets.QCheckBox(
-            "每次啟動自動檢測（TWSE 股價、期貨大額交易人未沖銷部位歷史有缺口時自動補齊）"
+            "每次啟動自動檢測（TWSE 股價、期貨大額交易人未沖銷部位歷史、"
+            "三大法人買賣超歷史有缺口時自動補齊）"
         )
         self.auto_check_box.setChecked(self.settings.get("auto_check_continuity", True))
         self.auto_check_box.toggled.connect(self._on_auto_check_toggle)
@@ -154,7 +215,10 @@ class SettingsTabMixin:
 
         backfill_days_row = QtWidgets.QHBoxLayout()
         backfill_days_row.addWidget(
-            QtWidgets.QLabel("回補天數（上市 TWSE／上櫃 TPEX 股價、期貨大額交易人歷史共用）")
+            QtWidgets.QLabel(
+                "回補天數（上市 TWSE／上櫃 TPEX 股價、期貨大額交易人歷史、"
+                "三大法人買賣超歷史共用）"
+            )
         )
         self.backfill_days_spin = QtWidgets.QSpinBox()
         self.backfill_days_spin.setRange(20, 500)
@@ -187,8 +251,20 @@ class SettingsTabMixin:
         backfill_buttons_row.addWidget(
             QtWidgets.QPushButton("使用 FinMind 補上櫃缺口", clicked=self.open_tpex_backfill_dialog)
         )
+        self.institutional_update_button = QtWidgets.QPushButton(
+            "更新法人資料", clicked=self._sync_institutional_history
+        )
+        self.institutional_update_button.setToolTip(
+            "抓取最新交易日並補齊「回補天數」天的三大法人買賣超（供「法人資金流去哪？」頁用，"
+            "每個請求間隔 3 秒，約需十餘分鐘）"
+        )
+        backfill_buttons_row.addWidget(self.institutional_update_button)
         backfill_buttons_row.addStretch(1)
         layout.addLayout(backfill_buttons_row)
+
+        self.institutional_status_label = QtWidgets.QLabel("")
+        self.institutional_status_label.setProperty("muted", True)
+        layout.addWidget(self.institutional_status_label)
 
         layout.addSpacing(10)
         valuation_backfill_hint = QtWidgets.QLabel(

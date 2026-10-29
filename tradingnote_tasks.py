@@ -34,9 +34,10 @@ def wait_for_background_tasks(timeout: float = 5.0):
     與其等著撞上那個更難看的當機，這裡改成直接呼叫 os._exit(0) 跳過 Python
     的 GC／finalize 直接結束行程：sqlite3 用 WAL／rollback journal 設計成
     禁得起行程被砍掉，不會因此壞掉，效果不會比目前反覆發生的原生當機更差，
-    只是跳過非必要的收尾步驟。使用者的資料（部位／設定／快取）都是各自
-    操作當下就同步寫檔（見 save_positions／save_position_detail_cache 等），
-    不是留到程式關閉才寫，所以這裡略過的收尾不影響已經完成的操作。"""
+    只是跳過非必要的收尾步驟。使用者的資料（部位／交易／設定／快取）都是各自
+    操作當下就同步寫入（見 tradingnote_tradejournal.record_execution／
+    save_position_detail_cache 等），不是留到程式關閉才寫，所以這裡略過的
+    收尾不影響已經完成的操作。"""
     with _live_threads_lock:
         threads = [t for t in _live_threads if t.is_alive()]
     deadline = time.monotonic() + timeout

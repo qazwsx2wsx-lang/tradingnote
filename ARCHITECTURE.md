@@ -69,7 +69,7 @@
 - **`tradingnote_api_config.py`**：純常數，全部外部端點網址集中在這，官方端點改版時只需要改這一個檔案。
 
 ### 核心業務模組
-- **`tradingnote_core.py`**：`Position`／`PriceInfo` 資料模型、`positions.json`／`settings.json` 讀寫、`get_market_snapshot()`（TWSE+TPEX 即時報價，走 `fetch_with_file_cache` 風格的 fallback，但因為有多階段 `on_progress` 需求所以沒有直接呼叫共用 helper，自己手刻一份）、`compute_pnl()`。
+- **`tradingnote_core.py`**：`Position`／`PriceInfo` 資料模型、`settings.json` 讀寫、`get_market_snapshot()`（TWSE+TPEX 即時報價，走 `fetch_with_file_cache` 風格的 fallback，但因為有多階段 `on_progress` 需求所以沒有直接呼叫共用 helper，自己手刻一份）、`compute_pnl()`、`find_position()`、`validate_position_input()`。**2026-10-24**：部位本身的新增／編輯／刪除已搬到 `tradingnote_tradejournal.py`（`open_position`／`update_position_plan`／`cancel_empty_position`，寫入 `trades`），不再是 `positions.json`；`Position` 現在是唯讀 view-model（見下方 `tradingnote_tradejournal.py`），`find_position`／`validate_position_input`／`compute_pnl` 仍是通用工具留在這裡。
 - **`tradingnote_history.py`**（目前最大的核心模組，約1400行）：`data/history.db` 的股票歷史相關表格（`daily_prices`／`industry_map`／`valuation_history`）schema 與讀寫、TWSE 歷史回補、產業分類抓取與快取、資金流向與估值流向的百分位/加權中位數計算、個股量比異常偵測。**注意**：期貨的 `large_traders_history` 表**不在**這裡，在 `tradingnote_taifex.py`。
 - **`tradingnote_institutional.py`**：全市場三大法人買賣超（TWSE T86 + TPEx `tpex_3insti_daily_trading`），依族群聚合，供「法人方向」頁用；跟 `tradingnote_history.py` 是平行關係，不互相依賴。
 - **`tradingnote_institutional_history.py`**：可帶日期的 T86／BFI82U／櫃買新版 `/www/zh-tw/` 端點逐日回補（3 秒間隔、非交易日記錄在 `institutional_calendar`），把近 5／20 日、加速流入、連續買賣等跨日指標預先算進 `sector_metrics`／`stock_metrics`。指標在回補時就算好寫進表，GUI 頁面（`ui/pages/institutional_flow_page.py`）只呼叫這個模組的讀取函式（`sector_rows`／`sector_history`／`sector_stocks`／`summary_text`…），不自己算。`aggregate_group_flow_for_dates()` 給 `tradingnote_flow.py` 用，流向區間每天都有歷史時「主力同步買超」改用區間加總。
@@ -78,6 +78,8 @@
 - **`tradingnote_finmind.py`**（約 700 行，第二大核心模組）：FinMind v4 API 的所有資料集查詢（本益比、三大法人、融資融券、外資持股、借券、技術指標用價格序列），統一走 `TTLCache` 做行程內快取，額度統計（`get_call_count`）供 GUI 判斷是否該提早停止批次回補。
 - **`tradingnote_taifex.py`**：TAIFEX 期貨每日行情、大額交易人未沖銷部位（即時＋歷史，`large_traders_history` 表的 schema 跟讀寫都在這裡）、股票期貨標的對照。
 - **`tradingnote_journal.py`**：交易週誌與持股週曆，自己的 4 張表（`journal_meta`／`journal_entries`／`portfolio_snapshots`／`portfolio_snapshot_positions`），獨立的 `_connect()`，跟其他模組的表互不干涉。
+- **`tradingnote_tradejournal.py`**：部位／交易的唯一資料來源，自己的 6 張表（`strategies`／`tags`／`trades`／`trade_executions`／`trade_tags`／`trade_analytics`）。「部位」＝目前 OPEN 的交易：`trade_as_position()`／`list_positions()`／`list_open_positions()` 把 `trades` 映射成 `tradingnote_core.Position`（唯讀 view-model），讓 `tradingnote_journal.py`／`compute_pnl()` 等既有程式碼不用改；`open_position()`／`update_position_plan()`／`cancel_empty_position()` 是 GUI／CLI 操作部位的入口。單方向 import `tradingnote_core`（`Position`／`lookup_price`／`validate_position_input`），`tradingnote_core.py` 不會回頭 import 這裡。
+- **`tradingnote_legacy_positions.py`**：舊版 `positions.json` 一次性搬遷用（`load_legacy_positions`／`archive_legacy_positions_file`），只有 GUI 啟動流程（`tradingnote_gui.main`）與 CLI 啟動流程（`tradingnote.main`）會呼叫；之後沒有使用者還留著 `positions.json` 時可以整個刪除這個模組。
 - **`tradingnote_concepts.py`**：讀 `concepts.json`（人工維護的概念股清單），不打任何 API。
 
 ### 介面層
@@ -94,7 +96,7 @@
 ### JSON 檔案（`data/`，git 忽略，路徑定義見 `tradingnote_paths.py`）
 | 檔案 | 內容 | 讀寫模組 |
 |---|---|---|
-| `positions.json` | 使用者部位紀錄 | `tradingnote_core.py` |
+| `positions.json.bak` | 舊版部位紀錄備份（一次性搬遷進 `trades` 成功後改名，見 `tradingnote_legacy_positions.py`；搬遷完不再讀寫） | — |
 | `settings.json` | `auto_check_continuity`／`finmind_token`／`backfill_target_days` 等本機設定 | `tradingnote_core.py` |
 | `price_cache.json` | 全市場收盤價快取（30分鐘 TTL） | `tradingnote_core.py` |
 | `futures_cache.json`／`futures_large_traders_cache.json`／`futures_ssf_cache.json` | 期貨相關快取 | `tradingnote_taifex.py` |
@@ -110,6 +112,7 @@
 | `daily_margin`／`tdcc_holders` | 融資融券逐日餘額、集保週分散表 | `tradingnote_chips.py` |
 | `daily_institutional`／`market_summary`／`institutional_calendar`／`sector_map`／`sector_metrics`／`stock_metrics` | 三大法人歷史、交易所公布金額、類股對照與預先計算指標 | `tradingnote_institutional_history.py` |
 | `journal_meta`／`journal_entries`／`portfolio_snapshots`／`portfolio_snapshot_positions` | 交易週誌與持股快照 | `tradingnote_journal.py` |
+| `strategies`／`tags`／`trades`／`trade_executions`／`trade_tags`／`trade_analytics` | 部位／交易的唯一資料來源：策略、標籤、逐筆交易與成交明細、復盤診斷。「部位」＝目前 OPEN 的 `trades` 列（2026-10-24 取代 `positions.json`） | `tradingnote_tradejournal.py` |
 
 **共用同一個實體檔案，但 schema／連線各自獨立**：每個擁有模組都有自己的 `_connect(db_path)`，各自用 `CREATE TABLE IF NOT EXISTS` 建自己的表，一律 `PRAGMA journal_mode=WAL` + `timeout=30`（多執行緒/多行程同時讀寫同一個檔案時，WAL 讓讀者不擋寫者、`timeout` 給排隊的寫入緩衝）。三個擁有模組彼此不 import 對方的 `_connect()`，只有需要跨模組查資料時才 import 對方暴露出來的讀寫函式（例如 `tradingnote_taifex.py` 會 import `tradingnote_history.py` 的交易日期輔助函式，但不會碰它的表）。
 
