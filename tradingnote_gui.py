@@ -30,10 +30,11 @@ from ui.tabs.flow_tab import FlowTabMixin
 from ui.tabs.futures_tab import FuturesTabMixin
 from ui.tabs.journal_tab import JournalTabMixin
 from ui.tabs.positions_tab import PositionsTabMixin
+from ui.tabs.quotes_tab import QuotesTabMixin
 from ui.tabs.settings_tab import SettingsTabMixin
 from ui.tabs.stocks_tab import StocksTabMixin
 from ui.theme import CHART_BG, COLOR_TEXT, STYLESHEET
-from ui.widgets import _center_on_screen, _screen_fit_size, _set_standard_icon
+from ui.widgets import _center_on_screen, _screen_fit_size, _set_standard_icon, show_error
 from ui.workers import run_startup_preload_in_thread, run_task_in_thread
 
 # 背景檢查「今天的資料是否已發布」的輪詢間隔。get_market_snapshot 本身有 30 分鐘
@@ -48,6 +49,7 @@ class TradingNoteWindow(
     PositionsTabMixin,
     JournalTabMixin,
     FuturesTabMixin,
+    QuotesTabMixin,
     SettingsTabMixin,
     QtWidgets.QMainWindow,
 ):
@@ -126,6 +128,7 @@ class TradingNoteWindow(
         self.journal_tab = QtWidgets.QWidget()
         self.stocks_tab = QtWidgets.QWidget()
         self.futures_tab = QtWidgets.QWidget()
+        self.quotes_tab = QtWidgets.QWidget()
         self.settings_tab = QtWidgets.QWidget()
         # 主功能改用左側導覽列，頁面本體放進右側堆疊；各頁內的技術圖表分頁仍維持
         # QTabWidget，讓主導覽與頁內切換有清楚的視覺層級。
@@ -135,6 +138,7 @@ class TradingNoteWindow(
             (self.journal_tab, "交易週誌", "每週持股變化與交易筆記"),
             (self.stocks_tab, "個股查詢", "全市場股票搜尋與基本資料"),
             (self.futures_tab, "期貨行情", "期貨盤後與大額交易人部位"),
+            (self.quotes_tab, "即時報價", "玉山 API 即時行情與部位現價"),
             (self.settings_tab, "設定", "資料同步、回補與本機偏好"),
         )
 
@@ -213,6 +217,7 @@ class TradingNoteWindow(
         self._build_journal_tab()
         self._build_stocks_tab()
         self._build_futures_tab()
+        self._build_quotes_tab()
         self._build_settings_tab()
         self._apply_responsive_density()
 
@@ -424,11 +429,13 @@ class TradingNoteWindow(
 
     def closeEvent(self, event):
         """離開前保存使用者正在編輯的週誌內容與部位的交易筆記/診斷。"""
+        if hasattr(self, "_shutdown_quotes"):
+            self._shutdown_quotes()
         try:
             if hasattr(self, "journal_note_edit"):
                 self._save_journal_if_dirty()
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(
+            show_error(
                 self,
                 "週誌尚未儲存",
                 f"交易週誌儲存失敗：{exc}\n\n請先處理問題後再關閉程式。",
@@ -439,7 +446,7 @@ class TradingNoteWindow(
             if hasattr(self, "position_notes_edit"):
                 self._save_position_detail_if_dirty()
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(
+            show_error(
                 self,
                 "部位紀錄尚未儲存",
                 f"部位紀錄儲存失敗：{exc}\n\n請先處理問題後再關閉程式。",
@@ -471,7 +478,7 @@ def main():
     # 只防同一個 process 內的執行緒互撞與寫壞檔案，擋不住這個。
     single_instance_server = ensure_single_instance(app_paths.DATA_DIR)
     if single_instance_server is None:
-        QtWidgets.QMessageBox.warning(
+        show_error(
             None,
             "提示",
             "TradingNote 已經在執行中，請切換到原本開啟的視窗。",

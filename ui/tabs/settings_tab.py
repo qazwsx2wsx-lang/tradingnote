@@ -277,6 +277,9 @@ class SettingsTabMixin:
         layout.addWidget(valuation_backfill_hint)
 
         layout.addSpacing(20)
+        self._build_esun_settings_section(layout)
+
+        layout.addSpacing(20)
         status_header = QtWidgets.QLabel("資料庫狀態")
         status_header.setProperty("header", True)
         layout.addWidget(status_header)
@@ -287,6 +290,55 @@ class SettingsTabMixin:
         self.history_status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         layout.addWidget(self.history_status_label)
         self._refresh_history_status()
+
+    def _build_esun_settings_section(self, layout):
+        """玉山證券 Market Data API 設定（供「即時報價」分頁與部位即時現價使用）。"""
+        header = QtWidgets.QLabel("玉山證券即時報價")
+        header.setProperty("header", True)
+        layout.addWidget(header)
+        layout.addSpacing(4)
+
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignLeft)
+        self.esun_fields = {}
+
+        def add_field(key, label, echo=None, placeholder=""):
+            edit = QtWidgets.QLineEdit(str(self.settings.get(key, "")))
+            edit.setPlaceholderText(placeholder)
+            if echo is not None:
+                edit.setEchoMode(echo)
+            edit.editingFinished.connect(lambda k=key, e=edit: self._on_esun_setting_changed(k, e))
+            form.addRow(label, edit)
+            self.esun_fields[key] = edit
+
+        add_field("esun_api_key", "API Key", QtWidgets.QLineEdit.Password)
+        add_field("esun_api_secret", "API Secret", QtWidgets.QLineEdit.Password)
+        add_field("esun_cert_path", "憑證 (.p12) 路徑", placeholder="/path/to/cert.p12")
+        add_field("esun_account", "帳號")
+        add_field("esun_entry", "API Entry")
+        env_combo = QtWidgets.QComboBox()
+        env_combo.addItems(["SIMULATION", "PRODUCTION"])
+        env_combo.setCurrentText(self.settings.get("esun_environment", "SIMULATION"))
+        env_combo.currentTextChanged.connect(
+            lambda text: self._save_esun_setting("esun_environment", text)
+        )
+        form.addRow("環境", env_combo)
+        layout.addLayout(form)
+
+        hint = QtWidgets.QLabel(
+            "Key／Secret 以明文存在本機 data/settings.json（不會進 git），憑證檔只記路徑。"
+            "需另外安裝玉山提供的 esun_marketdata wheel。修改後，請在「即時報價」分頁重新連線。"
+        )
+        hint.setProperty("muted", True)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+    def _on_esun_setting_changed(self, key, edit):
+        self._save_esun_setting(key, edit.text().strip())
+
+    def _save_esun_setting(self, key, value):
+        self.settings[key] = value
+        save_settings(app_paths.SETTINGS_PATH, self.settings)
 
     def _on_auto_check_toggle(self, checked):
         self.settings["auto_check_continuity"] = checked

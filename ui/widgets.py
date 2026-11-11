@@ -1,6 +1,44 @@
 """GUI 共用的小型 widget helper（按鈕、版面清空、螢幕適配尺寸、對話框基底 DialogBase）。"""
 
+import logging
+import logging.handlers
+
 from PySide6 import QtCore, QtGui, QtWidgets
+
+from ui import app_paths
+
+_popup_logger = None
+
+
+def _get_popup_logger():
+    """延遲設定寫檔 logger，呼叫當下才讀 app_paths.DATA_DIR（跟其他 ui 模組
+    一致的「呼叫當下讀取」慣例，測試覆寫 app_paths 才會生效）。"""
+    global _popup_logger
+    if _popup_logger is not None:
+        return _popup_logger
+    logger = logging.getLogger("tradingnote.popup")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    handler = logging.handlers.RotatingFileHandler(
+        app_paths.DATA_DIR / "error.log",
+        maxBytes=1_000_000,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    logger.addHandler(handler)
+    _popup_logger = logger
+    return _popup_logger
+
+
+def show_error(parent, title, message, *, level="warning"):
+    """跳出警告/錯誤訊息框，同時把內容寫進 data/error.log 方便事後回查。"""
+    logger = _get_popup_logger()
+    if level == "critical":
+        logger.error("%s: %s", title, message)
+        return QtWidgets.QMessageBox.critical(parent, title, message)
+    logger.warning("%s: %s", title, message)
+    return QtWidgets.QMessageBox.warning(parent, title, message)
 
 
 def accent_button(text, slot=None):

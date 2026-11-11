@@ -13,7 +13,7 @@ from tradingnote_history import get_latest_ticker_record
 from tradingnote_tradejournal import create_strategy
 
 from ui import app_paths
-from ui.widgets import DialogBase, accent_button
+from ui.widgets import DialogBase, accent_button, show_error
 
 
 class PositionFormDialog(DialogBase):
@@ -102,7 +102,7 @@ class PositionFormDialog(DialogBase):
         try:
             strategy_id = create_strategy(self.db_path, name.strip(), description.strip() or None)
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "錯誤", str(e))
+            show_error(self, "錯誤", str(e), level="critical")
             return
         self.strategy_combo.addItem(name.strip(), strategy_id)
         self.strategy_combo.setCurrentIndex(self.strategy_combo.count() - 1)
@@ -121,8 +121,9 @@ class PositionFormDialog(DialogBase):
             initial_take_profit = self._parse_optional_float(self.take_profit_edit.text())
             planned_risk_amount = self._parse_optional_float(self.risk_amount_edit.text())
         except ValueError:
-            QtWidgets.QMessageBox.critical(
-                self, "錯誤", "股數需為整數；成本價、初始停損價、停利價與風險金額需為數字。"
+            show_error(
+                self, "錯誤", "股數需為整數；成本價、初始停損價、停利價與風險金額需為數字。",
+                level="critical",
             )
             return
 
@@ -140,7 +141,7 @@ class PositionFormDialog(DialogBase):
                 planned_risk_amount=planned_risk_amount,
             )
         except ValueError as e:
-            QtWidgets.QMessageBox.critical(self, "錯誤", str(e))
+            show_error(self, "錯誤", str(e), level="critical")
             return
         self.accept()
 
@@ -216,7 +217,7 @@ class PositionPlanFormDialog(DialogBase):
         try:
             strategy_id = create_strategy(self.db_path, name.strip(), description.strip() or None)
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "錯誤", str(e))
+            show_error(self, "錯誤", str(e), level="critical")
             return
         self.strategy_combo.addItem(name.strip(), strategy_id)
         self.strategy_combo.setCurrentIndex(self.strategy_combo.count() - 1)
@@ -232,7 +233,7 @@ class PositionPlanFormDialog(DialogBase):
             initial_take_profit = self._parse_optional_float(self.take_profit_edit.text())
             planned_risk_amount = self._parse_optional_float(self.risk_amount_edit.text())
         except ValueError:
-            QtWidgets.QMessageBox.critical(self, "錯誤", "初始停損價、停利價與風險金額需為數字。")
+            show_error(self, "錯誤", "初始停損價、停利價與風險金額需為數字。", level="critical")
             return
 
         try:
@@ -243,7 +244,7 @@ class PositionPlanFormDialog(DialogBase):
                 planned_risk_amount=planned_risk_amount,
             )
         except ValueError as e:
-            QtWidgets.QMessageBox.critical(self, "錯誤", str(e))
+            show_error(self, "錯誤", str(e), level="critical")
             return
         self.accept()
 
@@ -302,7 +303,7 @@ class ExecutionFormDialog(DialogBase):
             commission = float(self.commission_edit.text() or "0")
             slippage = float(self.slippage_edit.text() or "0")
         except ValueError:
-            QtWidgets.QMessageBox.critical(self, "錯誤", "價格、數量、手續費與滑價需為數字。")
+            show_error(self, "錯誤", "價格、數量、手續費與滑價需為數字。", level="critical")
             return
 
         executed_at = self.executed_at_edit.text().strip() or datetime.now().isoformat(
@@ -319,7 +320,7 @@ class ExecutionFormDialog(DialogBase):
                 executed_at=executed_at,
             )
         except ValueError as e:
-            QtWidgets.QMessageBox.critical(self, "錯誤", str(e))
+            show_error(self, "錯誤", str(e), level="critical")
             return
         self.accept()
 

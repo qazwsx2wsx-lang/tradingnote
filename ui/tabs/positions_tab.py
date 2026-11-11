@@ -8,11 +8,12 @@
 positions.json／Position 跟新版 trades 合併後最大的語意差異，詳見
 tradingnote_tradejournal.update_position_plan 的說明。"""
 
+import dataclasses
 from datetime import date
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from tradingnote_core import compute_pnl, find_position, lookup_price
+from tradingnote_core import PriceInfo, compute_pnl, find_position, lookup_price
 from tradingnote_finmind import fetch_position_detail, load_position_detail_cache, save_position_detail_cache
 from tradingnote_history import get_industry_map
 from tradingnote_http import PriceFetchError
@@ -44,7 +45,7 @@ from ui.dialogs.positions import (
     PriceLookupDialog,
 )
 from ui.format import _format_fetched_at, gain_loss_color
-from ui.widgets import _clear_layout, _set_standard_icon, accent_button
+from ui.widgets import _clear_layout, _set_standard_icon, accent_button, show_error
 from ui.workers import run_task_in_thread
 
 
@@ -267,6 +268,68 @@ class PositionsTabMixin:
         panel_layout.addWidget(detail_splitter, 1)
         return panel
 
+    def _position_price(self, ticker):
+        """部位現價：有連線中的即時報價（玉山）就用最新成交價取代快照收盤價。"""
+        price = lookup_price(ticker, self.snapshot)
+        session = getattr(self, "_quotes_session", None)
+        live = session.last_price(ticker.strip().upper()) if session is not None else None
+        if live is None:
+            return price
+        if price is None:
+            return PriceInfo(
+                ticker=ticker, name="", open=None, high=None, low=None, close=live,
+                change=None, volume=None, date="", market="",
+            )
+        return dataclasses.replace(price, close=live)
+
+    @staticmethod
+    def _open_position_values(pos, price):
+        """OPEN 部位的 (現價, 損益, 損益%, 權益現值, 損益色, 損益%色, 未實現損益或 None)。"""
+        pnl = compute_pnl(pos, price)
+        if pnl is None:
+            return "N/A", "N/A", "N/A", "N/A", None, None, None
+        color = gain_loss_color(pnl.unrealized_pnl)
+        return (
+            f"{pnl.current_price:.2f}",
+            f"{pnl.unrealized_pnl:+.0f}",
+            f"{pnl.pnl_pct:+.2f}%",
+            f"{pnl.current_value:,.0f}",
+            color,
+            color,
+            pnl.unrealized_pnl,
+        )
+
+    def _refresh_position_live_prices(self):
+        """即時報價更新時只重算 OPEN 列的現價／損益欄與總損益，不重讀資料庫。"""
+        keys = list(self._column_keys)
+        total_pnl, has_pnl = 0.0, False
+        for row, pos in enumerate(self.positions):
+            trade = self._position_trades.get(pos.id)
+            if trade is None or trade.status != "OPEN":
+                continue
+            (current_price, pnl_amt, pnl_pct, equity_value,
+             pnl_color, pnl_pct_color, unrealized) = self._open_position_values(
+                pos, self._position_price(pos.ticker))
+            if unrealized is not None:
+                total_pnl += unrealized
+                has_pnl = True
+            for key, text, color in (
+                ("current_price", current_price, None),
+                ("equity_value", equity_value, None),
+                ("pnl", pnl_amt, pnl_color),
+                ("pnl_pct", pnl_pct, pnl_pct_color),
+            ):
+                if key not in keys:
+                    continue
+                item = self.table.item(row, keys.index(key))
+                if item is None:
+                    continue
+                item.setText(text)
+                if color:
+                    item.setForeground(QtGui.QColor(color))
+        self._total_pnl = total_pnl if has_pnl else None
+        self._update_status_bar()
+
     def refresh_table(self):
         statuses = ("OPEN", "CLOSED", "CANCELLED") if self.position_history_checkbox.isChecked() else ("OPEN",)
         trades = []
@@ -292,23 +355,15 @@ class PositionsTabMixin:
             concepts = self._ticker_concept_map.get(pos.ticker) or []
 
             if trade.status == "OPEN":
-                price = lookup_price(pos.ticker, self.snapshot)
-                pnl = compute_pnl(pos, price)
+                price = self._position_price(pos.ticker)
                 if price is not None and price.name and price.name != pos.name:
                     pos.name = price.name
                     pos.market = price.market
                 equity_cost = pos.shares * pos.entry_price
-                if pnl is None:
-                    current_price, pnl_amt, pnl_pct = "N/A", "N/A", "N/A"
-                    equity_value = "N/A"
-                    pnl_color = pnl_pct_color = None
-                else:
-                    current_price = f"{pnl.current_price:.2f}"
-                    pnl_amt = f"{pnl.unrealized_pnl:+.0f}"
-                    pnl_pct = f"{pnl.pnl_pct:+.2f}%"
-                    equity_value = f"{pnl.current_value:,.0f}"
-                    pnl_color = pnl_pct_color = gain_loss_color(pnl.unrealized_pnl)
-                    total_pnl += pnl.unrealized_pnl
+                (current_price, pnl_amt, pnl_pct, equity_value,
+                 pnl_color, pnl_pct_color, unrealized) = self._open_position_values(pos, price)
+                if unrealized is not None:
+                    total_pnl += unrealized
                     has_pnl = True
             else:
                 # 已收盤／已取消：不再即時估價，損益欄改顯示交易的已實現淨損益。
@@ -357,6 +412,8 @@ class PositionsTabMixin:
             self._refresh_journal_week()
         self._total_pnl = total_pnl if has_pnl else None
         self._update_status_bar()
+        if hasattr(self, "_sync_position_quote_subscriptions"):
+            self._sync_position_quote_subscriptions()
 
     # ---------- 部位詳細資訊區塊：族群／概念股（本地）＋ FinMind 基本面／
     # 三大法人120日趨勢（背景查詢，見 tradingnote_finmind.py） ----------
@@ -549,7 +606,7 @@ class PositionsTabMixin:
         try:
             create_tag(app_paths.HISTORY_DB_PATH, name.strip(), category)
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "錯誤", str(e))
+            show_error(self, "錯誤", str(e), level="critical")
             return
         self._render_position_plan_detail(self._selected_position_id())
 
@@ -633,7 +690,7 @@ class PositionsTabMixin:
             return None
         trade = get_trade(app_paths.HISTORY_DB_PATH, int(position_id))
         if trade is None:
-            QtWidgets.QMessageBox.warning(self, "錯誤", "找不到這筆部位，畫面可能已過期，請按重新整理。")
+            show_error(self, "錯誤", "找不到這筆部位，畫面可能已過期，請按重新整理。")
             return None
         if trade.status != "OPEN":
             QtWidgets.QMessageBox.information(
