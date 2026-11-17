@@ -216,5 +216,100 @@ class BackfillLargeTradersHistoryTests(unittest.TestCase):
         self.assertEqual(result, {"chunks": 0, "rows": 0})
 
 
+# 期交所 futDataDown 實際回應（2026-10-02 CDF，節錄；含日盤／夜盤與價差單）
+FUT_DAILY_CSV = (
+    "交易日期,契約,到期月份(週別),開盤價,最高價,最低價,收盤價,漲跌價,漲跌%,成交量,結算價,"
+    "未沖銷契約數,最後最佳買價,最後最佳賣價,歷史最高價,歷史最低價,是否因訊息面暫停交易,"
+    "交易時段,價差對單式委託成交量\r\n"
+    "2026/10/02,CDF,202611  ,2530,2535,2520,2525,-15,-0.59%,2060,2525,3260,2525,2530,2545,2420,,一般,,\r\n"
+    "2026/10/02,CDF,202611  ,2530,2530,2525,2525,-15,-0.59%,458,-,-,2525,2530,2545,2420,,盤後,,\r\n"
+    "2026/10/02,CDF,202610/202611    ,9.51,9.73,9.5,9.73,-,-,1362,-,-,9.71,9.72,10.97,9,,一般,464,\r\n"
+)
+
+
+class FuturesDailyHistoryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = Path(self.temp_dir.name) / "history.db"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_parse_skips_spreads_and_keeps_sessions(self):
+        text = FUT_DAILY_CSV.encode("big5").decode("big5")
+        rows = taifex.parse_futures_daily_csv(text)
+        self.assertEqual(len(rows), 2)
+        day = rows[0]
+        self.assertEqual(day[:4], ("2026-10-02", "CDF", "202611", "一般"))
+        self.assertEqual(day[4:11], (2530, 2535, 2520, 2525, 2525, 2060, 3260))
+        self.assertEqual(rows[1][3], "盤後")
+        self.assertIsNone(rows[1][8])  # 夜盤沒有結算價
+
+    def test_parse_rejects_html(self):
+        with self.assertRaises(ValueError):
+            taifex.parse_futures_daily_csv("<!DOCTYPE HTML PUBLIC>\n<html></html>")
+
+    def test_fetch_posts_expected_form(self):
+        with patch.object(taifex, "http_post_text", return_value=FUT_DAILY_CSV) as post:
+            rows = taifex.fetch_futures_daily_range("CDF", date(2026, 10, 1), date(2026, 10, 8))
+        body = post.call_args[0][1]
+        self.assertIn("commodity_id=CDF", body)
+        self.assertIn("queryStartDate=2026%2F10%2F01", body)
+        self.assertEqual(len(rows), 2)
+
+    def test_ensure_only_fetches_unchecked_days_and_chunks(self):
+        calls = []
+
+        def fake_fetch(code, start, end):
+            calls.append((start, end))
+            return taifex.parse_futures_daily_csv(FUT_DAILY_CSV)
+
+        today = date(2026, 11, 20)
+        n = taifex.ensure_futures_daily(self.db, "CDF", "2026-09-01", "2026-10-15",
+                                        delay_seconds=0, today=today, fetch=fake_fetch)
+        self.assertEqual(n, 2)  # 45 天 → 31＋14
+        self.assertTrue(all((e - s).days < taifex.FUTURES_DAILY_MAX_SPAN_DAYS for s, e in calls))
+        calls.clear()
+        n = taifex.ensure_futures_daily(self.db, "CDF", "2026-09-10", "2026-10-20",
+                                        delay_seconds=0, today=today, fetch=fake_fetch)
+        self.assertEqual(n, 1)
+        self.assertEqual(calls, [(date(2026, 10, 16), date(2026, 10, 20))])
+
+        bars = taifex.get_futures_bars(self.db, "CDF", "202611", "2026-10-01", "2026-10-31")
+        self.assertEqual(bars, [{"date": "2026-10-02", "open": 2530, "high": 2535, "low": 2520,
+                                 "close": 2525, "settlement": 2525, "volume": 2060}])
+
+    def test_today_without_data_is_not_marked_checked(self):
+        today = date(2026, 10, 5)
+        fetch = Mock(return_value=[])
+        taifex.ensure_futures_daily(self.db, "CDF", "2026-10-05", "2026-10-05",
+                                    delay_seconds=0, today=today, fetch=fetch)
+        taifex.ensure_futures_daily(self.db, "CDF", "2026-10-05", "2026-10-05",
+                                    delay_seconds=0, today=today, fetch=fetch)
+        self.assertEqual(fetch.call_count, 2)
+
+    def test_fetch_error_does_not_mark_checked(self):
+        def boom(code, start, end):
+            raise ValueError("blocked")
+
+        with self.assertRaises(ValueError):
+            taifex.ensure_futures_daily(self.db, "CDF", "2026-09-01", "2026-09-03",
+                                        delay_seconds=0, today=date(2026, 11, 1), fetch=boom)
+        fetch = Mock(return_value=[])
+        taifex.ensure_futures_daily(self.db, "CDF", "2026-09-01", "2026-09-03",
+                                    delay_seconds=0, today=date(2026, 11, 1), fetch=fetch)
+        self.assertEqual(fetch.call_count, 1)
+
+    def test_ssf_codes_for_stock_uses_list_order(self):
+        rows = [
+            {"Contract": "CDF", "StockCode": "2330"},
+            {"Contract": "DVF", "StockCode": "2454"},
+            {"Contract": "QFF", "StockCode": "2330"},
+        ]
+        self.assertEqual(taifex.ssf_codes_for_stock(rows, "2330"), ("CDF", "QFF"))
+        self.assertEqual(taifex.ssf_codes_for_stock(rows, "2454"), ("DVF", None))
+        self.assertEqual(taifex.ssf_codes_for_stock(rows, "9999"), (None, None))
+
+
 if __name__ == "__main__":
     unittest.main()

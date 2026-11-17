@@ -195,6 +195,42 @@ class PositionsGuiTests(unittest.TestCase):
         self.assertEqual(received["price"], 10.0)
         self.assertEqual(received["qty"], 100.0)
 
+    def test_position_form_dialog_ssf_fields(self):
+        received = {}
+        dialog = PositionFormDialog(self.window, lambda **k: received.update(k), [], self.db_path)
+        self.assertTrue(dialog.contract_month_edit.isHidden())
+        dialog.instrument_combo.setCurrentIndex(2)  # 小型
+        self.assertFalse(dialog.contract_month_edit.isHidden())
+        dialog.ticker_edit.setText("2330")
+        dialog.contract_month_edit.setText("202612")
+        dialog.futures_code_edit.setText("qff")
+        dialog.shares_edit.setText("3")
+        dialog.entry_price_edit.setText("1000")
+        dialog.commission_edit.setText("30")
+        dialog.stop_loss_edit.setText("")  # 個股期可不填停損
+        dialog._submit()
+        self.assertEqual(received["instrument"], "SSF")
+        self.assertEqual(received["contract_size"], 100)
+        self.assertEqual(received["futures_code"], "QFF")
+        self.assertEqual(received["contract_month"], "202612")
+        self.assertEqual(received["initial_stop_loss"], 0.0)
+        self.assertEqual(received["commission"], 30.0)
+
+    def test_execution_form_dialog_ssf_auto_tax(self):
+        trade_id = open_trade(
+            self.db_path, symbol="2330", side="LONG", initial_stop_loss=0,
+            instrument="SSF", contract_size=2000, contract_month="202611",
+        )
+        received = {}
+        dialog = ExecutionFormDialog(
+            self.window, lambda **k: received.update(k), trade=get_trade(self.db_path, trade_id)
+        )
+        dialog.price_edit.setText("1000")
+        dialog.qty_edit.setText("2")
+        self.assertEqual(dialog.tax_edit.text(), "80")
+        dialog._submit()
+        self.assertEqual(received["tax"], 80.0)
+
     def test_history_checkbox_toggles_status_filter(self):
         open_id = open_trade(self.db_path, symbol="2330", side="LONG", initial_stop_loss=9.0)
         cancelled_id = open_trade(self.db_path, symbol="2317", side="LONG", initial_stop_loss=100.0)

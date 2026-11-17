@@ -118,8 +118,39 @@ def _cross_sectional_percentile(value, values):
 
 # ---------- DB ----------
 
-# TODO(perf): 每次呼叫都重跑 PRAGMA／CREATE TABLE／12 個 TRIGGER／INSERT＋commit（量測單次約 4ms）；
-#     應改成每個 process 初始化一次。見 CHANGELOG 2026-10-21「未做」。
+_REVISION_TABLES = ("daily_prices", "valuation_history", "valuation_observations", "industry_map")
+_REQUIRED_SCHEMA = {
+    ("table", "daily_prices"),
+    ("table", "industry_map"),
+    ("table", "valuation_history"),
+    ("table", "valuation_observations"),
+    ("table", "analysis_revision"),
+    ("index", "idx_daily_prices_ticker_date"),
+    ("index", "idx_valuation_history_ticker_date"),
+} | {
+    ("trigger", f"revision_{table}_{action}")
+    for table in _REVISION_TABLES
+    for action in ("INSERT", "UPDATE", "DELETE")
+}
+
+
+def _schema_ready(conn):
+    """只用讀取確認 schema 已完整（表、索引、trigger、補過的欄位、revision 那一列）。
+
+    不能每次都直接跑下面的初始化：`INSERT INTO analysis_revision ...` 就算一列都沒
+    插入也要拿寫入鎖，於是連純讀取（資金流向分析、每秒輪詢的 get_data_revision）都得
+    排在背景寫入（例如法人指標重算）後面，等超過 timeout 就是 database is locked。"""
+    existing = set(conn.execute("SELECT type, name FROM sqlite_master"))
+    if not _REQUIRED_SCHEMA <= existing:
+        return False
+    price_columns = {r[1] for r in conn.execute("PRAGMA table_info(daily_prices)")}
+    if not {"high", "low"} <= price_columns:
+        return False
+    if "retrieved_at" not in {r[1] for r in conn.execute("PRAGMA table_info(valuation_history)")}:
+        return False
+    return conn.execute("SELECT 1 FROM analysis_revision LIMIT 1").fetchone() is not None
+
+
 def _connect(db_path):
     p = Path(db_path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -127,7 +158,15 @@ def _connect(db_path):
     # WAL 模式，讓 CLI／GUI 同時開啟，或 GUI 內背景執行緒（啟動自動同步）跟使用者手動
     # 點「回補歷史資料」湊巧同時寫入時，不會直接丟出 database is locked。
     conn = sqlite3.connect(p, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
+    if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+        conn.execute("PRAGMA journal_mode=WAL")
+    if _schema_ready(conn):
+        return conn
+    _init_schema(conn)
+    return conn
+
+
+def _init_schema(conn):
     conn.execute(
         """CREATE TABLE IF NOT EXISTS daily_prices (
             date TEXT NOT NULL,
@@ -138,9 +177,16 @@ def _connect(db_path):
             change_pct REAL,
             volume INTEGER,
             trading_value REAL,
+            high REAL,
+            low REAL,
             PRIMARY KEY (date, ticker)
         )"""
     )
+    # 既有資料庫補欄位：最高／最低價（每日選股的 KD 用；2026-10-30 起才開始存，舊日子要 backfill_high_low）
+    price_columns = {r[1] for r in conn.execute("PRAGMA table_info(daily_prices)")}
+    for column in ("high", "low"):
+        if column not in price_columns:
+            conn.execute(f"ALTER TABLE daily_prices ADD COLUMN {column} REAL")
     # PK 索引是 (date, ticker)，對「依日期範圍查詢」（compute_industry_flow）有效，但
     # 對 LIFO 的主要存取模式「WHERE ticker = ? ORDER BY date DESC」（get_latest_ticker_record／
     # get_ticker_history）完全用不上，會退化成全表掃描。這裡另建一個 (ticker, date DESC)
@@ -190,14 +236,13 @@ def _connect(db_path):
             FROM valuation_history WHERE retrieved_at IS NOT NULL""")
     conn.execute("CREATE TABLE IF NOT EXISTS analysis_revision (revision INTEGER NOT NULL)")
     conn.execute("INSERT INTO analysis_revision SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM analysis_revision)")
-    for table in ("daily_prices", "valuation_history", "valuation_observations", "industry_map"):
+    for table in _REVISION_TABLES:
         for action in ("INSERT", "UPDATE", "DELETE"):
             conn.execute(
                 f"CREATE TRIGGER IF NOT EXISTS revision_{table}_{action} AFTER {action} ON {table} "
                 "BEGIN UPDATE analysis_revision SET revision = revision + 1; END"
             )
     conn.commit()
-    return conn
 
 
 # ---------- 每日快照累積（TPEX 逐日累積的基礎來源，另見下方 upsert_daily_prices／
@@ -312,45 +357,43 @@ def record_snapshot(db_path, snapshot, as_of_date=None):
     這樣同一次 snapshot 裡 TWSE／TPEX 更新進度不同步時，各自會存到正確的日期，
     不會把某個市場還沒更新的舊資料誤標成今天。"""
     today_iso = date.today().isoformat()
-    conn = _connect(db_path)
-    try:
-        conn.executemany(
-            """INSERT OR REPLACE INTO daily_prices
-               (date, ticker, market, name, close, change_pct, volume, trading_value)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            [
-                (
-                    as_of_date or price.date or today_iso,
-                    price.ticker,
-                    price.market,
-                    price.name,
-                    price.close,
-                    _change_pct(price),
-                    price.volume,
-                    price.trading_value,
-                )
-                for price in snapshot.values()
-            ],
+    upsert_daily_prices(db_path, [
+        (
+            as_of_date or price.date or today_iso,
+            price.ticker,
+            price.market,
+            price.name,
+            price.close,
+            _change_pct(price),
+            price.volume,
+            price.trading_value,
+            price.high,
+            price.low,
         )
-        conn.commit()
-    finally:
-        conn.close()
+        for price in snapshot.values()
+    ])
 
 
 def upsert_daily_prices(db_path, rows):
-    """寫入一批 (date, ticker, market, name, close, change_pct, volume, trading_value)
-    tuple 到 daily_prices（INSERT OR REPLACE，跟 record_snapshot 寫入邏輯一致），
-    供不同來源共用同一個寫入路徑而不用各自重寫一次 SQL／欄位順序——目前給
-    tradingnote_finmind.backfill_tpex_history_via_finmind() 寫入 FinMind 補齊的
-    上櫃歷史資料用。rows 為空時直接 return，不開連線。"""
+    """寫入一批 (date, ticker, market, name, close, change_pct, volume, trading_value[, high, low])
+    tuple 到 daily_prices，所有價格來源（每日快照、TWSE／TPEX 歷史日、FinMind 上櫃回補）
+    共用這個寫入路徑。同一 (date, ticker) 已存在時覆寫其餘欄位，但最高／最低價只在新資料
+    有值時才覆寫——沒有高低價的來源（8 欄 tuple，例如 FinMind 回補）不會把已存的洗掉。
+    rows 為空時直接 return，不開連線。"""
     if not rows:
         return
+    rows = [tuple(r) + (None, None) if len(r) == 8 else tuple(r) for r in rows]
     conn = _connect(db_path)
     try:
         conn.executemany(
-            """INSERT OR REPLACE INTO daily_prices
-               (date, ticker, market, name, close, change_pct, volume, trading_value)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO daily_prices
+               (date, ticker, market, name, close, change_pct, volume, trading_value, high, low)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(date, ticker) DO UPDATE SET
+                   market = excluded.market, name = excluded.name, close = excluded.close,
+                   change_pct = excluded.change_pct, volume = excluded.volume,
+                   trading_value = excluded.trading_value,
+                   high = COALESCE(excluded.high, high), low = COALESCE(excluded.low, low)""",
             rows,
         )
         conn.commit()
@@ -517,6 +560,10 @@ def parse_tpex_daily_quotes(payload):
     )
     if table is None or not table.get("data"):
         return None
+    # 最高／最低依表頭找（2026-10 實測在第 5、6 欄：代號,名稱,收盤,漲跌,開盤,最高,最低,均價,...）
+    fields = [str(f).strip() for f in table.get("fields") or []]
+    high_index = fields.index("最高") if "最高" in fields else None
+    low_index = fields.index("最低") if "最低" in fields else None
     records = []
     for row in table["data"]:
         try:
@@ -525,6 +572,8 @@ def parse_tpex_daily_quotes(payload):
             change = to_float(row[3])
             volume = to_int(row[8])
             trading_value = to_float(row[9])
+            high = to_float(row[high_index]) if high_index is not None else None
+            low = to_float(row[low_index]) if low_index is not None else None
         except IndexError:
             continue
         if not code or close is None:
@@ -536,6 +585,8 @@ def parse_tpex_daily_quotes(payload):
                 "ticker": code,
                 "name": name,
                 "market": "TPEX",
+                "high": high,
+                "low": low,
                 "close": close,
                 "change": change,
                 "change_pct": change_pct,
@@ -614,11 +665,54 @@ def backfill_tpex_gaps(db_path, max_days=None, delay_seconds=DEFAULT_BACKFILL_DE
         records = fetch_tpex_historical_day(iso.replace("-", ""))
         time.sleep(delay_seconds)
         if records:
-            upsert_daily_prices(db_path, [
-                (iso, r["ticker"], r["market"], r["name"], r["close"], r["change_pct"],
-                 r["volume"], r["trading_value"])
-                for r in records
-            ])
+            upsert_daily_prices(db_path, _price_rows(iso, records))
+            filled += 1
+        else:
+            failed += 1
+        if on_progress:
+            on_progress(i, len(pending))
+    return {"filled": filled, "total": len(pending), "failed": failed}
+
+
+def _price_rows(iso, records):
+    """fetch_twse_historical_day／parse_tpex_daily_quotes 的 records 轉成 upsert_daily_prices 的 10 欄 tuple。"""
+    return [(iso, r["ticker"], r["market"], r["name"], r["close"], r["change_pct"],
+             r["volume"], r["trading_value"], r.get("high"), r.get("low")) for r in records]
+
+
+def missing_high_low(db_path, days):
+    """最近 days 個交易日（上市報價完整的日子）中，有收盤價的列過半沒有最高／最低價的 (日期, 市場)，由新到舊。
+    高低價 2026-10-30 才開始存，之前的日子要靠 backfill_high_low 重抓。"""
+    conn = _connect(db_path)
+    try:
+        dates = [r[0] for r in conn.execute(
+            "SELECT date FROM daily_prices WHERE market = 'TWSE' GROUP BY date "
+            "HAVING COUNT(*) >= ? ORDER BY date DESC LIMIT ?", (MIN_MARKET_ROWS, days))]
+        if not dates:
+            return []
+        rows = conn.execute(
+            "SELECT date, market, SUM(close IS NOT NULL), SUM(close IS NOT NULL AND high IS NULL) "
+            "FROM daily_prices WHERE date >= ? AND market IN ('TWSE', 'TPEX') GROUP BY date, market",
+            (dates[-1],)).fetchall()
+    finally:
+        conn.close()
+    stats = {(d, m): (priced, missing) for d, m, priced, missing in rows}
+    return [(d, m) for d in dates for m in ("TWSE", "TPEX")
+            if stats.get((d, m), (0, 0))[0] and stats[(d, m)][1] * 2 > stats[(d, m)][0]]
+
+
+def backfill_high_low(db_path, days=60, delay_seconds=DEFAULT_BACKFILL_DELAY_SECONDS, on_progress=None):
+    """重抓 missing_high_low 的日子（TWSE MI_INDEX／櫃買 dailyQuotes，免費、一天一次抓全市場），
+    補上最高／最低價；新到舊，可中斷重跑（已補的日子下次不會再列入）。
+    回傳 {"filled", "total", "failed"}，格式同 backfill_tpex_gaps。"""
+    pending = missing_high_low(db_path, days)
+    filled = failed = 0
+    for i, (iso, market) in enumerate(pending, 1):
+        fetcher = fetch_twse_historical_day if market == "TWSE" else fetch_tpex_historical_day
+        records = fetcher(iso.replace("-", ""))
+        time.sleep(delay_seconds)
+        if records:
+            upsert_daily_prices(db_path, _price_rows(iso, records))
             filled += 1
         else:
             failed += 1
@@ -653,25 +747,7 @@ def _backfill_twse_history_locked(
             records = fetch_twse_historical_day(date_str)
             time.sleep(delay_seconds)
             if records:
-                conn.executemany(
-                    """INSERT OR REPLACE INTO daily_prices
-                       (date, ticker, market, name, close, change_pct, volume, trading_value)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    [
-                        (
-                            iso_date,
-                            r["ticker"],
-                            r["market"],
-                            r["name"],
-                            r["close"],
-                            r["change_pct"],
-                            r["volume"],
-                            r["trading_value"],
-                        )
-                        for r in records
-                    ],
-                )
-                conn.commit()
+                upsert_daily_prices(db_path, _price_rows(iso_date, records))
                 existing_dates.add(iso_date)
                 done += 1
                 if on_progress:

@@ -25,6 +25,7 @@ from ui import app_paths
 from ui.dialogs.legacy_position_migration import LegacyPositionMigrationDialog
 from ui.dialogs.progress import RefreshDialog, StartupProgressDialog
 from ui.format import _format_fetched_at, _snapshot_date
+from ui.pages.futures_backtest_page import FuturesBacktestPage
 from ui.pages.institutional_flow_page import InstitutionalFlowPage
 from ui.tabs.flow_tab import FlowTabMixin
 from ui.tabs.futures_tab import FuturesTabMixin
@@ -126,6 +127,7 @@ class TradingNoteWindow(
         self.institutional_flow_tab = InstitutionalFlowPage(app_paths.HISTORY_DB_PATH)
         self.positions_tab = QtWidgets.QWidget()
         self.journal_tab = QtWidgets.QWidget()
+        self.futures_backtest_tab = FuturesBacktestPage()
         self.stocks_tab = QtWidgets.QWidget()
         self.futures_tab = QtWidgets.QWidget()
         self.quotes_tab = QtWidgets.QWidget()
@@ -136,6 +138,7 @@ class TradingNoteWindow(
             (self.flow_tab, "資金流向", "市場族群、排行與法人方向"),
             (self.positions_tab, "部位紀錄", "持股損益、交易設定與日誌"),
             (self.journal_tab, "交易週誌", "每週持股變化與交易筆記"),
+            (self.futures_backtest_tab, "個股期回測", "個股期實單績效與 What-if 出場模擬"),
             (self.stocks_tab, "個股查詢", "全市場股票搜尋與基本資料"),
             (self.futures_tab, "期貨行情", "期貨盤後與大額交易人部位"),
             (self.quotes_tab, "即時報價", "玉山 API 即時行情與部位現價"),

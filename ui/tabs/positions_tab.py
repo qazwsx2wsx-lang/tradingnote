@@ -68,7 +68,7 @@ COLUMNS = [
     ("updated_at", "開倉日期", 90),
 ]
 
-_EXECUTION_COLUMNS = ["買賣", "價格", "數量", "手續費", "滑價", "成交時間"]
+_EXECUTION_COLUMNS = ["買賣", "價格", "數量", "手續費", "期交稅", "滑價", "成交時間"]
 
 _RATING_CHOICES = [("(未評分)", None), ("1", 1), ("2", 2), ("3", 3), ("4", 4), ("5", 5)]
 
@@ -539,9 +539,18 @@ class PositionsTabMixin:
             self._render_position_plan_detail(None)
             return
 
+        if trade.instrument == "SSF":
+            kind = "標準型" if trade.contract_size == 2000 else f"{trade.contract_size:g}股/口"
+            instrument_text = (
+                f"　個股期 {trade.futures_code or ''} {trade.contract_month or ''} {kind}"
+            )
+            qty_text = f"目前口數 {trade.total_qty:g}"
+        else:
+            instrument_text = ""
+            qty_text = f"目前數量 {trade.total_qty:g}"
         self.position_plan_title.setText(
-            f"#{trade.trade_id}　{trade.symbol}　{trade.side}　{trade.status}"
-            f"　目前數量 {trade.total_qty:g}　淨損益 {trade.net_pnl:+,.0f}"
+            f"#{trade.trade_id}　{trade.symbol}{instrument_text}　{trade.side}　{trade.status}"
+            f"　{qty_text}　淨損益 {trade.net_pnl:+,.0f}"
         )
 
         self.position_execution_table.setRowCount(len(trade.executions))
@@ -551,6 +560,7 @@ class PositionsTabMixin:
                 f"{execution.price:.2f}",
                 f"{execution.qty:g}",
                 f"{execution.commission:.2f}",
+                f"{execution.tax:.0f}",
                 f"{execution.slippage:.2f}",
                 execution.executed_at,
             )
@@ -710,7 +720,7 @@ class PositionsTabMixin:
             record_execution(app_paths.HISTORY_DB_PATH, trade.trade_id, **kwargs)
             self.refresh_table()
 
-        ExecutionFormDialog(self, on_submit).exec()
+        ExecutionFormDialog(self, on_submit, trade=trade).exec()
 
     def open_edit_plan_dialog(self):
         trade = self._selected_open_trade("編輯設定")

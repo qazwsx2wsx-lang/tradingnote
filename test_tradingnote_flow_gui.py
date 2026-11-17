@@ -45,10 +45,10 @@ class FlowGuiTests(unittest.TestCase):
             window = gui.TradingNoteWindow(self.snapshot, None)
             try:
                 window.show()
-                self.assertEqual(window.page_stack.count(), 7)
+                self.assertEqual(window.page_stack.count(), 8)
                 self.assertIs(window.institutional_flow_tab.parentWidget().parentWidget(),
                               window.flow_section_stack)
-                for index in range(7):
+                for index in range(8):
                     window._set_main_page(index)
                     app.processEvents()
                     self.assertEqual(window.page_stack.currentIndex(), index)

@@ -6,6 +6,32 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 
 ---
 
+## 2026-11-17 每日選股移除「兩週內大戶增加」條件
+
+**動機**：全功能測試發現每日選股 11-09、11-17 都是 0 檔：集保 `tdcc_holders` 最新只到 2026-10-16（集保 CSV 只有最新一週，只有 `scripts/fetch_daily.py` 會抓；GUI 自動同步不抓，本機也沒有排程），
+`holder_window` 判定過舊 → 條件 1 全部不通過。user 決定刪除條件 1。
+**改法**：`tradingnote_screener.RULES` 的 `big_holder` 改成註解（比照 2026-10-14 停用 `margin_down` 的做法，取消註解即可恢復）；`compute_metrics` 照樣算大戶占比Δ／走勢並存進 `screener_results`、名單照樣顯示，
+排序仍以大戶占比Δ優先（沒資料當 0）。`holder_window` 的提示由「大戶條件已略過」改為「大戶占比欄位空白」；GUI 狀態列的集保說明改成只影響大戶占比欄、不影響入選。
+GUI 的條件說明與「各條件單獨通過」都是從 `RULES` 產生，不用另外改。`docs/SCREENER.md` 同步更新，並修正過時的「報價需融資融券已存」（10-14 起就不要求）。
+**驗證**：`test_tradingnote_screener`（沒集保／大戶減少也能入選、`rule_counts` 不再有 `big_holder`）；全套 327 項只剩既有的 `test_tradingnote_flow_gui`（第 57 行）。
+真實資料庫**副本**重篩：11-09 母體 1986、入選 144（低檔鈍化 143、高檔 1）；11-17 母體 1986、入選 83（低檔 70、高檔 13）。
+**未做**：正式資料庫的 `screener_runs` 仍存 0 檔的舊結果（GUI 只會自動篩「還沒篩過」的日子），要在「每日選股」按重新篩選；集保週資料斷更本身沒處理（大戶占比欄仍會是空的）。
+
+---
+
+## 2026-11-17 修「資金流向分析失敗：database is locked」
+
+**動機**：`data/error.log` 在 2026-11-17 18:20～18:46 記了 5 次「資金流向分析失敗：database is locked」（GUI 18:17 啟動、啟動自動同步抓到 11-17 法人資料），當時 `history.db-wal` 長到 392 MB。
+**原因**：①`tradingnote_history._connect` 每次開連線都跑 `INSERT INTO analysis_revision ... WHERE NOT EXISTS`＋commit，就算沒插入也要拿寫入鎖，所以資金流向分析、每秒輪詢的 `get_data_revision` 這些純讀取都排在背景寫入後面，等滿 30 秒就丟錯（實測：另一條連線握寫入鎖時，8 個模組的 `_connect` 只有這個會卡住）；
+②`ih.backfill` 只要寫入新的一天就 `compute_metrics` 整批 `DELETE`＋重寫 `stock_metrics`（397 天、3,026,572 列）與 `sector_metrics`，在同一個交易裡握住寫入鎖。
+**改法**：①`_connect` 先用唯讀查詢（`_schema_ready`：sqlite_master 的表／索引／12 個 trigger、補過的欄位、revision 那一列、journal_mode）確認完整才直接回傳，缺任何一樣才跑原本的初始化（搬到 `_init_schema`）；也順便解掉 2026-10-21 記的 TODO(perf)。
+②`compute_metrics(since=)`：計算照樣走完整序列，只刪除／重寫 `date >= since` 的列（指標都只往回看，結果與整批相同）；`backfill` 傳 `since`＝min(新寫入日, 最近 `INCREMENTAL_RECOMPUTE_DAYS`=20 個交易日的第一天)，保留「上櫃收盤價晚到時下次回補會修正」的效果；類股對照（`sector_map` 的 ticker→sector）有變才整批重寫。`scripts/recompute.py` 仍整批。
+**驗證**：新增單元測試（握寫入鎖時 `_connect`／`get_data_revision` 0.2 秒 timeout 內成功、缺 trigger／revision 列會補回、增量與整批結果逐列相同、增量不碰更早的列、`since` 計算與類股變動退回整批、backfill 傳入的 `since`）；全套 327 項只剩既有的 `test_tradingnote_flow_gui`（第 57 行）。
+真實資料庫**副本**（sqlite backup）：增量寫入鎖 0.84s（重寫 156,480 列，since=2026-10-19）、整批 13.6s；兩者計算總時間 30s／43s（讀取階段不持鎖）；增量結果與現有表逐列相同。
+**未做**：副本上整批只量到 13.6s，沒重現超過 30 秒——實機當時 WAL 392 MB、又有其他背景寫入，推測是兩者疊加；①已讓讀取不再等寫入鎖，這個錯誤訊息應該不會再出現，但沒有在實機上重跑啟動同步確認。
+
+---
+
 ## 2026-11-11 整合玉山即時報價（新「即時報價」分頁＋部位即時現價）
 
 **動機**：把 `~/Documents/Vibecoding/esun/quote_cli.py`（玉山 Market Data SDK 的終端機報價板）整合進 tradingnote。user 選的範圍：報價分頁＋部位現價串接，不含下單（`esun/index.py` 沒搬）。
@@ -13,6 +39,44 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 設定頁新增「玉山證券即時報價」區塊（`esun_*` 寫入 `data/settings.json`，明文，不進 git；憑證只存路徑）；`positions_tab.py` 的現價改走 `_position_price`（連線中用即時價取代快照收盤價），報價更新時只重算現價／損益欄（`_refresh_position_live_prices`），連線後自動訂閱 OPEN 部位代號。
 **驗證**：`test_tradingnote_esun.py`（fake SDK：設定、時段、報價欄位、訂閱／推播／搜尋）、`test_tradingnote_quotes_gui.py`（offscreen）；全套 275 個測試只剩既有的 `test_tradingnote_flow_gui` 失敗。
 **沒有**：實際連玉山（本機沒裝 `esun_marketdata` wheel，也沒用真金鑰測）；打包（`tradingnote.spec`）沒處理 SDK；夜盤只做 REST 輪詢，與原 CLI 相同。
+
+---
+
+## 2026-11-09 個股期回測：實單績效＋What-if 出場模擬
+
+**動機**：user 每天記錄個股期（波段）操作，要看實單績效，並用期交所真實日 K 模擬「換一種出場方式」的結果；手動輸入＋通用 CSV 匯入。
+**改法**：
+- `tradingnote_tradejournal`：`trades` 加 `instrument`／`contract_size`／`futures_code`／`contract_month`／`total_tax`，`trade_executions` 加 `tax`／`source_key`（`_connect` 自動補欄）。
+  `_recalculate_rollup` 損益乘每口股數、淨損益扣期交稅；`closed_at` 改為最後一筆出場的 `executed_at`（原本是結案當下時間，匯入舊單會錯；股票也一併適用）。
+  `record_execution(tax=None)` 個股期自動算期交稅（`ssf_tax`，十萬分之二四捨五入）；`list_trades(instrument=)`；個股期在部位頁以等值股數顯示。
+- `tradingnote_futures_backtest.py`（新）：`closed_trade_results`、`compute_stats`、`ExitRule`／`simulate_exit`／`run_whatif`、`parse_ssf_csv`／`import_ssf_rows`。假設見 `docs/FUTURES_BACKTEST.md`。
+- `tradingnote_taifex`：`futures_daily`＋`futures_daily_checked` 表、`parse_futures_daily_csv`／`fetch_futures_daily_range`／`ensure_futures_daily`／`get_futures_bars`、
+  `ssf_codes_for_stock`／`lookup_ssf_code`（SSFLists 依順序判斷小型）。
+- UI：新頁「個股期回測」（`ui/pages/futures_backtest_page.py`，導覽第 4 頁）、`ui/dialogs/futures_import.py`；新增部位對話框加「商品」選項（個股期顯示月份／期貨代號／手續費、停損可留空），
+  新增成交對話框對個股期顯示期交稅；成交明細表加期交稅欄。
+**驗證**：單元測試（乘數／稅／closed_at／舊表補欄、統計已知序列、模擬 11 種情境、CSV 加碼減碼反手與重複匯入、期交所 CSV 解析與只補缺口、頁面與匯入對話框 offscreen）。
+真實期交所：CDF 2026-09-15～11-08 兩次請求 32 根日 K，10/01 數字與官網 CSV 相同，第二次 0 請求；2330 查到 CDF／QFF；用一筆假交易跑三種規則的 What-if 正常。offscreen 合成資料截圖確認版面。
+**未做**：實機點擊；用 user 真實交易跑過；券商對帳單專用格式；夜盤不納入模擬；到期日不處理假日順延。
+
+---
+
+## 2026-10-30 每日選股新增「KD 鈍化」條件（daily_prices 開始存最高／最低價）
+
+**動機**：user 要在每日選股加 KD 鈍化，高檔、低檔都算，且是必要條件；KD 要用真正的高低價（像個股彈窗的 KD 圖）。
+彈窗 KD 是逐檔向 FinMind 抓 OHLC，全市場每天約 2000 檔會超過 600 次／小時額度；但 TWSE `MI_INDEX`、櫃買 `dailyQuotes`、每日快照本來就有全市場高低價，只是沒存。
+**改法**：
+- `daily_prices` 加 `high`／`low`（`_connect` 自動補欄位）。`upsert_daily_prices` 改 `ON CONFLICT DO UPDATE`、接受 8 或 10 欄 tuple，高低價只在新資料有值時覆寫（FinMind 上櫃回補不會洗掉）；
+  `record_snapshot`、`_backfill_twse_history_locked`、`backfill_tpex_gaps`、`ih` 的補價格都改帶高低價；`parse_tpex_daily_quotes` 依表頭「最高／最低」取欄（實測第 5、6 欄）。
+- 新增 `missing_high_low`／`backfill_high_low`（最近 N 個交易日中過半列缺高低價的「日期×市場」逐日重抓）、`scripts/backfill_high_low.py`（`--days`、`--db`），`scripts/fetch_daily.py` 選股前順便補。
+- `tradingnote_screener`：條件 4 `kd_dull`＝K 連續 3 日 ≥ 80 或 ≤ 20；KD 直接用 `tradingnote_technical._calculate_kd`（與彈窗同函式），K 需連續算出 30 天才採用，
+  沒成交日高＝低＝前收；`screener_results` 加 `kd_k`／`kd_d`／`kd_state`／`kd_dull_days`。名單加「K」「D」「KD鈍化」欄（高檔紅、低檔綠）；KD 全部不通過時狀態列提示可能未回補高低價。
+**驗證**：單元測試（`kd_dullness`、`calculate_kd` 缺高低價、端到端含 KD 與彈窗算法一致、缺高低價有 warning、舊表補欄位、8 欄 upsert 不洗高低價、TPEX 表頭解析、回補只抓缺的日子）；
+全部測試 245 項只剩既有的 `test_tradingnote_flow_gui`（與改前同一行 57）。真實資料庫**副本**：`backfill_high_low` 60 交易日 120 次請求全成功；2026-10-29 母體 1976 檔，
+KD 鈍化單獨通過 484 檔（低檔 460、高檔 24，近期盤勢偏弱），全部通過 39 檔；6442／1569／2330／6161 的 K、D 與 FinMind OHLC 用彈窗算法算出的值到小數兩位完全相同。offscreen 渲染名單新欄位。
+正式資料庫隨後也跑了 `backfill_high_low`（120 筆全成功）並重篩 10-29，結果與副本相同（入選 39 檔）。
+**未做**：實機點擊；回測這組條件；低檔鈍化與「大戶增加＋放量」合併是否合理留給 user 判斷。
+
+---
 
 ## 2026-10-21 啟動／切頁卡頓：耗時 DB 查詢移出 GUI thread
 

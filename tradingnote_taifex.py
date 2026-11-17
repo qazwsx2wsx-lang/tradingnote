@@ -21,6 +21,7 @@ from pathlib import Path
 
 from tradingnote_api_config import (
     TAIFEX_DAILY_FUTURES_URL,
+    TAIFEX_FUTURES_DAILY_HISTORY_URL,
     TAIFEX_LARGE_TRADERS_FUTURES_URL,
     TAIFEX_LARGE_TRADERS_HISTORY_URL,
     TAIFEX_SSF_LIST_URL,
@@ -285,6 +286,23 @@ def build_ssf_map(rows):
     }
 
 
+def ssf_codes_for_stock(rows, stock_id):
+    """標的股票代號 → (標準型代號, 小型代號或 None)。SSFLists 沒有標示哪個是小型，
+    實測 2026-11：有兩個契約的 53 檔，小型契約一律排在清單較後面（2330：CDF 在前、
+    QFF 在後；2454：DVF／PUF），所以依清單順序取第一個當標準型、第二個當小型。
+    查不到回傳 (None, None)。"""
+    codes = [r["Contract"] for r in rows if r.get("StockCode") == stock_id and r.get("Contract")]
+    if not codes:
+        return None, None
+    return codes[0], (codes[1] if len(codes) > 1 else None)
+
+
+def lookup_ssf_code(cache_path, stock_id, mini=False):
+    """用 SSFLists 檔案快取查個股期代號（快取過期會連網更新，失敗退回舊快取）。"""
+    standard, small = ssf_codes_for_stock(get_cached_ssf_list(cache_path), stock_id)
+    return small if mini else standard
+
+
 def large_traders_code_for_product(product, ssf_map):
     """把日盤行情的商品代碼換成「大額交易人未沖銷部位」端點用的代碼。股票期貨
     （在 ssf_map 裡、代碼結尾為 F）在大額端點是去掉結尾 F（實測日盤 CDF＝台積電
@@ -330,6 +348,29 @@ def _connect(db_path):
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_large_traders_history_contract_date "
         "ON large_traders_history (contract, settlement_month, trader_type, date)"
+    )
+    # 期貨逐日行情（個股期 What-if 模擬用，tradingnote_futures_backtest）。
+    # session：一般＝日盤、盤後＝夜盤；價差單（月份含 "/"）不存。
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS futures_daily (
+            date TEXT NOT NULL,
+            futures_code TEXT NOT NULL,
+            contract_month TEXT NOT NULL,
+            session TEXT NOT NULL,
+            open REAL, high REAL, low REAL, close REAL,
+            settlement REAL,
+            volume INTEGER,
+            open_interest INTEGER,
+            PRIMARY KEY (date, futures_code, contract_month, session)
+        )"""
+    )
+    # 已向期交所查過的（代號, 曆日）：讓假日／沒成交的日子不會每次模擬都重抓。
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS futures_daily_checked (
+            futures_code TEXT NOT NULL,
+            date TEXT NOT NULL,
+            PRIMARY KEY (futures_code, date)
+        )"""
     )
     conn.commit()
     return conn
@@ -508,3 +549,152 @@ def backfill_large_traders_history(
             on_progress(index + 1, len(chunks))
 
     return {"chunks": len(chunks), "rows": total_rows}
+
+
+# ---------- 期貨逐日行情歷史（個股期 What-if 模擬用） ----------
+
+# 期交所 futDataDown 單次查詢跨度：實測 31 天可、61 天回 HTML 錯誤頁（2026-11）。
+FUTURES_DAILY_MAX_SPAN_DAYS = 31
+
+
+def parse_futures_daily_csv(text):
+    """解析 futDataDown 的 CSV → [(date, code, month, session, open, high, low, close,
+    settlement, volume, open_interest)]。只收一般月份合約（YYYYMM），跳過價差單
+    （202611/202612）與週契約。回應不是 CSV（跨度超限、被擋）時丟 ValueError，
+    讓呼叫端不要把這段日期記成「已查過」。"""
+    lines = text.splitlines()
+    if not lines or "交易日期" not in lines[0]:
+        raise ValueError("期交所回應不是行情 CSV（可能查詢跨度過長或暫時被擋）")
+    rows = []
+    for record in csv.reader(io.StringIO(text)):
+        if len(record) < 18 or "/" not in record[0]:
+            continue
+        month = record[2].strip()
+        if len(month) != 6 or not month.isdigit():
+            continue
+        rows.append(
+            (
+                record[0].strip().replace("/", "-"),
+                record[1].strip(),
+                month,
+                record[17].strip(),
+                to_float(record[3]),
+                to_float(record[4]),
+                to_float(record[5]),
+                to_float(record[6]),
+                to_float(record[10]),
+                to_int(record[9]),
+                to_int(record[11]),
+            )
+        )
+    return rows
+
+
+def fetch_futures_daily_range(code, start_date, end_date):
+    """下載一個契約（如 CDF）在 [start_date, end_date]（datetime.date，跨度不得超過
+    FUTURES_DAILY_MAX_SPAN_DAYS）所有月份、日盤＋夜盤的逐日行情。"""
+    body = urlencode(
+        {
+            "down_type": "1",
+            "commodity_id": code,
+            "queryStartDate": start_date.strftime("%Y/%m/%d"),
+            "queryEndDate": end_date.strftime("%Y/%m/%d"),
+        }
+    )
+    text = http_post_text(TAIFEX_FUTURES_DAILY_HISTORY_URL, body, encoding="big5")
+    return parse_futures_daily_csv(text)
+
+
+def upsert_futures_daily(db_path, rows):
+    if not rows:
+        return
+    conn = _connect(db_path)
+    try:
+        conn.executemany(
+            """INSERT OR REPLACE INTO futures_daily
+               (date, futures_code, contract_month, session, open, high, low, close,
+                settlement, volume, open_interest)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _missing_ranges(days):
+    """排序好的 date 清單 → 連續區段 [(start, end)]。"""
+    ranges = []
+    for day in days:
+        if ranges and day == ranges[-1][1] + timedelta(days=1):
+            ranges[-1] = (ranges[-1][0], day)
+        else:
+            ranges.append((day, day))
+    return ranges
+
+
+def ensure_futures_daily(db_path, code, start_date, end_date, *, delay_seconds=0.3,
+                         today=None, fetch=None):
+    """確保 code 在 [start_date, end_date]（ISO 字串或 date）的逐日行情已存進
+    futures_daily；只下載還沒查過的曆日。今天（含）以後的日子只有真的抓到資料才記成
+    已查過（盤後資料可能還沒公布）。回傳下載的請求次數。"""
+    fetch = fetch or fetch_futures_daily_range
+    today = today or date.today()
+    start = date.fromisoformat(str(start_date)[:10])
+    end = min(date.fromisoformat(str(end_date)[:10]), today)
+    if start > end:
+        return 0
+    conn = _connect(db_path)
+    try:
+        checked = {
+            row[0] for row in conn.execute(
+                "SELECT date FROM futures_daily_checked WHERE futures_code=? AND date BETWEEN ? AND ?",
+                (code, start.isoformat(), end.isoformat()),
+            )
+        }
+    finally:
+        conn.close()
+    days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+    missing = [d for d in days if d.isoformat() not in checked]
+
+    requests = 0
+    for range_start, range_end in _missing_ranges(missing):
+        for chunk_start, chunk_end in _date_chunks(range_start, range_end, FUTURES_DAILY_MAX_SPAN_DAYS):
+            if requests and delay_seconds:
+                time.sleep(delay_seconds)
+            rows = fetch(code, chunk_start, chunk_end)
+            requests += 1
+            upsert_futures_daily(db_path, rows)
+            with_data = {row[0] for row in rows}
+            done = [
+                (code, (chunk_start + timedelta(days=i)).isoformat())
+                for i in range((chunk_end - chunk_start).days + 1)
+            ]
+            done = [item for item in done if item[1] < today.isoformat() or item[1] in with_data]
+            conn = _connect(db_path)
+            try:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO futures_daily_checked (futures_code, date) VALUES (?, ?)",
+                    done,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+    return requests
+
+
+def get_futures_bars(db_path, code, contract_month, start_date, end_date, session="一般"):
+    """回傳 [{date, open, high, low, close, settlement, volume}]（依日期排序），
+    tradingnote_futures_backtest.simulate_exit 吃的格式。"""
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """SELECT date, open, high, low, close, settlement, volume FROM futures_daily
+               WHERE futures_code=? AND contract_month=? AND session=? AND date BETWEEN ? AND ?
+               ORDER BY date""",
+            (code, str(contract_month), session, str(start_date)[:10], str(end_date)[:10]),
+        ).fetchall()
+    finally:
+        conn.close()
+    keys = ("date", "open", "high", "low", "close", "settlement", "volume")
+    return [dict(zip(keys, row)) for row in rows]

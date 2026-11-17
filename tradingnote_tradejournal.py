@@ -15,6 +15,33 @@ import sqlite3
 from tradingnote_core import Position, lookup_price, validate_position_input
 
 
+INSTRUMENT_STOCK = "STOCK"
+INSTRUMENT_SSF = "SSF"
+# 個股期期交稅：十萬分之二，買賣各課一次，以契約金額（價格×每口股數×口數）計。
+SSF_TAX_RATE = 0.00002
+
+# 舊資料庫沒有這些欄位時由 _connect 自動 ALTER TABLE 補上；預設值讓既有股票
+# 交易的行為完全不變。
+_ADDED_COLUMNS = {
+    "trades": (
+        ("instrument", "TEXT DEFAULT 'STOCK'"),
+        ("contract_size", "REAL DEFAULT 1"),
+        ("futures_code", "TEXT"),
+        ("contract_month", "TEXT"),
+        ("total_tax", "REAL DEFAULT 0"),
+    ),
+    "trade_executions": (
+        ("tax", "REAL DEFAULT 0"),
+        ("source_key", "TEXT"),
+    ),
+}
+
+
+def ssf_tax(price, contract_size, qty):
+    """個股期單邊期交稅（四捨五入到元）。"""
+    return float(round(price * contract_size * qty * SSF_TAX_RATE))
+
+
 @dataclass(frozen=True)
 class Strategy:
     strategy_id: int
@@ -40,6 +67,8 @@ class TradeExecution:
     commission: float
     slippage: float
     executed_at: str
+    tax: float = 0.0
+    source_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +111,13 @@ class Trade:
     executions: tuple[TradeExecution, ...] = field(default_factory=tuple)
     tags: tuple[Tag, ...] = field(default_factory=tuple)
     analytics: TradeAnalytics | None = None
+    # 個股期（SSF）欄位：股票交易一律 instrument='STOCK'、contract_size=1，
+    # 所以 realized_pnl／net_pnl 的算法跟加欄位前完全一樣。
+    instrument: str = "STOCK"
+    contract_size: float = 1.0
+    futures_code: str | None = None
+    contract_month: str | None = None
+    total_tax: float = 0.0
 
 
 def _connect(db_path):
@@ -175,6 +211,15 @@ def _connect(db_path):
         CREATE INDEX IF NOT EXISTS idx_trades_opened_at ON trades(opened_at);
         CREATE INDEX IF NOT EXISTS idx_executions_trade_id ON trade_executions(trade_id);
         """
+    )
+    for table, columns in _ADDED_COLUMNS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, ddl in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_executions_source_key "
+        "ON trade_executions(source_key)"
     )
     conn.commit()
     return conn
@@ -281,8 +326,18 @@ def open_trade(
     opened_at=None,
     notes=None,
     chart_screenshot_url=None,
+    instrument=INSTRUMENT_STOCK,
+    contract_size=None,
+    futures_code=None,
+    contract_month=None,
 ):
     opened_at = opened_at or _now_iso()
+    if instrument not in (INSTRUMENT_STOCK, INSTRUMENT_SSF):
+        raise ValueError(f"不支援的商品類型：{instrument}")
+    if contract_size is None:
+        contract_size = 1.0
+    if contract_size <= 0:
+        raise ValueError("每口股數必須大於 0。")
     conn = _connect(db_path)
     try:
         cursor = conn.execute(
@@ -291,8 +346,10 @@ def open_trade(
                    initial_entry_price, initial_stop_loss, initial_take_profit,
                    planned_risk_amount, total_qty, realized_pnl,
                    total_commission, net_pnl, notes, chart_screenshot_url,
-                   opened_at
-               ) VALUES (?, ?, ?, 'OPEN', ?, ?, ?, ?, 0, 0, 0, 0, ?, ?, ?)""",
+                   opened_at, instrument, contract_size, futures_code,
+                   contract_month, total_tax
+               ) VALUES (?, ?, ?, 'OPEN', ?, ?, ?, ?, 0, 0, 0, 0, ?, ?, ?,
+                         ?, ?, ?, ?, 0)""",
             (
                 symbol,
                 side,
@@ -304,6 +361,10 @@ def open_trade(
                 notes,
                 chart_screenshot_url,
                 opened_at,
+                instrument,
+                contract_size,
+                futures_code,
+                contract_month,
             ),
         )
         conn.commit()
@@ -314,15 +375,17 @@ def open_trade(
 
 def _recalculate_rollup(conn, trade_id):
     row = conn.execute(
-        "SELECT side, status FROM trades WHERE trade_id=?", (trade_id,)
+        "SELECT side, status, contract_size FROM trades WHERE trade_id=?",
+        (trade_id,),
     ).fetchone()
     if row is None:
         return
-    side, status = row
+    side, status, contract_size = row
+    multiplier = contract_size or 1.0
 
     rows = conn.execute(
-        "SELECT action, price, qty, commission FROM trade_executions "
-        "WHERE trade_id=? ORDER BY executed_at, execution_id",
+        "SELECT action, price, qty, commission, COALESCE(tax, 0), executed_at "
+        "FROM trade_executions WHERE trade_id=? ORDER BY executed_at, execution_id",
         (trade_id,),
     ).fetchall()
 
@@ -335,9 +398,12 @@ def _recalculate_rollup(conn, trade_id):
     exit_qty_sum = 0.0
     realized_pnl = 0.0
     total_commission = 0.0
+    total_tax = 0.0
+    last_exit_at = None
 
-    for action, price, qty, commission in rows:
-        total_commission += commission
+    for action, price, qty, commission, tax, executed_at in rows:
+        total_commission += commission or 0.0
+        total_tax += tax
         if action == entry_action:
             entry_cost_sum += price * qty
             entry_qty_sum += qty
@@ -351,10 +417,13 @@ def _recalculate_rollup(conn, trade_id):
             else:
                 realized_pnl += (running_avg_entry - price) * qty
             open_qty -= qty
+            last_exit_at = executed_at
 
+    # 價差×數量×每口股數（股票＝1）＝金額損益
+    realized_pnl *= multiplier
     avg_entry_price = (entry_cost_sum / entry_qty_sum) if entry_qty_sum else None
     avg_exit_price = (exit_proceeds_sum / exit_qty_sum) if exit_qty_sum else None
-    net_pnl = realized_pnl - total_commission
+    net_pnl = realized_pnl - total_commission - total_tax
     total_qty = round(open_qty, 10)
 
     new_status = status
@@ -368,7 +437,7 @@ def _recalculate_rollup(conn, trade_id):
             """UPDATE trades SET
                    total_qty=?, avg_entry_price=?, avg_exit_price=?,
                    realized_pnl=?, total_commission=?, net_pnl=?, status=?,
-                   closed_at=CURRENT_TIMESTAMP
+                   total_tax=?, closed_at=COALESCE(?, CURRENT_TIMESTAMP)
                WHERE trade_id=?""",
             (
                 total_qty,
@@ -378,6 +447,8 @@ def _recalculate_rollup(conn, trade_id):
                 total_commission,
                 net_pnl,
                 new_status,
+                total_tax,
+                last_exit_at,
                 trade_id,
             ),
         )
@@ -385,7 +456,8 @@ def _recalculate_rollup(conn, trade_id):
         conn.execute(
             """UPDATE trades SET
                    total_qty=?, avg_entry_price=?, avg_exit_price=?,
-                   realized_pnl=?, total_commission=?, net_pnl=?, status=?
+                   realized_pnl=?, total_commission=?, net_pnl=?, status=?,
+                   total_tax=?
                WHERE trade_id=?""",
             (
                 total_qty,
@@ -395,6 +467,7 @@ def _recalculate_rollup(conn, trade_id):
                 total_commission,
                 net_pnl,
                 new_status,
+                total_tax,
                 trade_id,
             ),
         )
@@ -419,15 +492,29 @@ def record_execution(
     commission=0.0,
     slippage=0.0,
     executed_at=None,
+    tax=None,
+    source_key=None,
 ):
+    """tax=None：個股期自動算期交稅（ssf_tax），股票記 0；要覆寫就明確傳數字。"""
     executed_at = executed_at or _now_iso()
     conn = _connect(db_path)
     try:
+        if tax is None:
+            row = conn.execute(
+                "SELECT instrument, contract_size FROM trades WHERE trade_id=?",
+                (trade_id,),
+            ).fetchone()
+            if row is not None and row[0] == INSTRUMENT_SSF:
+                tax = ssf_tax(price, row[1] or 1.0, qty)
+            else:
+                tax = 0.0
         cursor = conn.execute(
             """INSERT INTO trade_executions
-                   (trade_id, action, price, qty, commission, slippage, executed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (trade_id, action, price, qty, commission, slippage, executed_at),
+                   (trade_id, action, price, qty, commission, slippage, executed_at,
+                    tax, source_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (trade_id, action, price, qty, commission, slippage, executed_at,
+             tax, source_key),
         )
         execution_id = cursor.lastrowid
         _recalculate_rollup(conn, trade_id)
@@ -563,7 +650,13 @@ _TRADE_COLUMNS = (
     "trade_id, symbol, side, strategy_id, status, initial_entry_price, "
     "initial_stop_loss, initial_take_profit, planned_risk_amount, total_qty, "
     "avg_entry_price, avg_exit_price, realized_pnl, total_commission, net_pnl, "
-    "execution_rating, notes, chart_screenshot_url, opened_at, closed_at, created_at"
+    "execution_rating, notes, chart_screenshot_url, opened_at, closed_at, created_at, "
+    "COALESCE(instrument, 'STOCK'), COALESCE(contract_size, 1), futures_code, "
+    "contract_month, COALESCE(total_tax, 0)"
+)
+_EXECUTION_COLUMNS = (
+    "execution_id, trade_id, action, price, qty, commission, slippage, "
+    "executed_at, COALESCE(tax, 0), source_key"
 )
 
 
@@ -590,6 +683,11 @@ def _row_to_trade(row, executions=(), tags=(), analytics=None):
         opened_at=row[18],
         closed_at=row[19],
         created_at=row[20],
+        instrument=row[21],
+        contract_size=row[22],
+        futures_code=row[23],
+        contract_month=row[24],
+        total_tax=row[25],
         executions=executions,
         tags=tags,
         analytics=analytics,
@@ -606,8 +704,7 @@ def get_trade(db_path, trade_id):
             return None
 
         execution_rows = conn.execute(
-            "SELECT execution_id, trade_id, action, price, qty, commission, "
-            "slippage, executed_at FROM trade_executions WHERE trade_id=? "
+            f"SELECT {_EXECUTION_COLUMNS} FROM trade_executions WHERE trade_id=? "
             "ORDER BY executed_at, execution_id",
             (trade_id,),
         ).fetchall()
@@ -642,11 +739,15 @@ def list_trades(
     strategy_id=None,
     date_from=None,
     date_to=None,
+    instrument=None,
 ):
     conn = _connect(db_path)
     try:
         clauses = []
         params = []
+        if instrument is not None:
+            clauses.append("COALESCE(instrument, 'STOCK')=?")
+            params.append(instrument)
         if symbol is not None:
             clauses.append("symbol=?")
             params.append(symbol)
@@ -684,7 +785,9 @@ def trade_as_position(trade, snapshot=None):
         price = lookup_price(trade.symbol, snapshot)
         if price is not None:
             name, market = price.name, price.market
-    shares = trade.total_qty
+    # 個股期在部位頁以「等值股數」（口數×每口股數）呈現，未實現損益用標的現貨價
+    # 近似（不含基差）。
+    shares = trade.total_qty * (trade.contract_size or 1.0)
     return Position(
         ticker=trade.symbol,
         shares=int(shares) if float(shares).is_integer() else shares,
@@ -728,7 +831,14 @@ def open_position(
     initial_take_profit=None,
     planned_risk_amount=None,
     snapshot=None,
+    instrument=INSTRUMENT_STOCK,
+    contract_size=None,
+    futures_code=None,
+    contract_month=None,
+    commission=0.0,
+    tax=None,
 ):
+    """股票：shares＝股數；個股期：shares＝口數，contract_size＝每口股數。"""
     ticker = ticker.strip().upper()
     validate_position_input(ticker, shares, entry_price, entry_date)
     trade_id = open_trade(
@@ -742,6 +852,10 @@ def open_position(
         planned_risk_amount=planned_risk_amount,
         opened_at=entry_date,
         notes=note or None,
+        instrument=instrument,
+        contract_size=contract_size,
+        futures_code=futures_code,
+        contract_month=contract_month,
     )
     record_execution(
         db_path,
@@ -750,6 +864,8 @@ def open_position(
         price=entry_price,
         qty=shares,
         executed_at=entry_date,
+        commission=commission,
+        tax=tax,
     )
     return trade_as_position(get_trade(db_path, trade_id), snapshot)
 

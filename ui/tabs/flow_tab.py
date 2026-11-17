@@ -937,7 +937,7 @@ class FlowTabMixin:
 
         self.screener_list = QtWidgets.QTreeWidget()
         headers = ["代號", "名稱", "產業", "收盤", "漲跌%", "大戶占比Δ(pp)", "大戶占比走勢%",
-                   "融資連減(天)", "融資變化%", "量比", "MFI"]
+                   "融資連減(天)", "融資變化%", "量比", "MFI", "K", "D", "KD鈍化"]
         self.screener_list.setColumnCount(len(headers))
         self.screener_list.setHeaderLabels(headers)
         self.screener_list.setRootIsDecorated(False)
@@ -1025,10 +1025,15 @@ class FlowTabMixin:
         parts = "、".join(
             f"{rule.label} {counts.get(rule.key, 0)} 檔" for rule in screener.RULES)
         base, latest = result["holder_dates"]
-        holder = f"集保比較 {base} → {latest}" if base else "集保資料不足（請先「補集保大戶歷史…」補最近 3 週）"
+        # 大戶增加已不是篩選條件（2026-11-17 停用），集保只影響「大戶占比Δ／走勢」欄
+        holder = (f"大戶占比欄：集保比較 {base} → {latest}" if base
+                  else "集保資料不足，大戶占比欄空白（不影響入選；可用「補集保大戶歷史…」補最近 3 週）")
+        # 篩選警告沒有存檔，這裡只能由通過數推測：KD 全部不通過多半是舊日子還沒補最高／最低價
+        kd_hint = ("KD 鈍化 0 檔，可能是最高／最低價尚未回補（執行 scripts/backfill_high_low.py 後重新篩選）。"
+                   if result["universe"] and counts.get("kd_dull") == 0 else "")
         self.screener_status.setText(
             f"{result['date']}　母體 {result['universe']} 檔，全部通過 {result['matched']} 檔。"
-            f"各條件單獨通過：{parts}。{holder}。")
+            f"各條件單獨通過：{parts}。{holder}。{kd_hint}")
         for row in result["rows"]:
             def fmt(value, pattern):
                 return pattern.format(value) if value is not None else "—"
@@ -1038,11 +1043,16 @@ class FlowTabMixin:
                 fmt(row["big_delta"], "{:+.2f}"), self._screener_trail_text(row),
                 fmt(row["margin_down_days"], "{}"), fmt(row["margin_change_pct"], "{:+.2f}%"),
                 fmt(row["volume_ratio"], "{:.2f}"), fmt(row["mfi"], "{:.1f}"),
+                fmt(row.get("kd_k"), "{:.1f}"), fmt(row.get("kd_d"), "{:.1f}"),
+                f"{row['kd_state']} {row['kd_dull_days']} 天" if row.get("kd_state") else "—",
             ])
             item.setData(0, QtCore.Qt.UserRole, row["ticker"])
             item.setData(0, QtCore.Qt.UserRole + 1, row.get("market"))
-            for col in range(3, 11):
+            for col in range(3, 14):
                 item.setTextAlignment(col, QtCore.Qt.AlignCenter)
+            if row.get("kd_state"):
+                # 高檔鈍化＝強勢（紅）、低檔鈍化＝弱勢（綠），沿用台股漲紅跌綠
+                item.setForeground(13, QtGui.QColor(gain_loss_color(1 if row["kd_state"] == "高檔" else -1)))
             if row["change_pct"] is not None:
                 item.setForeground(4, QtGui.QColor(gain_loss_color(row["change_pct"])))
             if row["big_delta"] is not None:

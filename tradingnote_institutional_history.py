@@ -326,7 +326,7 @@ def fetch_day(db_path, day, delay_seconds=DEFAULT_DELAY_SECONDS, log=print):
             raise PriceFetchError(f"{iso} {market} 收盤行情抓取失敗")
         history.upsert_daily_prices(db_path, [
             (iso, r["ticker"], market, r["name"], r["close"], r["change_pct"],
-             r["volume"], r["trading_value"])
+             r["volume"], r["trading_value"], r.get("high"), r.get("low"))
             for r in records
         ])
 
@@ -421,9 +421,32 @@ def backfill(db_path, target_days=DEFAULT_TARGET_DAYS, delay_seconds=DEFAULT_DEL
         cursor -= timedelta(days=1)
 
     if written:
-        refresh_sector_map(db_path)
-        compute_metrics(db_path)
+        old_sectors = _sector_assignments(db_path)
+        new_sectors = {t: s for t, (_n, _m, s) in refresh_sector_map(db_path).items()}
+        compute_metrics(db_path, since=_incremental_since(db_path, written, old_sectors, new_sectors))
     return written
+
+
+# 增量重算時，除了新寫入的日子，也重寫最近這麼多個交易日：法人資料先到、該日上櫃
+# 收盤價稍後才回補時，那幾天的金額會在下次回補自動修正（原本整批重寫順便做到的事）。
+INCREMENTAL_RECOMPUTE_DAYS = 20
+
+
+def _sector_assignments(db_path):
+    conn = _connect(db_path)
+    try:
+        return dict(conn.execute("SELECT ticker, sector FROM sector_map"))
+    finally:
+        conn.close()
+
+
+def _incremental_since(db_path, written, old_sectors, new_sectors):
+    """回傳 compute_metrics 的 since；類股對照有變（或還沒有舊的指標）時回 None＝整批重寫。"""
+    if old_sectors != new_sectors:
+        return None
+    dates = completed_dates(db_path)
+    tail = dates[-INCREMENTAL_RECOMPUTE_DAYS:]
+    return min([*written, *tail[:1]])
 
 
 def _mark_non_trading(db_path, iso):
@@ -437,9 +460,16 @@ def _mark_non_trading(db_path, iso):
 
 # ---------- 指標預先計算 ----------
 
-def compute_metrics(db_path, keep_days=None):
-    """用 daily_institutional × daily_prices × sector_map 重算全部日期的
-    sector_metrics／stock_metrics（整批重寫，資料量是 N 天 × 約 2000 檔，數秒內完成）。"""
+def compute_metrics(db_path, keep_days=None, since=None):
+    """用 daily_institutional × daily_prices × sector_map 計算 sector_metrics／stock_metrics。
+
+    計算一律從頭走完整序列（sum20、連續天數、加速度都要前面的日子），但寫入時：
+    - since=None：兩張表整批重寫（scripts/recompute.py、類股對照有變時用）。
+    - since="YYYY-MM-DD"：只刪除、重寫 date >= since 的列。所有指標都只往回看，
+      新增或修正 since 之後的日子不會影響更早的列，所以結果與整批重寫相同。
+    stock_metrics 約 N 天 × 2000 檔 × 4 種法人（2026-11 已約 300 萬列），整批重寫在
+    同一個交易裡要數十秒，期間 history.db 的寫入鎖被占住，其他連線等超過 30 秒就會
+    database is locked；backfill 因此只重寫最近幾天。"""
     dates = completed_dates(db_path)
     if keep_days:
         dates = dates[-keep_days:]
@@ -512,8 +542,14 @@ def compute_metrics(db_path, keep_days=None):
                         window_sum(values, 20), acceleration(values, 5), streak(values),
                         change5, agg["value"], agg["count"], min(len(values), 20),
                     ))
-        conn.execute("DELETE FROM sector_metrics")
-        conn.execute("DELETE FROM stock_metrics")
+        if since is None:
+            conn.execute("DELETE FROM sector_metrics")
+            conn.execute("DELETE FROM stock_metrics")
+        else:
+            sector_rows = [row for row in sector_rows if row[0] >= since]
+            stock_rows = [row for row in stock_rows if row[0] >= since]
+            conn.execute("DELETE FROM sector_metrics WHERE date >= ?", (since,))
+            conn.execute("DELETE FROM stock_metrics WHERE date >= ?", (since,))
         conn.executemany(
             "INSERT INTO sector_metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", sector_rows)
         conn.executemany("INSERT INTO stock_metrics VALUES (?, ?, ?, ?, ?, ?)", stock_rows)

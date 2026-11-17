@@ -225,6 +225,55 @@ class ComputeMetricsTests(unittest.TestCase):
         self.assertEqual(stocks[0]["foreign_streak"], 6)
         self.assertAlmostEqual(stocks[0]["close"], 100.0)
 
+    def _all_metrics(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            return {table: conn.execute(f"SELECT * FROM {table} ORDER BY 1, 2, 3").fetchall()
+                    for table in ("sector_metrics", "stock_metrics")}
+        finally:
+            conn.close()
+
+    def test_incremental_since_matches_full_rewrite(self):
+        full = self._all_metrics()
+        # 模擬「最後 3 天還沒抓」：先只對前 9 天整批計算，再補上後 3 天、只重寫 since 之後
+        conn = sqlite3.connect(self.db)
+        hidden = conn.execute("SELECT * FROM market_summary WHERE date >= ?",
+                              (self.dates[9],)).fetchall()
+        conn.execute("DELETE FROM market_summary WHERE date >= ?", (self.dates[9],))
+        conn.commit()
+        ih.compute_metrics(self.db)
+        conn.executemany("INSERT INTO market_summary VALUES (?, ?, ?, ?, ?)", hidden)
+        conn.commit()
+        conn.close()
+        self.assertNotEqual(self._all_metrics(), full)
+
+        ih.compute_metrics(self.db, since=self.dates[9])
+        self.assertEqual(self._all_metrics(), full)
+
+    def test_incremental_since_leaves_older_rows_untouched(self):
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE stock_metrics SET day_amt = 999 WHERE date = ?", (self.dates[0],))
+        conn.commit()
+        conn.close()
+        ih.compute_metrics(self.db, since=self.dates[-1])
+        r = self.row("stock_metrics", "date=? AND ticker='1111' AND investor='foreign'",
+                     (self.dates[0],))
+        self.assertEqual(r["day_amt"], 999)
+
+    def test_incremental_since_window(self):
+        sectors = {"1111": "測試", "2222": "測試"}
+        with patch.object(ih, "INCREMENTAL_RECOMPUTE_DAYS", 5):
+            # 新寫入的日子比最近 5 個交易日新 → 從倒數第 5 天開始重寫
+            self.assertEqual(ih._incremental_since(self.db, [self.dates[-1]], sectors, dict(sectors)),
+                             self.dates[-5])
+            # 回補到更舊的日子 → 從那天開始
+            self.assertEqual(ih._incremental_since(self.db, [self.dates[2], self.dates[-1]],
+                                                   sectors, dict(sectors)), self.dates[2])
+        # 類股對照有變 → 整批重寫
+        self.assertIsNone(ih._incremental_since(self.db, [self.dates[-1]], sectors,
+                                                {"1111": "測試", "2222": "其他"}))
+        self.assertIsNone(ih._incremental_since(self.db, [self.dates[-1]], {}, sectors))
+
 
 class SummaryTextTests(unittest.TestCase):
     def rows(self, **amounts):
@@ -274,10 +323,12 @@ class BackfillSkipTests(unittest.TestCase):
 
             with patch.object(ih, "fetch_day", fake_fetch), \
                     patch.object(ih, "taipei_today", return_value=date(2026, 9, 25)), \
-                    patch.object(ih, "refresh_sector_map"), \
-                    patch.object(ih, "compute_metrics"):
+                    patch.object(ih, "refresh_sector_map", return_value={}), \
+                    patch.object(ih, "compute_metrics") as compute:
                 written = ih.backfill(db, target_days=3, end_date=date(2026, 9, 24), log=lambda *_: None)
                 self.assertEqual(written, ["2026-09-24", "2026-09-23", "2026-09-21"])
+                # 類股對照沒變 → 只重寫最早寫入那天之後
+                compute.assert_called_once_with(db, since="2026-09-21")
                 calls.clear()
                 ih.backfill(db, target_days=4, end_date=date(2026, 9, 24), log=lambda *_: None)
             # 第二次：已完成日期與已知假日都不再打 API，只補更早的 9/18（9/19、9/20 是週末）

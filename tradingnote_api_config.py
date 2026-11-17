@@ -68,6 +68,9 @@ TAIFEX_LARGE_TRADERS_FUTURES_URL = (
 TAIFEX_LARGE_TRADERS_HISTORY_URL = "https://www.taifex.com.tw/cht/3/largeTraderFutDown"
 # 股票期貨契約代碼對照標的股票清單
 TAIFEX_SSF_LIST_URL = "https://openapi.taifex.com.tw/v1/SSFLists"
+# 期貨每日交易行情歷史 CSV 下載（POST：down_type=1、commodity_id=契約代碼如 CDF、
+# queryStartDate／queryEndDate=YYYY/MM/DD，單次跨度上限約 1 個月，Big5 編碼）
+TAIFEX_FUTURES_DAILY_HISTORY_URL = "https://www.taifex.com.tw/cht/3/futDataDown"
 
 # ---- 籌碼資料（tradingnote_chips.py） ----
 

@@ -1,8 +1,31 @@
 # tradingnote 現況（STATUS.md）
 
-## 必讀簡介（2026-10-21）
+## 必讀簡介（2026-11-17）
+- **Claude（2026-11-17，每日選股移除「兩週內大戶增加」條件，未 commit）**：user 要求刪除條件 1。集保週資料停在 2026-10-16（只有 `scripts/fetch_daily.py` 會抓，
+  GUI 自動同步不抓、本機也沒排程），所以 11-09、11-17 都是 0 檔。`RULES` 裡 `big_holder` 改成註解（比照 10-14 停用融資），大戶占比Δ／走勢欄仍顯示。
+  真實資料庫**副本**重篩：11-09 入選 144 檔、11-17 入選 83 檔（低檔鈍化 70、高檔 13）。**正式資料庫存的 11-17 仍是 0 檔**，重開 app 後在「每日選股」按重新篩選才會更新。
+- **Claude（2026-11-17，修「資金流向分析失敗：database is locked」，未 commit）**：①`tradingnote_history._connect` 先用唯讀查詢確認 schema 完整，
+  完整就不再寫（原本每次都 `INSERT INTO analysis_revision`＋commit，連純讀取都要等寫入鎖）；②`ih.backfill` 寫入新日子後的 `compute_metrics`
+  改成只重寫最近 20 個交易日（`since=`，類股對照有變才整批），`stock_metrics` 約 300 萬列不再每次整表重寫。真實資料庫副本：寫入鎖 13.6s→0.84s，結果與整批相同。
+  同日也 `git pull` 合併了 origin 的回測引擎與玉山報價（merge commit `eb8a931`），`test_tradingnote_flow_gui` 頁數改成 8。細節見 CHANGELOG 2026-11-17。
+
+## 前一輪（2026-11-11）
 - **Claude（2026-11-11，玉山即時報價，未 commit）**：新增「即時報價」分頁＋部位現價改用即時價（連線中）。程式在 `tradingnote_esun.py`、`ui/tabs/quotes_tab.py`，金鑰在設定頁填（`esun_*`，明文存 `data/settings.json`）。
   **還沒做**：沒用真玉山帳號實測（本機沒裝 `esun_marketdata` wheel，在 `~/Documents/Vibecoding/esun/`）；打包沒納入 SDK；下單功能刻意不整合。細節見 CHANGELOG 2026-11-11。
+
+## 前一輪（2026-11-09）
+- **Claude（2026-11-09，個股期回測，未 commit）**：新頁「個股期回測」＝實單績效（權益曲線、勝率、盈虧比、最大回撤…）＋What-if 出場模擬（用期交所個股期真實日 K，
+  停損／停利／移動停損／持有天數可組合）。紀錄：「部位紀錄」新增部位選「個股期 標準型／小型」，或本頁匯入通用 CSV。說明與模擬假設見 `docs/FUTURES_BACKTEST.md`。
+  `trades` 加了合約欄位、損益乘每口股數、扣期交稅；**`closed_at` 改成最後出場日**（原本是結案當下）。期貨日 K 存 `futures_daily`，第一次模擬會連網補。
+  **未做**：實機點擊、user 真實交易跑過、券商對帳單格式、夜盤。工作目錄同時還有下面 10-30 KD 鈍化的未 commit 異動，兩者互不相干。
+
+## 前一輪（2026-10-30）
+- **Claude（2026-10-30，每日選股加「KD 鈍化」，未 commit）**：條件 4＝K 連續 3 日 ≥ 80（高檔）或 ≤ 20（低檔），必要條件；KD 用真正高低價、與個股彈窗 KD 圖同函式。
+  為此 `daily_prices` 新增 `high`／`low` 欄並開始存（快照、TWSE／TPEX 歷史日都帶），`upsert_daily_prices` 不會用沒有高低價的資料洗掉既有值。
+  正式資料庫已於 2026-10-30 用 `scripts/backfill_high_low.py` 補完最近 60 個交易日高低價（120 筆全成功），並重篩 10-29：母體 1976 檔、KD 鈍化 484 檔、入選 39 檔。
+  之後 `scripts/fetch_daily.py` 每天會順便補；K/D 與 FinMind 算法完全一致（細節見 CHANGELOG 2026-10-30）。
+
+## 前一輪（2026-10-21）
 - **Claude（2026-10-21，啟動／切頁卡頓，未 commit）**：量測後把 GUI thread 上最慢的同步 DB 查詢搬走：每日選股的日期掃描／重篩／讀結果改背景（`_start_screener_task`）、
   `screen_dates`／`get_available_dates` 依資料修訂號快取、設定頁資料庫狀態改背景。副本實測啟動建構阻塞 6.3s→1.1s、GUI 最大停頓約 3.5s→0.15~0.27s。
   **還沒做**：`_connect` 每次跑 DDL、前 50／族群清單的大戶與法人查詢仍在 GUI thread、`get_industry_map` 過期時 positions_tab 會在 GUI thread 連網（細節與依據見 CHANGELOG 2026-10-21）。

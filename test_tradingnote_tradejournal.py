@@ -378,5 +378,96 @@ class TradeJournalTests(unittest.TestCase):
         self.assertEqual(len(trade.executions), 1)
 
 
+class SsfTradeTests(unittest.TestCase):
+    """個股期（SSF）：合約乘數、期交稅、closed_at＝最後出場日。"""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "history.db"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _ssf_trade(self, side="LONG", size=2000):
+        return open_trade(
+            self.db_path, symbol="2330", side=side, initial_stop_loss=0,
+            opened_at="2026-10-01", instrument="SSF", contract_size=size,
+            futures_code="CDF", contract_month="202611",
+        )
+
+    def test_standard_contract_pnl_uses_multiplier_and_tax(self):
+        trade_id = self._ssf_trade()
+        record_execution(self.db_path, trade_id, action="BUY", price=1000.0, qty=2,
+                         commission=40, executed_at="2026-10-01")
+        record_execution(self.db_path, trade_id, action="SELL", price=1010.0, qty=2,
+                         commission=40, executed_at="2026-10-05")
+        trade = get_trade(self.db_path, trade_id)
+        self.assertEqual(trade.instrument, "SSF")
+        self.assertEqual(trade.contract_size, 2000)
+        self.assertEqual(trade.status, "CLOSED")
+        self.assertAlmostEqual(trade.realized_pnl, 10 * 2 * 2000)
+        # 期交稅：1000*2000*2*0.00002=80、1010*2000*2*0.00002=80.8→81
+        self.assertEqual([e.tax for e in trade.executions], [80.0, 81.0])
+        self.assertAlmostEqual(trade.total_tax, 161.0)
+        self.assertAlmostEqual(trade.net_pnl, 40000 - 80 - 161)
+        self.assertEqual(trade.closed_at, "2026-10-05")
+
+    def test_mini_short_contract(self):
+        trade_id = self._ssf_trade(side="SHORT", size=100)
+        record_execution(self.db_path, trade_id, action="SELL", price=500.0, qty=3,
+                         tax=0, executed_at="2026-10-01")
+        record_execution(self.db_path, trade_id, action="BUY", price=480.0, qty=3,
+                         tax=0, executed_at="2026-10-03")
+        trade = get_trade(self.db_path, trade_id)
+        self.assertAlmostEqual(trade.realized_pnl, 20 * 3 * 100)
+        self.assertAlmostEqual(trade.net_pnl, 6000)
+
+    def test_stock_trade_has_no_tax_and_unchanged_defaults(self):
+        trade_id = open_trade(self.db_path, symbol="2330", side="LONG", initial_stop_loss=9.0)
+        record_execution(self.db_path, trade_id, action="BUY", price=10.0, qty=100)
+        trade = get_trade(self.db_path, trade_id)
+        self.assertEqual(trade.instrument, "STOCK")
+        self.assertEqual(trade.contract_size, 1)
+        self.assertEqual(trade.executions[0].tax, 0)
+
+    def test_list_trades_instrument_filter_and_position_shares(self):
+        ssf_id = self._ssf_trade()
+        record_execution(self.db_path, ssf_id, action="BUY", price=1000.0, qty=2,
+                         executed_at="2026-10-01")
+        open_trade(self.db_path, symbol="2317", side="LONG", initial_stop_loss=9.0)
+        self.assertEqual(
+            [t.trade_id for t in list_trades(self.db_path, instrument="SSF")], [ssf_id]
+        )
+        self.assertEqual(len(list_trades(self.db_path, instrument="STOCK")), 1)
+        position = trade_as_position(get_trade(self.db_path, ssf_id))
+        self.assertEqual(position.shares, 4000)
+
+    def test_legacy_database_gets_new_columns(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript(
+            """CREATE TABLE trades (trade_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   symbol TEXT NOT NULL, side TEXT NOT NULL, strategy_id INTEGER,
+                   status TEXT DEFAULT 'OPEN', initial_entry_price REAL,
+                   initial_stop_loss REAL NOT NULL, initial_take_profit REAL,
+                   planned_risk_amount REAL, total_qty REAL DEFAULT 0,
+                   avg_entry_price REAL, avg_exit_price REAL,
+                   realized_pnl REAL DEFAULT 0, total_commission REAL DEFAULT 0,
+                   net_pnl REAL DEFAULT 0, execution_rating INTEGER, notes TEXT,
+                   chart_screenshot_url TEXT, opened_at DATETIME NOT NULL,
+                   closed_at DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+               CREATE TABLE trade_executions (execution_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   trade_id INTEGER NOT NULL, action TEXT NOT NULL, price REAL NOT NULL,
+                   qty REAL NOT NULL, commission REAL DEFAULT 0, slippage REAL DEFAULT 0,
+                   executed_at DATETIME NOT NULL);
+               INSERT INTO trades (symbol, side, initial_stop_loss, opened_at)
+                   VALUES ('2330', 'LONG', 9, '2026-09-01');"""
+        )
+        conn.close()
+        trades = list_trades(self.db_path)
+        self.assertEqual(trades[0].instrument, "STOCK")
+        self.assertIn("contract_size", TradeJournalTests._table_columns(self, "trades"))
+        self.assertIn("tax", TradeJournalTests._table_columns(self, "trade_executions"))
+
+
 if __name__ == "__main__":
     unittest.main()

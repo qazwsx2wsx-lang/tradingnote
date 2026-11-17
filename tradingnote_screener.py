@@ -11,10 +11,16 @@
 要加回去：把下面 RULES 最前面註解起來的 margin_down 那條取消註解。
 同日 screen_dates() 也不再要求融資融券已存（該資料常比收盤晚公布，若當作門檻會讓選股卡在舊日期不動）；
 重新啟用 margin_down 規則時不需要跟著恢復這個門檻，缺資料的日子一樣會被 compute_metrics 算成 None 而篩不過）：
-  1. 兩週內大戶增加：集保 400 張以上持股占比，最新一週 比 兩週前 增加超過 BIG_HOLDER_MIN_DELTA_PP 個百分點（目前 0.1）
+  （已停用，2026-11-17）兩週內大戶增加：集保 400 張以上持股占比，最新一週 比 兩週前 增加超過
+     BIG_HOLDER_MIN_DELTA_PP 個百分點。集保週資料只靠 scripts/fetch_daily.py 累積，斷更時這條讓名單整個變 0 檔；
+     大戶占比Δ／走勢仍會算並顯示在名單。要加回去：取消 RULES 裡 big_holder 那條的註解。
   2. 增量比 > 1：今日成交量 ÷ 前 5 日均量（即量比）> 1
-  3. MFI < 80：14 日資金流量指標（資料庫沒有最高／最低價，典型價用收盤價近似，
-     資金流用成交金額）
+  3. MFI < 80：14 日資金流量指標（典型價用收盤價近似，資金流用成交金額）
+  4. KD 鈍化（2026-10-30 加入）：K 值連續 KD_DULL_DAYS 個交易日（含篩選日）≥ KD_HIGH（高檔鈍化）
+     或 ≤ KD_LOW（低檔鈍化），兩種都算通過。KD 用 daily_prices 的最高／最低價、與個股彈窗 KD 圖
+     同一個函式（tradingnote_technical._calculate_kd，9 日 RSV、2/3 與 1/3 平滑）。
+     高低價 2026-10-30 起才開始存，舊日子要先跑 scripts/backfill_high_low.py（fetch_daily 也會順便補）；
+     缺高低價的股票 KD 是 None、條件不通過。
 
 擁有的表：
   screener_results  每個交易日入選的個股與當時的指標值
@@ -32,6 +38,7 @@ from typing import Callable
 
 import tradingnote_chips as chips
 import tradingnote_history as history
+import tradingnote_technical as technical
 
 # ---------- 參數（要調整就改這裡） ----------
 BIG_HOLDER_WEEKS_BACK = 2     # 與幾週前的集保週資料比較
@@ -41,6 +48,12 @@ VOLUME_RATIO_DAYS = 5         # 量比的均量天數（前 N 日，不含今日
 VOLUME_RATIO_MIN = 1.0        # 量比要大於這個值
 MFI_PERIOD = 14
 MFI_MAX = 80.0                # MFI 要小於這個值
+KD_PERIOD = 9                 # KD 的 RSV 天數
+KD_HIGH = 80.0                # K 值 ≥ 這個值算高檔
+KD_LOW = 20.0                 # K 值 ≤ 這個值算低檔
+KD_DULL_DAYS = 3              # 連續幾個交易日在高檔／低檔算鈍化
+KD_WARMUP_DAYS = 30           # K 值至少要連續算出幾天才採用（平滑從 50 起算，太短會偏離看盤軟體的數值）
+KD_BACKFILL_DAYS = 60         # 最高／最低價要補最近幾個交易日（需 ≥ KD_PERIOD - 1 + KD_WARMUP_DAYS + PRICE_SLACK_DAYS）
 MIN_PRICE_ROWS = 500          # 一個市場當天至少有幾檔報價才算「完整的一天」
 PRICE_SLACK_DAYS = 5          # 多抓幾個交易日，容許個股有幾天沒報價或收盤價空白
 HOLDER_GAP_TOLERANCE_DAYS = 3  # 基準週與最新週的間隔要在 7 × 週數 ± 這個天數內，否則視為缺週
@@ -60,9 +73,10 @@ def _num(value):
 
 
 RULES = (
-    Rule("big_holder", f"{BIG_HOLDER_WEEKS_BACK} 週內大戶增加",
-         f"集保 400 張以上持股占比，最新一週比 {BIG_HOLDER_WEEKS_BACK} 週前增加",
-         lambda m: _num(m["big_delta"]) and m["big_delta"] > BIG_HOLDER_MIN_DELTA_PP),
+    # 2026-11-17 停用：兩週內大戶增加（大戶占比Δ／走勢仍會算並顯示，只是不參與篩選）。要啟用就取消註解：
+    # Rule("big_holder", f"{BIG_HOLDER_WEEKS_BACK} 週內大戶增加",
+    #      f"集保 400 張以上持股占比，最新一週比 {BIG_HOLDER_WEEKS_BACK} 週前增加",
+    #      lambda m: _num(m["big_delta"]) and m["big_delta"] > BIG_HOLDER_MIN_DELTA_PP),
     # 2026-10-14 停用：融資連續減少（只顯示指標，不參與篩選）。要啟用就取消註解：
     # Rule("margin_down", "融資連續減少",
     #      f"融資餘額連續 {MARGIN_DOWN_DAYS} 個交易日比前一日少",
@@ -73,6 +87,9 @@ RULES = (
     Rule("mfi", f"MFI < {MFI_MAX:g}",
          f"{MFI_PERIOD} 日 MFI（收盤價近似）低於 {MFI_MAX:g}，不在超買區",
          lambda m: _num(m["mfi"]) and m["mfi"] < MFI_MAX),
+    Rule("kd_dull", "KD 鈍化",
+         f"K 值連續 {KD_DULL_DAYS} 日 ≥ {KD_HIGH:g}（高檔鈍化）或 ≤ {KD_LOW:g}（低檔鈍化）",
+         lambda m: _num(m["kd_dull_days"]) and m["kd_dull_days"] >= KD_DULL_DAYS),
 )
 
 
@@ -100,6 +117,10 @@ def _connect(db_path):
             margin_change_pct REAL,
             volume_ratio REAL,
             mfi REAL,
+            kd_k REAL,
+            kd_d REAL,
+            kd_state TEXT,
+            kd_dull_days INTEGER,
             PRIMARY KEY (date, ticker)
         );
         CREATE TABLE IF NOT EXISTS screener_runs (
@@ -112,10 +133,15 @@ def _connect(db_path):
         );
         """
     )
-    # 既有資料庫補欄位：big_trail＝兩週比較期間每週的大戶占比（JSON，[[日期, 占比], ...]）
+    # 既有資料庫補欄位：big_trail＝兩週比較期間每週的大戶占比（JSON，[[日期, 占比], ...]）；kd_*＝KD 鈍化（2026-10-30）
     columns = {row[1] for row in conn.execute("PRAGMA table_info(screener_results)")}
-    if "big_trail" not in columns:
-        conn.execute("ALTER TABLE screener_results ADD COLUMN big_trail TEXT")
+    added = False
+    for column, kind in (("big_trail", "TEXT"), ("kd_k", "REAL"), ("kd_d", "REAL"),
+                         ("kd_state", "TEXT"), ("kd_dull_days", "INTEGER")):
+        if column not in columns:
+            conn.execute(f"ALTER TABLE screener_results ADD COLUMN {column} {kind}")
+            added = True
+    if added:
         conn.commit()
     return conn
 
@@ -162,25 +188,53 @@ def calculate_mfi(closes, trading_values, period=MFI_PERIOD):
     return 100.0 if negative == 0 else 100 - 100 / (1 + positive / negative)
 
 
+def kd_dullness(k_values):
+    """由篩選日往回數 K 值連續在高檔（≥ KD_HIGH）或低檔（≤ KD_LOW）的天數，回傳 ("高檔"／"低檔"／None, 天數)。
+    k_values 由舊到新、不可含 None；篩選日 K 值在中間區時回傳 (None, 0)。"""
+    for state, inside in (("高檔", lambda k: k >= KD_HIGH), ("低檔", lambda k: k <= KD_LOW)):
+        days = 0
+        for k in reversed(k_values):
+            if not inside(k):
+                break
+            days += 1
+        if days:
+            return state, days
+    return None, 0
+
+
+def calculate_kd(bars):
+    """bars＝(最高, 最低, 收盤) 由舊到新。回傳最近 KD_WARMUP_DAYS 天的 (K 序列, D 序列)；
+    天數不足或這段期間任一天 K 算不出來（缺高低價）就回傳 None。"""
+    kd = technical._calculate_kd([
+        technical.TechnicalPriceBar(date=str(i), open=None, high=high, low=low, close=close,
+                                    volume=0.0, trading_value=None)
+        for i, (high, low, close) in enumerate(bars)], KD_PERIOD)
+    k, d = kd["k"][-KD_WARMUP_DAYS:], kd["d"][-KD_WARMUP_DAYS:]
+    if len(k) < KD_WARMUP_DAYS or any(v is None for v in k):
+        return None
+    return k, d
+
+
 def holder_window(holder_dates, as_of):
     """由集保日期（由舊到新）決定比較區間，回傳 (base, latest, trail_dates, 問題說明或 None)。
 
     以日曆天數驗證：基準週必須落在最新週往前 7 × BIG_HOLDER_WEEKS_BACK 天（±容許天數）內，
-    最新週也不能比篩選日舊太多；不符合就回傳 None 區間與原因，大戶條件會全部不通過。"""
+    最新週也不能比篩選日舊太多；不符合就回傳 None 區間與原因，名單的大戶占比Δ欄會是空的
+    （big_holder 規則啟用時則全部不通過）。"""
     holder_dates = [d for d in holder_dates if d <= as_of]
     if not holder_dates:
-        return None, None, [], "沒有集保資料"
+        return None, None, [], "沒有集保資料，大戶占比欄位空白"
     latest = holder_dates[-1]
     latest_day = datetime.strptime(latest, "%Y-%m-%d").date()
     stale = (datetime.strptime(as_of, "%Y-%m-%d").date() - latest_day).days
     if stale > HOLDER_MAX_STALE_DAYS:
-        return None, None, [], f"集保最新資料 {latest} 距篩選日 {as_of} 已 {stale} 天，大戶條件已略過"
+        return None, None, [], f"集保最新資料 {latest} 距篩選日 {as_of} 已 {stale} 天，大戶占比欄位空白"
     target = BIG_HOLDER_WEEKS_BACK * 7
     candidates = [(abs((latest_day - datetime.strptime(d, "%Y-%m-%d").date()).days - target), d)
                   for d in holder_dates[:-1]]
     if not candidates or min(candidates)[0] > HOLDER_GAP_TOLERANCE_DAYS:
         return None, None, [], (f"集保缺少 {latest} 往前 {BIG_HOLDER_WEEKS_BACK} 週的資料，"
-                                "大戶條件已略過（請補回集保歷史）")
+                                "大戶占比欄位空白（請補回集保歷史）")
     base = min(candidates)[1]
     return base, latest, [d for d in holder_dates if base <= d <= latest], None
 
@@ -202,9 +256,9 @@ def compute_metrics(db_path, as_of, directory=None, warnings=None):
     # max_age_days 設很大：篩選只讀現有產業對照表，不觸發網路重抓（對照表由其他流程更新）
     directory = directory if directory is not None else history.get_industry_directory(
         db_path, max_age_days=10 ** 6)
-    need_days = max(MFI_PERIOD + 1, VOLUME_RATIO_DAYS + 1)
+    need_days = max(MFI_PERIOD + 1, VOLUME_RATIO_DAYS + 1, KD_PERIOD - 1 + KD_WARMUP_DAYS)
     warnings = [] if warnings is None else warnings
-    mfi_missing = 0
+    mfi_missing = kd_missing = 0
     conn = history._connect(db_path)
     try:
         dates = [r[0] for r in conn.execute(
@@ -213,10 +267,10 @@ def compute_metrics(db_path, as_of, directory=None, warnings=None):
         if not dates:
             return {}, (None, None)
         series = defaultdict(list)
-        for date, ticker, close, change, volume, value in conn.execute(
-                "SELECT date, ticker, close, change_pct, volume, trading_value FROM daily_prices "
+        for date, ticker, close, change, volume, value, high, low in conn.execute(
+                "SELECT date, ticker, close, change_pct, volume, trading_value, high, low FROM daily_prices "
                 "WHERE date >= ? AND date <= ? ORDER BY date", (dates[0], as_of)):
-            series[ticker].append((date, close, change, volume, value))
+            series[ticker].append((date, close, change, volume, value, high, low))
     finally:
         conn.close()
 
@@ -255,20 +309,30 @@ def compute_metrics(db_path, as_of, directory=None, warnings=None):
         if not (len(ticker) == 4 and ticker.isdigit()) or not rows or rows[-1][0] != as_of:
             continue
         # 沒成交的日子（沒有報價列，或收盤價空白）以前一個收盤價延續、資金流算 0（平盤，不計入正負），
-        # 這樣冷門股停牌／沒成交也能算；第一個有收盤價之前的日子不補，所以新上市天數不足仍會是 None
+        # KD 的最高＝最低＝前收；這樣冷門股停牌／沒成交也能算；第一個有收盤價之前的日子不補，
+        # 所以新上市天數不足仍會是 None
         by_date = {r[0]: r for r in rows}
-        closes, values = [], []
+        closes, values, bars = [], [], []
         for d in dates:
             r = by_date.get(d)
             if r is not None and r[1] is not None:
                 closes.append(r[1])
                 values.append(r[4] or 0.0)
+                bars.append((r[5], r[6], r[1]))
             elif closes:
                 closes.append(closes[-1])
                 values.append(0.0)
+                bars.append((closes[-1], closes[-1], closes[-1]))
         mfi = calculate_mfi(closes, values)
         if mfi is None:
             mfi_missing += 1
+        kd = calculate_kd(bars)
+        kd_k = kd_d = kd_state = kd_dull_days = None
+        if kd is None:
+            kd_missing += 1
+        else:
+            kd_k, kd_d = kd[0][-1], kd[1][-1]
+            kd_state, kd_dull_days = kd_dullness(kd[0])
         volumes = [r[3] for r in rows]
         today = rows[-1]
         prev = [v for v in volumes[:-1][-VOLUME_RATIO_DAYS:] if v is not None]
@@ -298,9 +362,13 @@ def compute_metrics(db_path, as_of, directory=None, warnings=None):
             "margin_down_days": margin_down, "margin_change_pct": margin_change,
             "volume_ratio": volume_ratio,
             "mfi": mfi,
+            "kd_k": kd_k, "kd_d": kd_d, "kd_state": kd_state, "kd_dull_days": kd_dull_days,
         }
     if mfi_missing:
         warnings.append(f"{mfi_missing} 檔因有效報價不足 {MFI_PERIOD + 1} 筆（多半是新上市）無法計算 MFI")
+    if kd_missing:
+        warnings.append(f"{kd_missing} 檔缺最高／最低價或有效報價不足 {KD_PERIOD - 1 + KD_WARMUP_DAYS} 個交易日，"
+                        "無法計算 KD（舊日子的高低價請先執行 scripts/backfill_high_low.py）")
     return metrics, (base, latest)
 
 
@@ -333,10 +401,10 @@ def run_screen(db_path, as_of=None, directory=None):
     try:
         conn.execute("DELETE FROM screener_results WHERE date = ?", (as_of,))
         conn.executemany(
-            "INSERT INTO screener_results (date, ticker, name, industry, market, close, change_pct, big_delta, big_latest, big_trail, margin_down_days, margin_change_pct, volume_ratio, mfi) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO screener_results (date, ticker, name, industry, market, close, change_pct, big_delta, big_latest, big_trail, margin_down_days, margin_change_pct, volume_ratio, mfi, kd_k, kd_d, kd_state, kd_dull_days) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [(as_of, m["ticker"], m["name"], m["industry"], m["market"], m["close"], m["change_pct"],
               m["big_delta"], m["big_latest"], json.dumps(m["big_trail"]), m["margin_down_days"], m["margin_change_pct"],
-              m["volume_ratio"], m["mfi"]) for m in matched])
+              m["volume_ratio"], m["mfi"], m["kd_k"], m["kd_d"], m["kd_state"], m["kd_dull_days"]) for m in matched])
         conn.execute(
             "INSERT OR REPLACE INTO screener_runs VALUES (?,?,?,?,?,?)",
             (as_of, len(metrics), len(matched), json.dumps(counts),

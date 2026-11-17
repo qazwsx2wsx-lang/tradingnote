@@ -29,6 +29,13 @@ def main():
             print(f"上櫃價格缺漏：補上 {gaps['filled']}／{gaps['total']} 天")
     except Exception as exc:  # noqa: BLE001
         print(f"上櫃價格補缺失敗：{exc}")
+    # 最高／最低價（選股 KD 用）：補完一次之後每天通常只剩 0～1 天要補
+    try:
+        high_low = history.backfill_high_low(APP_PATHS.history_db, days=screener.KD_BACKFILL_DAYS)
+        if high_low["total"]:
+            print(f"最高最低價：補上 {high_low['filled']}／{high_low['total']} 筆（日期×市場）")
+    except Exception as exc:  # noqa: BLE001
+        print(f"最高最低價補缺失敗：{exc}")
     # 籌碼資料：失敗只印訊息，不影響法人流程的結果與 exit code
     try:
         margin = chips.backfill_margin(APP_PATHS.history_db)

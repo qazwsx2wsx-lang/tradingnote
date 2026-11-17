@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from datetime import date, timedelta
@@ -240,6 +241,44 @@ class BackfillTwseHistoryTests(unittest.TestCase):
             )
         self.assertEqual(done, 0)
         self.assertEqual(fetch_mock.call_count, 10)
+
+
+class ConnectLockTests(unittest.TestCase):
+    """schema 完整時 _connect 只讀不寫，另一條連線握著寫入鎖也能立刻打開、讀取。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "history.db"
+        history._connect(self.db).close()
+
+    def _short_timeout_connect(self):
+        real_connect = sqlite3.connect
+        return patch.object(history.sqlite3, "connect",
+                            lambda *a, **k: real_connect(*a, **{**k, "timeout": 0.2}))
+
+    def test_connect_and_read_while_another_connection_holds_write_lock(self):
+        holder = sqlite3.connect(self.db, isolation_level=None)
+        self.addCleanup(holder.close)
+        holder.execute("BEGIN IMMEDIATE")
+        holder.execute("UPDATE analysis_revision SET revision = revision")
+        try:
+            with self._short_timeout_connect():
+                self.assertEqual(history.get_data_revision(self.db), 0)
+                conn = history._connect(self.db)
+                conn.close()
+        finally:
+            holder.execute("ROLLBACK")
+
+    def test_missing_schema_parts_are_recreated(self):
+        conn = sqlite3.connect(self.db)
+        conn.execute("DROP TRIGGER revision_daily_prices_INSERT")
+        conn.execute("DELETE FROM analysis_revision")
+        conn.commit()
+        conn.close()
+        history._connect(self.db).close()
+        history.upsert_daily_prices(self.db, [("2026-11-17", "1111", "TWSE", "甲", 10.0, 1.0, 1, 1.0)])
+        self.assertEqual(history.get_data_revision(self.db), 1)
 
 
 if __name__ == "__main__":
