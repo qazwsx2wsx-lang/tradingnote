@@ -1,6 +1,8 @@
 # tradingnote 現況（STATUS.md）
 
 ## 必讀簡介（2026-11-17）
+- **git**：下面 11-09～11-17 標「未 commit」的異動（含 10-30 KD 鈍化）都已 commit 在分支 `feat/futures-backtest-kd-screener`（`ad4fed0`）並 push，
+  **尚未合併回 `main`**（`main` 本機比 origin 多 3 個 commit，也還沒 push）。另有 `stash@{0}`「pre-pull WIP 2026-11-17」是 pull 前的備份，內容已在分支裡，可刪。
 - **Claude（2026-11-17，每日選股移除「兩週內大戶增加」條件，未 commit）**：user 要求刪除條件 1。集保週資料停在 2026-10-16（只有 `scripts/fetch_daily.py` 會抓，
   GUI 自動同步不抓、本機也沒排程），所以 11-09、11-17 都是 0 檔。`RULES` 裡 `big_holder` 改成註解（比照 10-14 停用融資），大戶占比Δ／走勢欄仍顯示。
   真實資料庫**副本**重篩：11-09 入選 144 檔、11-17 入選 83 檔（低檔鈍化 70、高檔 13）。**正式資料庫存的 11-17 仍是 0 檔**，重開 app 後在「每日選股」按重新篩選才會更新。
