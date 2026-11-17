@@ -1,6 +1,8 @@
 # tradingnote 現況（STATUS.md）
 
 ## 必讀簡介（2026-10-21）
+- **Claude（2026-11-11，玉山即時報價，未 commit）**：新增「即時報價」分頁＋部位現價改用即時價（連線中）。程式在 `tradingnote_esun.py`、`ui/tabs/quotes_tab.py`，金鑰在設定頁填（`esun_*`，明文存 `data/settings.json`）。
+  **還沒做**：沒用真玉山帳號實測（本機沒裝 `esun_marketdata` wheel，在 `~/Documents/Vibecoding/esun/`）；打包沒納入 SDK；下單功能刻意不整合。細節見 CHANGELOG 2026-11-11。
 - **Claude（2026-10-21，啟動／切頁卡頓，未 commit）**：量測後把 GUI thread 上最慢的同步 DB 查詢搬走：每日選股的日期掃描／重篩／讀結果改背景（`_start_screener_task`）、
   `screen_dates`／`get_available_dates` 依資料修訂號快取、設定頁資料庫狀態改背景。副本實測啟動建構阻塞 6.3s→1.1s、GUI 最大停頓約 3.5s→0.15~0.27s。
   **還沒做**：`_connect` 每次跑 DDL、前 50／族群清單的大戶與法人查詢仍在 GUI thread、`get_industry_map` 過期時 positions_tab 會在 GUI thread 連網（細節與依據見 CHANGELOG 2026-10-21）。

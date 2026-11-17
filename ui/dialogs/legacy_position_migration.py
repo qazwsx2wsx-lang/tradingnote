@@ -6,7 +6,7 @@ initial_stop_loss 是必填欄位，但舊部位從來沒有停損價，所以�
 
 from PySide6 import QtWidgets
 
-from ui.widgets import DialogBase, accent_button
+from ui.widgets import DialogBase, accent_button, show_error
 
 _COLUMNS = ["代號", "名稱", "股數", "成本價", "進場日期", "初始停損價 (必填)"]
 
@@ -69,8 +69,9 @@ class LegacyPositionMigrationDialog(DialogBase):
                 if value <= 0:
                     raise ValueError
             except ValueError:
-                QtWidgets.QMessageBox.critical(
-                    self, "錯誤", f"{position.ticker} 的初始停損價必須是大於 0 的數字。"
+                show_error(
+                    self, "錯誤", f"{position.ticker} 的初始停損價必須是大於 0 的數字。",
+                    level="critical",
                 )
                 return
             stop_losses.append(value)
@@ -78,9 +79,10 @@ class LegacyPositionMigrationDialog(DialogBase):
         try:
             self.on_submit(list(zip(self.legacy_positions, stop_losses)))
         except Exception as e:
-            QtWidgets.QMessageBox.critical(
+            show_error(
                 self, "搬遷失敗",
                 f"搬遷過程發生錯誤，尚未標記為已完成，下次啟動會再次詢問：\n{e}",
+                level="critical",
             )
             return
         self.accept()

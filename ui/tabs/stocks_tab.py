@@ -15,7 +15,7 @@ from ui.badges import _populate_badge_row, _stock_trend_badges
 from ui.components.stat_card import StatCard
 from ui.dialogs.stock_detail import StockDetailDialog
 from ui.theme import COLOR_ACCENT, COLOR_LOSS, COLOR_MUTED
-from ui.widgets import _clear_layout, _set_standard_icon, accent_button
+from ui.widgets import _clear_layout, _set_standard_icon, accent_button, show_error
 
 
 class StocksTabMixin:
@@ -112,7 +112,7 @@ class StocksTabMixin:
         try:
             directory = get_industry_directory(app_paths.HISTORY_DB_PATH)
         except PriceFetchError as e:
-            QtWidgets.QMessageBox.warning(self, "錯誤", f"無法取得產業分類資料：{e}")
+            show_error(self, "錯誤", f"無法取得產業分類資料：{e}")
             return
 
         groups = {}

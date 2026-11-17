@@ -31,6 +31,14 @@ DEFAULT_SETTINGS = {
     # FinMind（finmindtrade.com）API token，用於「個股」模組查詢本益比／法人買賣，
     # 留空仍可打 API 但額度極低、部分資料集查不到。CLI／GUI 共用同一份 settings.json。
     "finmind_token": "",
+    # 玉山證券 Market Data SDK（「即時報價」分頁；見 tradingnote_esun.py）。
+    # 金鑰／密鑰以明文存在 settings.json（data/ 已被 .gitignore 排除），憑證 .p12 只存路徑。
+    "esun_api_key": "",
+    "esun_api_secret": "",
+    "esun_cert_path": "",
+    "esun_account": "",
+    "esun_environment": "SIMULATION",
+    "esun_entry": "https://esuntradingapi-simulation.esunsec.com.tw/api/v1",
 }
 
 

@@ -44,7 +44,7 @@ from ui.theme import (
     ENTITY_COLORS,
     SERIES_PALETTE,
 )
-from ui.widgets import _set_standard_icon
+from ui.widgets import _set_standard_icon, show_error
 
 
 class FlowTabMixin:
@@ -440,7 +440,7 @@ class FlowTabMixin:
 
         def on_error(message):
             self._flow_refresh_in_flight = False
-            QtWidgets.QMessageBox.warning(self, "錯誤", f"資金流向分析失敗：{message}")
+            show_error(self, "錯誤", f"資金流向分析失敗：{message}")
             if self._flow_refresh_pending_request is not None:
                 self._start_flow_refresh()
 

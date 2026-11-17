@@ -6,6 +6,14 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 
 ---
 
+## 2026-11-11 整合玉山即時報價（新「即時報價」分頁＋部位即時現價）
+
+**動機**：把 `~/Documents/Vibecoding/esun/quote_cli.py`（玉山 Market Data SDK 的終端機報價板）整合進 tradingnote。user 選的範圍：報價分頁＋部位現價串接，不含下單（`esun/index.py` 沒搬）。
+**改法**：`tradingnote_esun.py`（無 Qt，SDK 注入）含 `QuoteSession`（監控清單、WebSocket 日盤／股票、期貨夜盤 5 秒輪詢）與設定／時段純函式；`ui/tabs/quotes_tab.py` 為新分頁（連線、加入／移除、中文關鍵字搜尋、1 秒合併重繪）；
+設定頁新增「玉山證券即時報價」區塊（`esun_*` 寫入 `data/settings.json`，明文，不進 git；憑證只存路徑）；`positions_tab.py` 的現價改走 `_position_price`（連線中用即時價取代快照收盤價），報價更新時只重算現價／損益欄（`_refresh_position_live_prices`），連線後自動訂閱 OPEN 部位代號。
+**驗證**：`test_tradingnote_esun.py`（fake SDK：設定、時段、報價欄位、訂閱／推播／搜尋）、`test_tradingnote_quotes_gui.py`（offscreen）；全套 275 個測試只剩既有的 `test_tradingnote_flow_gui` 失敗。
+**沒有**：實際連玉山（本機沒裝 `esun_marketdata` wheel，也沒用真金鑰測）；打包（`tradingnote.spec`）沒處理 SDK；夜盤只做 REST 輪詢，與原 CLI 相同。
+
 ## 2026-10-21 啟動／切頁卡頓：耗時 DB 查詢移出 GUI thread
 
 **動機**：user 回報啟動與切頁不順；原則是 GUI thread 不做耗時工作。用 offscreen 載入真實資料庫副本、5ms QTimer 量 GUI thread 最大停頓＋cProfile，找到最大兩個同步瓶頸。
