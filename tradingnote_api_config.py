@@ -83,3 +83,6 @@ TDCC_HOLDERS_URL = "https://opendata.tdcc.com.tw/getOD.ashx?id=1-5"
 # 集保官網「集保戶股權分散表」歷史查詢（約一年、逐檔逐週、免驗證碼；表單 token 一次性，
 # 每次回應都會帶下一個）
 TDCC_QUERY_URL = "https://www.tdcc.com.tw/portal/zh/smWeb/qryStock"
+
+# 玉山證券 API 預設進入點（模擬環境）；設定頁的 esun_entry 留空時用這個，正式環境由使用者在設定頁改
+ESUN_SIMULATION_ENTRY = "https://esuntradingapi-simulation.esunsec.com.tw/api/v1"

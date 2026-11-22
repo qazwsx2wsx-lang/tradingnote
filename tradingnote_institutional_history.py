@@ -354,13 +354,7 @@ def fetch_day(db_path, day, delay_seconds=DEFAULT_DELAY_SECONDS, log=print):
 
 
 def _price_counts(db_path, iso):
-    conn = history._connect(db_path)
-    try:
-        return dict(conn.execute(
-            "SELECT market, COUNT(*) FROM daily_prices WHERE date = ? GROUP BY market", (iso,)
-        ).fetchall())
-    finally:
-        conn.close()
+    return history.market_row_counts(db_path, iso).get(iso, {})
 
 
 def completed_dates(db_path):

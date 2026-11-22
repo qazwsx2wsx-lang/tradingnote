@@ -482,6 +482,26 @@ def recalculate_trade_rollup(db_path, trade_id):
         conn.close()
 
 
+def existing_source_keys(db_path, keys):
+    """trade_executions 裡已存在的 source_key（匯入時判斷重複用）。"""
+    conn = _connect(db_path)
+    try:
+        found = set()
+        keys = list(keys)
+        for start in range(0, len(keys), 500):
+            chunk = keys[start:start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            found.update(
+                row[0] for row in conn.execute(
+                    f"SELECT source_key FROM trade_executions WHERE source_key IN ({placeholders})",
+                    chunk,
+                )
+            )
+        return found
+    finally:
+        conn.close()
+
+
 def record_execution(
     db_path,
     trade_id,

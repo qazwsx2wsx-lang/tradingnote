@@ -15,19 +15,15 @@
 """
 
 import csv
-import http.client
-import http.cookiejar
 import io
 import re
 import sqlite3
 import time
-import urllib.parse
 from pathlib import Path
-from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 import tradingnote_history as history
 from tradingnote_api_config import TDCC_HOLDERS_URL, TDCC_QUERY_URL, TPEX_MARGIN_URL, TWSE_MARGIN_URL
-from tradingnote_http import PriceFetchError, http_get_json, to_float, to_int
+from tradingnote_http import HttpSession, PriceFetchError, http_get_json, http_get_text, to_float, to_int
 
 DEFAULT_TARGET_DAYS = 60
 DEFAULT_DELAY_SECONDS = 3.0
@@ -194,6 +190,38 @@ def backfill_margin(db_path, target_days=DEFAULT_TARGET_DAYS, delay_seconds=DEFA
     return written
 
 
+def margin_window(db_path, as_of, n_dates):
+    """as_of（含）往前 n_dates 個有融資資料的日子：(dates 由舊到新, {ticker: {date: 融資餘額}})。"""
+    conn = _connect(db_path)
+    try:
+        dates = [r[0] for r in conn.execute(
+            "SELECT DISTINCT date FROM daily_margin WHERE date <= ? ORDER BY date DESC LIMIT ?",
+            (as_of, n_dates))][::-1]
+        balances = {}
+        if dates:
+            for date, ticker, balance in conn.execute(
+                    "SELECT date, ticker, margin_balance FROM daily_margin WHERE date >= ? AND date <= ?",
+                    (dates[0], as_of)):
+                balances.setdefault(ticker, {})[date] = balance
+        return dates, balances
+    finally:
+        conn.close()
+
+
+def big_holder_pct_by_date(db_path, dates):
+    """{集保日: {ticker: 400 張以上（級別 BIG～HUGE）持股占比合計}}。"""
+    conn = _connect(db_path)
+    try:
+        return {
+            date: dict(conn.execute(
+                "SELECT ticker, SUM(pct) FROM tdcc_holders WHERE data_date = ? "
+                "AND level BETWEEN ? AND ? GROUP BY ticker", (date, BIG_HOLDER_LEVEL, HUGE_HOLDER_LEVEL)))
+            for date in dates
+        }
+    finally:
+        conn.close()
+
+
 def margin_history(db_path, ticker, days=60):
     """個股近 days 天的融資融券餘額（由舊到新）：[(date, margin_balance, short_balance)]。"""
     conn = _connect(db_path)
@@ -225,9 +253,8 @@ def parse_tdcc_csv(text):
 
 def _fetch_tdcc_text(url=TDCC_HOLDERS_URL):
     try:
-        with urlopen(Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=60) as resp:
-            return resp.read().decode("utf-8-sig")
-    except (OSError, ValueError, http.client.HTTPException) as exc:
+        return http_get_text(url, encoding="utf-8-sig", timeout=60)
+    except PriceFetchError as exc:
         raise PriceFetchError(f"集保資料抓取失敗：{exc}") from exc
 
 
@@ -251,11 +278,7 @@ def fetch_tdcc_snapshot(db_path, text=None, log=print):
     if data_date in tdcc_dates(db_path):
         log(f"集保 {data_date}：已存在")
         return data_date
-    conn = history._connect(db_path)
-    try:
-        known = {r[0] for r in conn.execute("SELECT DISTINCT ticker FROM daily_prices")}
-    finally:
-        conn.close()
+    known = history.known_tickers(db_path)
     keep = [r for r in rows if r[1] in known] if known else rows
     conn = _connect(db_path)
     try:
@@ -313,17 +336,15 @@ class TdccQueryClient:
     """集保官網查詢的 session：表單 token 是一次性的，每次回應帶下一個，所以請求要循序進行。"""
 
     def __init__(self, timeout=30):
-        self._opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
-        self._opener.addheaders = [("User-Agent", "Mozilla/5.0")]
-        self._timeout = timeout
+        self._session = HttpSession(timeout=timeout)
         self._token = None
         self._dates = []
         self._load_form()
 
     def _load_form(self):
         try:
-            page = self._opener.open(TDCC_QUERY_URL, timeout=self._timeout).read().decode("utf-8", "replace")
-        except (OSError, ValueError, http.client.HTTPException) as exc:
+            page = self._session.get_text(TDCC_QUERY_URL)
+        except PriceFetchError as exc:
             raise PriceFetchError(f"集保查詢頁連線失敗：{exc}") from exc
         match = _TOKEN_RE.search(page)
         if not match:
@@ -340,15 +361,15 @@ class TdccQueryClient:
         """查一檔一週；回傳 parse_tdcc_query 的列（查無資料為 []）。失敗拋 PriceFetchError。"""
         if self._token is None:
             self._load_form()
-        data = urllib.parse.urlencode({
+        fields = {
             "SYNCHRONIZER_TOKEN": self._token, "SYNCHRONIZER_URI": "/portal/zh/smWeb/qryStock",
             "method": "submit", "firDate": self._dates[0] if self._dates else ymd,
             "scaDate": ymd, "sqlMethod": "StockNo", "stockNo": ticker, "stockName": "",
-        }).encode()
+        }
         self._token = None  # token 已用掉；回應沒帶新的就下次重新載入表單
         try:
-            page = self._opener.open(TDCC_QUERY_URL, data, timeout=self._timeout).read().decode("utf-8", "replace")
-        except (OSError, ValueError, http.client.HTTPException) as exc:
+            page = self._session.post_form(TDCC_QUERY_URL, fields)
+        except PriceFetchError as exc:
             raise PriceFetchError(f"集保查詢連線失敗：{exc}") from exc
         match = _TOKEN_RE.search(page)
         if match:

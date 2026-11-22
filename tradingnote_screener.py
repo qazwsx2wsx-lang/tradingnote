@@ -30,7 +30,6 @@
 
 import json
 import sqlite3
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -161,14 +160,7 @@ def screen_dates(db_path):
     cached = _screen_dates_cache.get(key)
     if cached is not None and cached[0] == revision:
         return list(cached[1])
-    conn = history._connect(db_path)
-    try:
-        counts = defaultdict(dict)
-        for date, market, n in conn.execute(
-                "SELECT date, market, COUNT(*) FROM daily_prices GROUP BY date, market"):
-            counts[date][market] = n
-    finally:
-        conn.close()
+    counts = history.market_row_counts(db_path)
     dates = sorted(d for d, c in counts.items()
                    if c.get("TWSE", 0) >= MIN_PRICE_ROWS and c.get("TPEX", 0) >= MIN_PRICE_ROWS)
     _screen_dates_cache[key] = (revision, dates)
@@ -259,49 +251,17 @@ def compute_metrics(db_path, as_of, directory=None, warnings=None):
     need_days = max(MFI_PERIOD + 1, VOLUME_RATIO_DAYS + 1, KD_PERIOD - 1 + KD_WARMUP_DAYS)
     warnings = [] if warnings is None else warnings
     mfi_missing = kd_missing = 0
-    conn = history._connect(db_path)
-    try:
-        dates = [r[0] for r in conn.execute(
-            "SELECT DISTINCT date FROM daily_prices WHERE date <= ? ORDER BY date DESC LIMIT ?",
-            (as_of, need_days + PRICE_SLACK_DAYS))][::-1]
-        if not dates:
-            return {}, (None, None)
-        series = defaultdict(list)
-        for date, ticker, close, change, volume, value, high, low in conn.execute(
-                "SELECT date, ticker, close, change_pct, volume, trading_value, high, low FROM daily_prices "
-                "WHERE date >= ? AND date <= ? ORDER BY date", (dates[0], as_of)):
-            series[ticker].append((date, close, change, volume, value, high, low))
-    finally:
-        conn.close()
+    # 價格、融資、集保都是別的模組擁有的表，一律透過擁有模組的唯讀函式讀
+    dates, series = history.price_window(db_path, as_of, need_days + PRICE_SLACK_DAYS)
+    if not dates:
+        return {}, (None, None)
 
-    margin_days = max(MARGIN_DOWN_DAYS + 1, 2)
-    conn = _connect(db_path)
-    try:
-        mdates = [r[0] for r in conn.execute(
-            "SELECT DISTINCT date FROM daily_margin WHERE date <= ? ORDER BY date DESC LIMIT ?",
-            (as_of, margin_days))][::-1]
-        margin = defaultdict(dict)
-        for date, ticker, balance in conn.execute(
-                "SELECT date, ticker, margin_balance FROM daily_margin WHERE date >= ? AND date <= ?",
-                (mdates[0], as_of)) if mdates else ():
-            margin[ticker][date] = balance
-    finally:
-        conn.close()
+    mdates, margin = chips.margin_window(db_path, as_of, max(MARGIN_DOWN_DAYS + 1, 2))
 
     base, latest, trail_dates, holder_problem = holder_window(chips.tdcc_dates(db_path), as_of)
     if holder_problem:
         warnings.append(holder_problem)
-    big = {}
-    if latest:
-        conn = chips._connect(db_path)
-        try:
-            for date in trail_dates:
-                big[date] = dict(conn.execute(
-                    "SELECT ticker, SUM(pct) FROM tdcc_holders WHERE data_date = ? "
-                    f"AND level BETWEEN {chips.BIG_HOLDER_LEVEL} AND {chips.HUGE_HOLDER_LEVEL} "
-                    "GROUP BY ticker", (date,)))
-        finally:
-            conn.close()
+    big = chips.big_holder_pct_by_date(db_path, trail_dates) if latest else {}
 
     metrics = {}
     for ticker, info in directory.items():

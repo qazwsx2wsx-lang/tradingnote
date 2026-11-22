@@ -9,7 +9,9 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from tradingnote_api_config import TPEX_PERATIO_URL, TPEX_URL, TWSE_URL, TWSE_VALUATION_URL
+from tradingnote_api_config import (
+    ESUN_SIMULATION_ENTRY, TPEX_PERATIO_URL, TPEX_URL, TWSE_URL, TWSE_VALUATION_URL,
+)
 from tradingnote_cache import TTLCache, load_fresh_file_cache, load_stale_file_cache, write_file_cache
 from tradingnote_http import PriceFetchError, http_get_json, to_float, to_int
 
@@ -38,7 +40,7 @@ DEFAULT_SETTINGS = {
     "esun_cert_path": "",
     "esun_account": "",
     "esun_environment": "SIMULATION",
-    "esun_entry": "https://esuntradingapi-simulation.esunsec.com.tw/api/v1",
+    "esun_entry": ESUN_SIMULATION_ENTRY,
 }
 
 

@@ -10,9 +10,13 @@
 
 import gzip
 import http.client
+import http.cookiejar
 import json
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlencode
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
+
+_BROWSER_UA = "Mozilla/5.0"
 
 
 class PriceFetchError(Exception):
@@ -76,6 +80,49 @@ def http_post_text(url, data, encoding="utf-8", timeout=30):
         raise PriceFetchError(f"連線失敗（回應中斷）：{e}") from e
     except OSError as e:
         raise PriceFetchError(f"回傳資料格式錯誤：{e}") from e
+
+
+def _read_text(open_fn, encoding):
+    """執行 open_fn() 取得回應並解碼成文字；例外包裝規則同 http_post_text。"""
+    try:
+        with open_fn() as resp:
+            raw = resp.read()
+            if resp.headers.get("Content-Encoding") == "gzip":
+                raw = gzip.decompress(raw)
+            return raw.decode(encoding, "replace")
+    except HTTPError as e:
+        raise PriceFetchError(f"連線失敗（HTTP {e.code}）：{e}") from e
+    except URLError as e:
+        raise PriceFetchError(f"連線失敗：{e}") from e
+    except TimeoutError as e:
+        raise PriceFetchError(f"連線逾時：{e}") from e
+    except http.client.HTTPException as e:
+        raise PriceFetchError(f"連線失敗（回應中斷）：{e}") from e
+    except (OSError, ValueError) as e:
+        raise PriceFetchError(f"連線失敗：{e}") from e
+
+
+def http_get_text(url, encoding="utf-8", timeout=30):
+    """GET 一個文字（CSV／HTML）端點，帶瀏覽器 User-Agent（集保等網站沒帶會被擋）。"""
+    return _read_text(
+        lambda: urlopen(Request(url, headers={"User-Agent": _BROWSER_UA}), timeout=timeout), encoding)
+
+
+class HttpSession:
+    """保留 cookie 的連續請求（例如集保查詢：表單 token 綁 session，必須同一個 cookie jar 循序送）。
+    回傳解碼後文字，失敗一律拋 PriceFetchError。"""
+
+    def __init__(self, timeout=30):
+        self._opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self._opener.addheaders = [("User-Agent", _BROWSER_UA)]
+        self._timeout = timeout
+
+    def get_text(self, url, encoding="utf-8"):
+        return _read_text(lambda: self._opener.open(url, timeout=self._timeout), encoding)
+
+    def post_form(self, url, fields, encoding="utf-8"):
+        body = urlencode(fields).encode()
+        return _read_text(lambda: self._opener.open(url, body, timeout=self._timeout), encoding)
 
 
 def to_float(value):

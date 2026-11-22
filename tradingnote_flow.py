@@ -8,9 +8,9 @@
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 
-from tradingnote_history import (
+from tradingnote_history import (  # noqa: F401  FlowPeriod 由這裡 re-export（定義在 history，避免循環 import）
+    FlowPeriod,
     compute_group_flow,
-    get_available_dates,
     get_data_revision,
     analysis_snapshot,
     compute_group_valuation_flow,
@@ -29,47 +29,6 @@ from tradingnote_institutional import (
     aggregate_institutional_by_group,
     load_cached_institutional_snapshot,
 )
-
-
-@dataclass(frozen=True)
-class FlowPeriod:
-    """資金流向頁共用的分析期間。"""
-
-    start_date: str
-    trading_days: int
-    end_date: str | None = None
-    actual_dates: tuple = ()
-    prior_dates: tuple = ()
-
-    @property
-    def sufficient(self):
-        return len(self.actual_dates) == self.trading_days
-
-    def resolve(self, db_path, snapshot):
-        end = self.end_date or max((p.date for p in snapshot.values() if p.date), default=self.start_date)
-        dates = set(get_available_dates(db_path)) | {p.date for p in snapshot.values() if p.date}
-        available = sorted(d for d in dates if d <= end)
-        end = available[-1] if available else end
-        dates = [d for d in available if self.start_date <= d][-self.trading_days:]
-        return replace(self, end_date=end, actual_dates=tuple(dates),
-                       prior_dates=tuple(d for d in available if d < end))
-
-    def __post_init__(self):
-        if not self.start_date:
-            raise ValueError("資金流向期間需要起始日期")
-        if int(self.trading_days) < 1:
-            raise ValueError("資金流向期間至少需要 1 個交易日")
-        object.__setattr__(self, "trading_days", int(self.trading_days))
-
-    @property
-    def recent_days(self):
-        """估值模式使用的短期窗口。"""
-        return min(5, self.trading_days)
-
-    @property
-    def valuation_baseline_days(self):
-        """估值資金熱度至少以 20 日為基準，避免短長窗口相同。"""
-        return max(20, self.trading_days)
 
 
 @dataclass(frozen=True)

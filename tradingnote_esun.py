@@ -16,7 +16,9 @@ import threading
 from configparser import ConfigParser
 from datetime import datetime, time as dtime
 
-DEFAULT_ENTRY = "https://esuntradingapi-simulation.esunsec.com.tw/api/v1"
+from tradingnote_api_config import ESUN_SIMULATION_ENTRY
+
+DEFAULT_ENTRY = ESUN_SIMULATION_ENTRY
 DEFAULT_ENVIRONMENT = "SIMULATION"
 AFTERHOURS_POLL_SECONDS = 5
 

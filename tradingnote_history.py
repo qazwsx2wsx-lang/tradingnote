@@ -257,9 +257,53 @@ def get_data_revision(db_path):
         conn.close()
 
 
+@dataclass(frozen=True)
+class FlowPeriod:
+    """資金流向頁共用的分析期間。
+
+    定義在這裡（而不是 tradingnote_flow.py）是因為本模組的流向計算函式也要建立預設期間；
+    放在 flow 會變成 history → flow → history 的循環 import。tradingnote_flow 會 re-export，
+    呼叫端照舊 `from tradingnote_flow import FlowPeriod`。"""
+
+    start_date: str
+    trading_days: int
+    end_date: str | None = None
+    actual_dates: tuple = ()
+    prior_dates: tuple = ()
+
+    @property
+    def sufficient(self):
+        return len(self.actual_dates) == self.trading_days
+
+    def resolve(self, db_path, snapshot):
+        end = self.end_date or max((p.date for p in snapshot.values() if p.date), default=self.start_date)
+        dates = set(get_available_dates(db_path)) | {p.date for p in snapshot.values() if p.date}
+        available = sorted(d for d in dates if d <= end)
+        end = available[-1] if available else end
+        dates = [d for d in available if self.start_date <= d][-self.trading_days:]
+        return replace(self, end_date=end, actual_dates=tuple(dates),
+                       prior_dates=tuple(d for d in available if d < end))
+
+    def __post_init__(self):
+        if not self.start_date:
+            raise ValueError("資金流向期間需要起始日期")
+        if int(self.trading_days) < 1:
+            raise ValueError("資金流向期間至少需要 1 個交易日")
+        object.__setattr__(self, "trading_days", int(self.trading_days))
+
+    @property
+    def recent_days(self):
+        """估值模式使用的短期窗口。"""
+        return min(5, self.trading_days)
+
+    @property
+    def valuation_baseline_days(self):
+        """估值資金熱度至少以 20 日為基準，避免短長窗口相同。"""
+        return max(20, self.trading_days)
+
+
 def load_analysis_history(db_path, snapshot, period=None, days=5, history_days=None):
     """Resolve one calendar and read prices without a calendar-day heuristic."""
-    from tradingnote_flow import FlowPeriod
     period = (period or FlowPeriod("0001-01-01", days)).resolve(db_path, snapshot)
     needed = period.actual_dates + period.prior_dates[-max(history_days or days, period.trading_days):]
     lower = min(needed, default=period.end_date)
@@ -863,6 +907,55 @@ def get_available_dates(db_path):
     dates = [row[0] for row in rows]
     _available_dates_cache[key] = (revision, dates)
     return list(dates)
+
+
+# ---------- 給其他模組的唯讀查詢（daily_prices 由本模組擁有，別的模組不要呼叫 _connect） ----------
+
+def known_tickers(db_path):
+    """daily_prices 出現過的所有代號（集保存檔時用來排除權證等衍生品）。"""
+    conn = _connect(db_path)
+    try:
+        return {row[0] for row in conn.execute("SELECT DISTINCT ticker FROM daily_prices")}
+    finally:
+        conn.close()
+
+
+def market_row_counts(db_path, date=None):
+    """{date: {market: 報價筆數}}；給 date 就只算那一天（判斷某市場當天資料是否完整）。"""
+    conn = _connect(db_path)
+    try:
+        if date is None:
+            rows = conn.execute("SELECT date, market, COUNT(*) FROM daily_prices GROUP BY date, market")
+        else:
+            rows = conn.execute(
+                "SELECT date, market, COUNT(*) FROM daily_prices WHERE date = ? GROUP BY market", (date,))
+        counts = {}
+        for day, market, n in rows:
+            counts.setdefault(day, {})[market] = n
+        return counts
+    finally:
+        conn.close()
+
+
+def price_window(db_path, as_of, n_dates):
+    """as_of（含）往前 n_dates 個有報價的日子。
+
+    回傳 (dates 由舊到新, {ticker: [(date, close, change_pct, volume, trading_value, high, low), ...]})，
+    每檔依日期排序；沒有任何日子時回傳 ([], {})。"""
+    conn = _connect(db_path)
+    try:
+        dates = [r[0] for r in conn.execute(
+            "SELECT DISTINCT date FROM daily_prices WHERE date <= ? ORDER BY date DESC LIMIT ?",
+            (as_of, n_dates))][::-1]
+        series = {}
+        if dates:
+            for row in conn.execute(
+                    "SELECT date, ticker, close, change_pct, volume, trading_value, high, low FROM daily_prices "
+                    "WHERE date >= ? AND date <= ? ORDER BY date", (dates[0], as_of)):
+                series.setdefault(row[1], []).append((row[0], *row[2:]))
+        return dates, series
+    finally:
+        conn.close()
 
 
 def trading_days_between(db_path, start_date, end_date=None):

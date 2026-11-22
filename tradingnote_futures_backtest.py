@@ -643,25 +643,6 @@ def parse_ssf_csv(path):
     return rows, errors
 
 
-def _existing_source_keys(db_path, keys):
-    conn = tj._connect(db_path)
-    try:
-        found = set()
-        keys = list(keys)
-        for start in range(0, len(keys), 500):
-            chunk = keys[start:start + 500]
-            placeholders = ",".join("?" * len(chunk))
-            found.update(
-                row[0] for row in conn.execute(
-                    f"SELECT source_key FROM trade_executions WHERE source_key IN ({placeholders})",
-                    chunk,
-                )
-            )
-        return found
-    finally:
-        conn.close()
-
-
 def _strategy_id(db_path, name, cache):
     if not name:
         return None
@@ -679,7 +660,7 @@ def import_ssf_rows(db_path, rows, code_lookup=None):
     既有未平倉的 SSF 交易會接續使用。code_lookup(stock_id, contract_size) → 期貨代號
     （GUI 傳期交所清單查詢；查詢失敗或不傳時代號留空，What-if 會跳過該筆）。"""
     result = ImportResult()
-    existing_keys = _existing_source_keys(db_path, [r.source_key for r in rows])
+    existing_keys = tj.existing_source_keys(db_path, [r.source_key for r in rows])
     state = {}
     for trade in tj.list_trades(db_path, status="OPEN", instrument=tj.INSTRUMENT_SSF):
         if trade.total_qty > 0:
