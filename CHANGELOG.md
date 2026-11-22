@@ -6,6 +6,39 @@ Append-only 的歷史變更記錄，新的加在最上面（跟以前 HANDOFF.md
 
 ---
 
+## 2026-11-22 收工前自我驗證（verify.py＋Stop hook）＋修好 test_tradingnote_flow_gui
+
+**動機**：user 要求在底層規則加自我驗證，必須正常運作才能收工，避免之後的 session 接手壞掉的狀態而浪費 token。
+**改法**：
+- 新增 `verify.py`：檢查是否用 `.venv`、全部 `.py` 能編譯、跑全部 unittest（`QT_QPA_PLATFORM=offscreen`、`TRADINGNOTE_DATA_DIR` 指向臨時目錄）。
+  通過只印一行；失敗只印 FAIL/ERROR 區塊（最多 120 行），省 token。`--hook` 模式給 Claude Code Stop hook 用：`.py` 內容雜湊跟上次通過時相同就直接放行
+  （只改文件時不重跑），失敗 exit 2 擋下收工，連續 3 次失敗才放行並要求寫進 STATUS.md。狀態存在 `.claude/verify_stamp.json`（gitignore）。
+- `.claude/settings.local.json` 加 Stop hook（`.claude/` 整個在 gitignore，只在這台機器生效）。
+- `AGENTS.md` 新增「收工前自我驗證（硬性規則）」，Codex 等沒有 hook 的工具要自己手動跑。
+- 修 `test_tradingnote_flow_gui`（從 10-13 起一直被標成「既有失敗」）：原因是 10-21 起 `refresh_flow_tab()` 改在背景執行緒跑，
+  測試卻在呼叫後立刻讀表格，讀到的是開窗時預設 5 日區間的結果（「實際有 4／需要 5 個交易日」）；另一個 ERROR 是同一個測試結束時背景執行緒還抓著臨時 `history.db`。
+  加 `_wait_flow_refresh()` 等背景分析套用完再檢查，兩個問題一起消失。產品程式碼沒改。
+**驗證**：`verify.py` 通過（336 tests，約 28 秒）；用系統 Python 3.14 執行會被擋；故意放一個失敗測試時 `--hook` 回 exit 2 且只印出該測試的 traceback；
+移除後通過，再跑一次因雜湊相同 0.7 秒放行。**未做**：Stop hook 在真正的 session 結束時觸發（要下一個 session 才會載入新設定）。
+
+## 2026-11-17 修正架構檢查發現的問題＋新增 test_architecture.py
+
+**動機**：依 ARCHITECTURE.md 規則做 AST 靜態檢查，找到 6 類不一致；user 要求修正。
+**改法**：
+- 不再呼叫別的模組的 `_connect()`（6 處）：擁有模組新增唯讀函式 `history.known_tickers`／`market_row_counts`／`price_window`、`chips.margin_window`／`big_holder_pct_by_date`、
+  `tradejournal.existing_source_keys`；`screener`（價格、融資、集保）、`chips`、`institutional_history`、`futures_backtest` 改用它們（screener 原本用自己的連線讀 `daily_margin` 也一併改掉）。
+- 循環 import：`FlowPeriod` 從 `tradingnote_flow.py` 搬到 `tradingnote_history.py`（history 的 `load_analysis_history` 原本在函式內 lazy import flow），flow re-export，呼叫端不用改。
+- 對外 HTTP：`tradingnote_http` 新增 `http_get_text`、`HttpSession`（cookie jar＋瀏覽器 UA），例外包裝與既有函式相同；`chips` 的集保 CSV 與逐週查詢 `TdccQueryClient` 改用它們，不再直接 import `urllib.request`／`http.client`。
+- 玉山預設進入點 `ESUN_SIMULATION_ENTRY` 移到 `tradingnote_api_config`（`tradingnote_core` 預設設定與 `tradingnote_esun.DEFAULT_ENTRY` 原本各寫一份）。
+- ARCHITECTURE.md：`tradingnote_single_instance` 列為 GUI 專用、`tradingnote_esun` 的 SDK lazy import 列為例外、補 9 張漏寫的表、分層圖補 5 個核心模組、八個分頁、跨模組讀寫規則（寫只經擁有者、不碰別人 `_connect`、單一查詢 JOIN 可唯讀）、模組行數。
+- 新增 `test_architecture.py`（9 項）：核心不 import UI／第三方、核心無循環（含 lazy import）、ui 依賴方向、`ui.app_paths` 用屬性讀、背景任務回傳值要留住、不呼叫別人的 `_connect`、
+  每張表一個擁有者且寫進文件、只有擁有者寫入、HTTP 與端點網址集中。前一版檢查把 `ui.badges → ui.components` 誤判為反向（components 是最底層），已修正分層。
+**驗證**：`test_architecture` 9 項通過；用 HEAD 版本的檔案跑同一份測試會抓到原本的循環、6 處 `_connect`、直接 HTTP、寫死網址（確認測試真的會擋）。全套 336 項只剩既有的 `test_tradingnote_flow_gui`（第 57 行）。
+實際連集保：CSV 4125 檔（2026-11-13 週）、`TdccQueryClient` 載入 51 週並循序查 2330／2317 各 17 級成功（第二次沿用 session token）。
+**未做**：`ARCHITECTURE.md`「已知架構債務」那 4 項（紅綠上色重複、history 的載入 N 天查詢重複、institutional 自帶重試、technical `_number` 與 `to_float` 重複）不在這次檢查範圍，沒處理；GUI 沒有重跑全功能冒煙測試（只有單元測試）。
+
+---
+
 ## 2026-11-17 每日選股移除「兩週內大戶增加」條件
 
 **動機**：全功能測試發現每日選股 11-09、11-17 都是 0 檔：集保 `tdcc_holders` 最新只到 2026-10-16（集保 CSV 只有最新一週，只有 `scripts/fetch_daily.py` 會抓；GUI 自動同步不抓，本機也沒有排程），

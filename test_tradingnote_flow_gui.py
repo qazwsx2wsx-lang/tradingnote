@@ -25,6 +25,18 @@ def _patch_gui_name(stack, name, **kwargs):
         stack.enter_context(patch.object(module, name, **kwargs))
 
 
+def _wait_flow_refresh(window, app, timeout=10.0):
+    """refresh_flow_tab() 在背景執行緒跑（2026-10-21 起），呼叫後要等結果套用到畫面才能檢查。"""
+    import time
+    deadline = time.monotonic() + timeout
+    while window._flow_refresh_in_flight or window._flow_refresh_pending_request is not None:
+        if time.monotonic() > deadline:
+            raise AssertionError("資金流向背景分析逾時")
+        app.processEvents()
+        time.sleep(0.01)
+    app.processEvents()
+
+
 class FlowGuiTests(unittest.TestCase):
     setUp = fixtures.FlowConsistencyTests.setUp
     period = fixtures.FlowConsistencyTests.period
@@ -54,12 +66,14 @@ class FlowGuiTests(unittest.TestCase):
                     self.assertEqual(window.page_stack.currentIndex(), index)
                 window.flow_period = self.period(3)
                 window.refresh_flow_tab()
+                _wait_flow_refresh(window, app)
                 self.assertEqual(window.flow_list.topLevelItem(0).text(5), '+21.00%')
                 conn = history._connect(self.db)
                 conn.execute("UPDATE daily_prices SET close=50 WHERE date='2026-09-11'")
                 conn.commit()
                 conn.close()
                 window._refresh_flow_on_revision()
+                _wait_flow_refresh(window, app)
                 self.assertEqual(window.flow_list.topLevelItem(0).text(5), '+142.00%')
                 scatter = next(item for item in window.flow_chart.getPlotItem().items
                                if isinstance(item, pg.ScatterPlotItem))
@@ -67,11 +81,13 @@ class FlowGuiTests(unittest.TestCase):
                 window.flow_period = self.period(1)
                 updated_snapshot = {'1111': replace(self.snapshot['1111'], change=21)}
                 window._apply_refresh_result(updated_snapshot, None)
+                _wait_flow_refresh(window, app)
                 self.assertEqual(window.flow_list.topLevelItem(0).text(5), '+21.00%')
                 window.snapshot = self.snapshot
                 for days in (1, 2, 3, 5):
                     window.flow_period = self.period(days)
                     window.refresh_flow_tab()
+                    _wait_flow_refresh(window, app)
                     rows = window.flow_service.get_group_top_stocks(self.snapshot, window.flow_period, '測試族群')
                     dialog = IndustryTopStocksDialog(window, '測試族群', rows, days)
                     if rows[0]['change_pct'] is not None:
