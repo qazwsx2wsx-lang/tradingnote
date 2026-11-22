@@ -4,8 +4,8 @@
 - **收工規則**：改過 `.py` 就要跑 `.venv/Scripts/python.exe verify.py`，全綠才能交接（見 AGENTS.md）。**最後一次 verify：通過，336 tests（2026-11-22）**。
   `test_tradingnote_flow_gui` 已修好，不再是「既有失敗」。Claude Code 的 Stop hook 會自動跑（`.claude/settings.local.json`）。
 - **Claude（2026-11-22，已 commit `89391cf`）**：新增 `verify.py`、Stop hook、AGENTS.md 驗證規則、修 `test_tradingnote_flow_gui`（測試沒等背景刷新）。細節見 CHANGELOG 2026-11-22。
-- **git**：工作目錄乾淨。下面所有標「未 commit」的異動（10-30～11-22）都已 commit 在分支 `feat/futures-backtest-kd-screener` 並 push（`ad4fed0`、`bed6d4f`、`89391cf`），
-  **尚未合併回 `main`**（`main` 本機比 origin 多 3 個 commit，也還沒 push）。另有 `stash@{0}`「pre-pull WIP 2026-11-17」是 pull 前的備份，內容已在分支裡，可刪。
+- **git**：工作目錄乾淨，在 `main`。下面所有標「未 commit」的異動（10-30～11-22）都已 commit（`ad4fed0`、`bed6d4f`、`89391cf`），
+  2026-11-23 以 fast-forward 合併進 `main` 並 push（merge 後 verify 通過，336 tests）。分支 `feat/futures-backtest-kd-screener` 已合併，可刪。另有 `stash@{0}`「pre-pull WIP 2026-11-17」是 pull 前的備份，內容已在分支裡，可刪。
 - **Claude（2026-11-17，修架構檢查問題，已 commit `bed6d4f`）**：不再呼叫別人的 `_connect()`（改用擁有模組新增的唯讀函式）、`FlowPeriod` 搬到 history 解掉循環 import、
   集保 HTTP 改走 `tradingnote_http.HttpSession`／`http_get_text`、玉山網址進 `tradingnote_api_config`、ARCHITECTURE.md 補齊。**新增 `test_architecture.py`**：新增 SQLite 表要寫進
   ARCHITECTURE.md「資料儲存」、不能呼叫別人的 `_connect`、HTTP／網址要集中，否則測試失敗。細節見 CHANGELOG 2026-11-17。
