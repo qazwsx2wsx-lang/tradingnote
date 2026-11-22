@@ -1,15 +1,15 @@
 # tradingnote 現況（STATUS.md）
 
-## 必讀簡介（2026-11-22）
+## 必讀簡介（2026-11-23）
 - **收工規則**：改過 `.py` 就要跑 `.venv/Scripts/python.exe verify.py`，全綠才能交接（見 AGENTS.md）。**最後一次 verify：通過，336 tests（2026-11-22）**。
   `test_tradingnote_flow_gui` 已修好，不再是「既有失敗」。Claude Code 的 Stop hook 會自動跑（`.claude/settings.local.json`）。
-- **Claude（2026-11-22，未 commit）**：新增 `verify.py`、Stop hook、AGENTS.md 驗證規則、修 `test_tradingnote_flow_gui`（測試沒等背景刷新）。細節見 CHANGELOG 2026-11-22。
-- **git**：下面 11-09～11-17 標「未 commit」的異動（含 10-30 KD 鈍化）都已 commit 在分支 `feat/futures-backtest-kd-screener`（`ad4fed0`）並 push，
+- **Claude（2026-11-22，已 commit `89391cf`）**：新增 `verify.py`、Stop hook、AGENTS.md 驗證規則、修 `test_tradingnote_flow_gui`（測試沒等背景刷新）。細節見 CHANGELOG 2026-11-22。
+- **git**：工作目錄乾淨。下面所有標「未 commit」的異動（10-30～11-22）都已 commit 在分支 `feat/futures-backtest-kd-screener` 並 push（`ad4fed0`、`bed6d4f`、`89391cf`），
   **尚未合併回 `main`**（`main` 本機比 origin 多 3 個 commit，也還沒 push）。另有 `stash@{0}`「pre-pull WIP 2026-11-17」是 pull 前的備份，內容已在分支裡，可刪。
-- **Claude（2026-11-17，修架構檢查問題，未 commit，在同一分支）**：不再呼叫別人的 `_connect()`（改用擁有模組新增的唯讀函式）、`FlowPeriod` 搬到 history 解掉循環 import、
+- **Claude（2026-11-17，修架構檢查問題，已 commit `bed6d4f`）**：不再呼叫別人的 `_connect()`（改用擁有模組新增的唯讀函式）、`FlowPeriod` 搬到 history 解掉循環 import、
   集保 HTTP 改走 `tradingnote_http.HttpSession`／`http_get_text`、玉山網址進 `tradingnote_api_config`、ARCHITECTURE.md 補齊。**新增 `test_architecture.py`**：新增 SQLite 表要寫進
   ARCHITECTURE.md「資料儲存」、不能呼叫別人的 `_connect`、HTTP／網址要集中，否則測試失敗。細節見 CHANGELOG 2026-11-17。
-- **Claude（2026-11-17，每日選股移除「兩週內大戶增加」條件，未 commit）**：user 要求刪除條件 1。集保週資料停在 2026-10-16（只有 `scripts/fetch_daily.py` 會抓，
+- **Claude（2026-11-17，每日選股移除「兩週內大戶增加」條件，已 commit `bed6d4f`）**：user 要求刪除條件 1。集保週資料停在 2026-10-16（只有 `scripts/fetch_daily.py` 會抓，
   GUI 自動同步不抓、本機也沒排程），所以 11-09、11-17 都是 0 檔。`RULES` 裡 `big_holder` 改成註解（比照 10-14 停用融資），大戶占比Δ／走勢欄仍顯示。
   真實資料庫**副本**重篩：11-09 入選 144 檔、11-17 入選 83 檔（低檔鈍化 70、高檔 13）。**正式資料庫存的 11-17 仍是 0 檔**，重開 app 後在「每日選股」按重新篩選才會更新。
 - **Claude（2026-11-17，修「資金流向分析失敗：database is locked」，未 commit）**：①`tradingnote_history._connect` 先用唯讀查詢確認 schema 完整，
